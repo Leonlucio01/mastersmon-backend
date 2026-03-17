@@ -6,7 +6,7 @@ from database import get_connection, get_cursor, release_connection
 from auth import verify_google_token, create_access_token, get_current_user
 
 router = APIRouter()
-
+MAX_NIVEL_POKEMON = 200
 
 # =========================================================
 # PAYLOADS
@@ -617,12 +617,27 @@ def ganar_experiencia(payload: ExpPayload):
         if not poke:
             return {"mensaje": "Pokémon del usuario no encontrado"}
 
-        nueva_exp = poke["experiencia"] + payload.exp_ganada
-        nuevo_nivel = poke["nivel"]
+        nivel_actual = int(poke["nivel"] or 1)
+        exp_actual = int(poke["experiencia"] or 0)
+        exp_ganada = max(0, int(payload.exp_ganada or 0))
 
-        while nueva_exp >= (nuevo_nivel * 50):
+        if nivel_actual >= MAX_NIVEL_POKEMON:
+            return {
+                "mensaje": "Este Pokémon ya alcanzó el nivel máximo",
+                "nivel": MAX_NIVEL_POKEMON,
+                "experiencia": 0
+            }
+
+        nueva_exp = exp_actual + exp_ganada
+        nuevo_nivel = nivel_actual
+
+        while nuevo_nivel < MAX_NIVEL_POKEMON and nueva_exp >= (nuevo_nivel * 50):
             nueva_exp -= (nuevo_nivel * 50)
             nuevo_nivel += 1
+
+        if nuevo_nivel >= MAX_NIVEL_POKEMON:
+            nuevo_nivel = MAX_NIVEL_POKEMON
+            nueva_exp = 0
 
         cursor.execute("""
             SELECT hp, ataque, defensa, velocidad
@@ -630,6 +645,9 @@ def ganar_experiencia(payload: ExpPayload):
             WHERE id = %s
         """, (poke["pokemon_id"],))
         base = cursor.fetchone()
+
+        if not base:
+            return {"mensaje": "Pokémon base no encontrado"}
 
         stats = calcular_stats(
             base["hp"],
@@ -745,12 +763,29 @@ def recompensa_victoria_batalla(payload: RecompensaBatallaPayload):
             if not poke:
                 continue
 
-            nueva_exp = int(poke["experiencia"] or 0) + int(payload.exp_ganada)
-            nuevo_nivel = int(poke["nivel"] or 1)
+            nivel_actual = int(poke["nivel"] or 1)
+            exp_actual = int(poke["experiencia"] or 0)
+            exp_ganada = max(0, int(payload.exp_ganada or 0))
 
-            while nueva_exp >= (nuevo_nivel * 50):
+            if nivel_actual >= MAX_NIVEL_POKEMON:
+                pokemon_actualizados.append({
+                    "usuario_pokemon_id": usuario_pokemon_id,
+                    "nivel": MAX_NIVEL_POKEMON,
+                    "experiencia": 0,
+                    "mensaje": "Nivel máximo alcanzado"
+                })
+                continue
+
+            nueva_exp = exp_actual + exp_ganada
+            nuevo_nivel = nivel_actual
+
+            while nuevo_nivel < MAX_NIVEL_POKEMON and nueva_exp >= (nuevo_nivel * 50):
                 nueva_exp -= (nuevo_nivel * 50)
                 nuevo_nivel += 1
+
+            if nuevo_nivel >= MAX_NIVEL_POKEMON:
+                nuevo_nivel = MAX_NIVEL_POKEMON
+                nueva_exp = 0
 
             cursor.execute("""
                 SELECT hp, ataque, defensa, velocidad
