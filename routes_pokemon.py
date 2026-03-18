@@ -42,9 +42,11 @@ class ExpPayload(BaseModel):
     usuario_pokemon_id: int
     exp_ganada: int
 
+
 class PokedolaresPayload(BaseModel):
     usuario_id: int
     monto: int
+
 
 class RecompensaBatallaPayload(BaseModel):
     usuario_id: int
@@ -104,6 +106,12 @@ def calcular_stats(
         "defensa": defensa,
         "velocidad": velocidad
     }
+
+
+def calcular_experiencia_total_base(nivel: int, experiencia_actual: int = 0) -> int:
+    nivel_seguro = max(1, int(nivel or 1))
+    experiencia_segura = max(0, int(experiencia_actual or 0))
+    return int((50 * ((nivel_seguro - 1) * nivel_seguro / 2)) + experiencia_segura)
 
 
 def obtener_usuario_por_id(usuario_id: int):
@@ -177,6 +185,8 @@ def obtener_pokemon_usuario_data(usuario_id: int):
                 p.tiene_mega,
                 up.nivel,
                 up.experiencia,
+                COALESCE(up.experiencia_total, 0) AS experiencia_total,
+                COALESCE(up.victorias_total, 0) AS victorias_total,
                 up.hp_actual,
                 up.hp_max,
                 up.ataque,
@@ -210,6 +220,8 @@ def obtener_pokemon_usuario_data(usuario_id: int):
                 "tiene_mega": row["tiene_mega"],
                 "nivel": row["nivel"],
                 "experiencia": row["experiencia"],
+                "experiencia_total": row["experiencia_total"],
+                "victorias_total": row["victorias_total"],
                 "hp_actual": row["hp_actual"],
                 "hp_max": row["hp_max"],
                 "ataque": row["ataque"],
@@ -556,23 +568,31 @@ def capturar_pokemon(payload: CapturaPayload):
         if not base:
             return {"mensaje": "Pokémon no encontrado"}
 
+        nivel_captura = max(1, min(int(payload.nivel or 1), MAX_NIVEL_POKEMON))
+
         stats = calcular_stats(
             base["hp"],
             base["ataque"],
             base["defensa"],
             base["velocidad"],
-            payload.nivel,
+            nivel_captura,
             payload.es_shiny
         )
 
+        experiencia_total_inicial = calcular_experiencia_total_base(nivel_captura, 0)
+
         cursor.execute("""
             INSERT INTO usuario_pokemon
-            (usuario_id, pokemon_id, nivel, experiencia, hp_actual, hp_max, ataque, defensa, velocidad, es_shiny)
-            VALUES (%s, %s, %s, 0, %s, %s, %s, %s, %s, %s)
+            (
+                usuario_id, pokemon_id, nivel, experiencia, experiencia_total, victorias_total,
+                hp_actual, hp_max, ataque, defensa, velocidad, es_shiny
+            )
+            VALUES (%s, %s, %s, 0, %s, 0, %s, %s, %s, %s, %s, %s)
         """, (
             payload.usuario_id,
             payload.pokemon_id,
-            payload.nivel,
+            nivel_captura,
+            experiencia_total_inicial,
             stats["hp_max"],
             stats["hp_max"],
             stats["ataque"],
@@ -585,7 +605,9 @@ def capturar_pokemon(payload: CapturaPayload):
 
         return {
             "mensaje": "Pokémon agregado al usuario",
-            "stats": stats
+            "stats": stats,
+            "experiencia_total": experiencia_total_inicial,
+            "victorias_total": 0
         }
     finally:
         cursor.close()
@@ -604,6 +626,7 @@ def ganar_experiencia(payload: ExpPayload):
                 up.pokemon_id,
                 up.nivel,
                 up.experiencia,
+                COALESCE(up.experiencia_total, 0) AS experiencia_total,
                 up.es_shiny,
                 up.bonus_hp_renacer,
                 up.bonus_ataque_renacer,
@@ -619,13 +642,65 @@ def ganar_experiencia(payload: ExpPayload):
 
         nivel_actual = int(poke["nivel"] or 1)
         exp_actual = int(poke["experiencia"] or 0)
+        exp_total_actual = int(poke["experiencia_total"] or 0)
         exp_ganada = max(0, int(payload.exp_ganada or 0))
+        nuevo_exp_total = exp_total_actual + exp_ganada
+
+        cursor.execute("""
+            SELECT hp, ataque, defensa, velocidad
+            FROM pokemon
+            WHERE id = %s
+        """, (poke["pokemon_id"],))
+        base = cursor.fetchone()
+
+        if not base:
+            return {"mensaje": "Pokémon base no encontrado"}
 
         if nivel_actual >= MAX_NIVEL_POKEMON:
+            stats = calcular_stats(
+                base["hp"],
+                base["ataque"],
+                base["defensa"],
+                base["velocidad"],
+                MAX_NIVEL_POKEMON,
+                bool(poke["es_shiny"]),
+                poke["bonus_hp_renacer"],
+                poke["bonus_ataque_renacer"],
+                poke["bonus_defensa_renacer"],
+                poke["bonus_velocidad_renacer"]
+            )
+
+            cursor.execute("""
+                UPDATE usuario_pokemon
+                SET nivel = %s,
+                    experiencia = %s,
+                    experiencia_total = %s,
+                    hp_max = %s,
+                    hp_actual = LEAST(hp_actual, %s),
+                    ataque = %s,
+                    defensa = %s,
+                    velocidad = %s
+                WHERE id = %s
+            """, (
+                MAX_NIVEL_POKEMON,
+                0,
+                nuevo_exp_total,
+                stats["hp_max"],
+                stats["hp_max"],
+                stats["ataque"],
+                stats["defensa"],
+                stats["velocidad"],
+                payload.usuario_pokemon_id
+            ))
+
+            conn.commit()
+
             return {
-                "mensaje": "Este Pokémon ya alcanzó el nivel máximo",
+                "mensaje": "Este Pokémon ya alcanzó el nivel máximo, pero su EXP total fue acumulada",
                 "nivel": MAX_NIVEL_POKEMON,
-                "experiencia": 0
+                "experiencia": 0,
+                "experiencia_total": nuevo_exp_total,
+                "stats": stats
             }
 
         nueva_exp = exp_actual + exp_ganada
@@ -638,16 +713,6 @@ def ganar_experiencia(payload: ExpPayload):
         if nuevo_nivel >= MAX_NIVEL_POKEMON:
             nuevo_nivel = MAX_NIVEL_POKEMON
             nueva_exp = 0
-
-        cursor.execute("""
-            SELECT hp, ataque, defensa, velocidad
-            FROM pokemon
-            WHERE id = %s
-        """, (poke["pokemon_id"],))
-        base = cursor.fetchone()
-
-        if not base:
-            return {"mensaje": "Pokémon base no encontrado"}
 
         stats = calcular_stats(
             base["hp"],
@@ -666,6 +731,7 @@ def ganar_experiencia(payload: ExpPayload):
             UPDATE usuario_pokemon
             SET nivel = %s,
                 experiencia = %s,
+                experiencia_total = %s,
                 hp_max = %s,
                 hp_actual = %s,
                 ataque = %s,
@@ -675,6 +741,7 @@ def ganar_experiencia(payload: ExpPayload):
         """, (
             nuevo_nivel,
             nueva_exp,
+            nuevo_exp_total,
             stats["hp_max"],
             stats["hp_max"],
             stats["ataque"],
@@ -689,11 +756,13 @@ def ganar_experiencia(payload: ExpPayload):
             "mensaje": "Experiencia actualizada",
             "nivel": nuevo_nivel,
             "experiencia": nueva_exp,
+            "experiencia_total": nuevo_exp_total,
             "stats": stats
         }
     finally:
         cursor.close()
         release_connection(conn)
+
 
 @router.post("/battle/recompensa-victoria")
 def recompensa_victoria_batalla(payload: RecompensaBatallaPayload):
@@ -741,6 +810,7 @@ def recompensa_victoria_batalla(payload: RecompensaBatallaPayload):
         """, (nuevos_pokedolares, payload.usuario_id))
 
         pokemon_actualizados = []
+        exp_ganada = max(0, int(payload.exp_ganada or 0))
 
         for usuario_pokemon_id in payload.usuario_pokemon_ids:
             cursor.execute("""
@@ -750,6 +820,8 @@ def recompensa_victoria_batalla(payload: RecompensaBatallaPayload):
                     up.pokemon_id,
                     up.nivel,
                     up.experiencia,
+                    COALESCE(up.experiencia_total, 0) AS experiencia_total,
+                    COALESCE(up.victorias_total, 0) AS victorias_total,
                     up.es_shiny,
                     up.bonus_hp_renacer,
                     up.bonus_ataque_renacer,
@@ -765,14 +837,72 @@ def recompensa_victoria_batalla(payload: RecompensaBatallaPayload):
 
             nivel_actual = int(poke["nivel"] or 1)
             exp_actual = int(poke["experiencia"] or 0)
-            exp_ganada = max(0, int(payload.exp_ganada or 0))
+            exp_total_actual = int(poke["experiencia_total"] or 0)
+            victorias_actuales = int(poke["victorias_total"] or 0)
+
+            nuevo_exp_total = exp_total_actual + exp_ganada
+            nuevas_victorias = victorias_actuales + 1
+
+            cursor.execute("""
+                SELECT hp, ataque, defensa, velocidad
+                FROM pokemon
+                WHERE id = %s
+            """, (poke["pokemon_id"],))
+            base = cursor.fetchone()
+
+            if not base:
+                continue
 
             if nivel_actual >= MAX_NIVEL_POKEMON:
+                stats = calcular_stats(
+                    base["hp"],
+                    base["ataque"],
+                    base["defensa"],
+                    base["velocidad"],
+                    MAX_NIVEL_POKEMON,
+                    bool(poke["es_shiny"]),
+                    poke["bonus_hp_renacer"],
+                    poke["bonus_ataque_renacer"],
+                    poke["bonus_defensa_renacer"],
+                    poke["bonus_velocidad_renacer"]
+                )
+
+                cursor.execute("""
+                    UPDATE usuario_pokemon
+                    SET nivel = %s,
+                        experiencia = %s,
+                        experiencia_total = %s,
+                        victorias_total = %s,
+                        hp_max = %s,
+                        hp_actual = LEAST(hp_actual, %s),
+                        ataque = %s,
+                        defensa = %s,
+                        velocidad = %s
+                    WHERE id = %s
+                """, (
+                    MAX_NIVEL_POKEMON,
+                    0,
+                    nuevo_exp_total,
+                    nuevas_victorias,
+                    stats["hp_max"],
+                    stats["hp_max"],
+                    stats["ataque"],
+                    stats["defensa"],
+                    stats["velocidad"],
+                    usuario_pokemon_id
+                ))
+
                 pokemon_actualizados.append({
                     "usuario_pokemon_id": usuario_pokemon_id,
                     "nivel": MAX_NIVEL_POKEMON,
                     "experiencia": 0,
-                    "mensaje": "Nivel máximo alcanzado"
+                    "experiencia_total": nuevo_exp_total,
+                    "victorias_total": nuevas_victorias,
+                    "hp_max": stats["hp_max"],
+                    "ataque": stats["ataque"],
+                    "defensa": stats["defensa"],
+                    "velocidad": stats["velocidad"],
+                    "mensaje": "Nivel máximo alcanzado, EXP total y victoria acumuladas"
                 })
                 continue
 
@@ -786,16 +916,6 @@ def recompensa_victoria_batalla(payload: RecompensaBatallaPayload):
             if nuevo_nivel >= MAX_NIVEL_POKEMON:
                 nuevo_nivel = MAX_NIVEL_POKEMON
                 nueva_exp = 0
-
-            cursor.execute("""
-                SELECT hp, ataque, defensa, velocidad
-                FROM pokemon
-                WHERE id = %s
-            """, (poke["pokemon_id"],))
-            base = cursor.fetchone()
-
-            if not base:
-                continue
 
             stats = calcular_stats(
                 base["hp"],
@@ -814,6 +934,8 @@ def recompensa_victoria_batalla(payload: RecompensaBatallaPayload):
                 UPDATE usuario_pokemon
                 SET nivel = %s,
                     experiencia = %s,
+                    experiencia_total = %s,
+                    victorias_total = %s,
                     hp_max = %s,
                     hp_actual = %s,
                     ataque = %s,
@@ -823,6 +945,8 @@ def recompensa_victoria_batalla(payload: RecompensaBatallaPayload):
             """, (
                 nuevo_nivel,
                 nueva_exp,
+                nuevo_exp_total,
+                nuevas_victorias,
                 stats["hp_max"],
                 stats["hp_max"],
                 stats["ataque"],
@@ -835,6 +959,8 @@ def recompensa_victoria_batalla(payload: RecompensaBatallaPayload):
                 "usuario_pokemon_id": usuario_pokemon_id,
                 "nivel": nuevo_nivel,
                 "experiencia": nueva_exp,
+                "experiencia_total": nuevo_exp_total,
+                "victorias_total": nuevas_victorias,
                 "hp_max": stats["hp_max"],
                 "ataque": stats["ataque"],
                 "defensa": stats["defensa"],
@@ -1108,23 +1234,31 @@ def intentar_captura(payload: IntentoCapturaPayload):
                     "mensaje": "Pokémon no encontrado"
                 }
 
+            nivel_captura = max(1, min(int(payload.nivel or 1), MAX_NIVEL_POKEMON))
+
             stats = calcular_stats(
                 base["hp"],
                 base["ataque"],
                 base["defensa"],
                 base["velocidad"],
-                payload.nivel,
+                nivel_captura,
                 payload.es_shiny
             )
 
+            experiencia_total_inicial = calcular_experiencia_total_base(nivel_captura, 0)
+
             cursor.execute("""
                 INSERT INTO usuario_pokemon
-                (usuario_id, pokemon_id, nivel, experiencia, hp_actual, hp_max, ataque, defensa, velocidad, es_shiny)
-                VALUES (%s, %s, %s, 0, %s, %s, %s, %s, %s, %s)
+                (
+                    usuario_id, pokemon_id, nivel, experiencia, experiencia_total, victorias_total,
+                    hp_actual, hp_max, ataque, defensa, velocidad, es_shiny
+                )
+                VALUES (%s, %s, %s, 0, %s, 0, %s, %s, %s, %s, %s, %s)
             """, (
                 payload.usuario_id,
                 payload.pokemon_id,
-                payload.nivel,
+                nivel_captura,
+                experiencia_total_inicial,
                 stats["hp_max"],
                 stats["hp_max"],
                 stats["ataque"],
@@ -1139,7 +1273,9 @@ def intentar_captura(payload: IntentoCapturaPayload):
                 "capturado": True,
                 "mensaje": f"¡{nombre_item} usada con éxito! Pokémon capturado.",
                 "probabilidad": probabilidad,
-                "item_id": payload.item_id
+                "item_id": payload.item_id,
+                "experiencia_total": experiencia_total_inicial,
+                "victorias_total": 0
             }
 
         conn.commit()
@@ -1261,6 +1397,7 @@ def comprar_item(payload: CompraItemPayload):
     finally:
         cursor.close()
         release_connection(conn)
+
 
 # =========================================================
 # EVOLUCIONES
@@ -1611,13 +1748,13 @@ def resumen_pokedex(usuario_id: int):
         cursor.close()
         release_connection(conn)
 
+
 @router.get("/pokemon/evoluciones-cache")
 def obtener_evoluciones_cache():
     conn = get_connection()
     cursor = get_cursor(conn)
 
     try:
-        # 1. Traer todos los pokemon
         cursor.execute("""
             SELECT id
             FROM pokemon
@@ -1627,7 +1764,6 @@ def obtener_evoluciones_cache():
 
         resultado = {str(row["id"]): [] for row in todos}
 
-        # 2. Traer todas las reglas activas
         cursor.execute("""
             SELECT
                 er.pokemon_id,
