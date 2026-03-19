@@ -65,7 +65,16 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
 
     try:
         cursor.execute("""
-            SELECT id, nombre, correo, foto, avatar_url, rol, pokedolares, fecha_registro
+            SELECT
+                id,
+                nombre,
+                correo,
+                foto,
+                avatar_url,
+                avatar_id,
+                rol,
+                pokedolares,
+                fecha_registro
             FROM usuarios
             WHERE id = %s
         """, (user_id,))

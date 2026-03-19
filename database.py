@@ -1,6 +1,5 @@
 import os
 from dotenv import load_dotenv
-import psycopg2
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
 
@@ -18,12 +17,15 @@ db_pool = pool.SimpleConnectionPool(
     sslmode="require"
 )
 
+
 def get_connection():
     return db_pool.getconn()
+
 
 def release_connection(conn):
     if conn:
         db_pool.putconn(conn)
+
 
 def get_cursor(conn):
     return conn.cursor(cursor_factory=RealDictCursor)
