@@ -702,7 +702,6 @@ def obtener_ranking_capturas_unicas_data(limit: int = 10):
 # =========================================================
 # MAPS / PRESENCIA HELPERS
 # =========================================================
-
 def construir_payload_presencia_usuario(usuario: dict, zona_id: int, nodo_id: str, updated_at=None):
     marca_tiempo = updated_at
     if marca_tiempo is None:
@@ -855,6 +854,40 @@ async def maps_ws_quitar(zona_id: int | None, connection_id: str | None):
 
         if not zona_conexiones:
             MAPS_WEBSOCKET_CONEXIONES.pop(zona_id, None)
+
+
+async def maps_ws_es_conexion_activa(zona_id: int | None, connection_id: str | None) -> bool:
+    if zona_id is None or not connection_id:
+        return False
+
+    async with MAPS_WEBSOCKET_LOCK:
+        zona_conexiones = MAPS_WEBSOCKET_CONEXIONES.get(zona_id, {})
+        return connection_id in zona_conexiones
+
+
+async def maps_ws_desregistrar_otras_conexiones_usuario(usuario_id: int, excluir_connection_id: str | None = None):
+    conexiones_a_cerrar = []
+
+    async with MAPS_WEBSOCKET_LOCK:
+        for zona_id, zona_conexiones in list(MAPS_WEBSOCKET_CONEXIONES.items()):
+            for connection_id, data in list(zona_conexiones.items()):
+                if int(data.get("usuario_id") or 0) != int(usuario_id):
+                    continue
+
+                if excluir_connection_id and connection_id == excluir_connection_id:
+                    continue
+
+                conexiones_a_cerrar.append({
+                    "zona_id": zona_id,
+                    "connection_id": connection_id,
+                    "websocket": data.get("websocket")
+                })
+                zona_conexiones.pop(connection_id, None)
+
+            if not zona_conexiones:
+                MAPS_WEBSOCKET_CONEXIONES.pop(zona_id, None)
+
+    return conexiones_a_cerrar
 
 
 async def maps_ws_broadcast_zona(zona_id: int, payload: dict, excluir_connection_id: str | None = None):
@@ -1929,6 +1962,7 @@ async def websocket_maps(websocket: WebSocket):
 
                 conn = get_connection()
                 cursor = get_cursor(conn)
+
                 try:
                     validar_zona_existente(cursor, zona_id)
                     limpiar_presencia_expirada(cursor)
@@ -1955,20 +1989,39 @@ async def websocket_maps(websocket: WebSocket):
                     except Exception:
                         pass
 
-                if zona_actual is not None and connection_id is not None:
+                if zona_actual is not None and connection_id is not None and zona_actual != zona_id:
                     await maps_ws_quitar(zona_actual, connection_id)
-                    if presencia_anterior and int(presencia_anterior["zona_id"]) != int(zona_id):
-                        await maps_ws_broadcast_zona(
-                            int(presencia_anterior["zona_id"]),
-                            {
-                                "type": "remove",
-                                "usuario_id": int(usuario["id"])
-                            },
-                            excluir_connection_id=None
-                        )
 
                 zona_actual = zona_id
-                connection_id = await maps_ws_registrar(zona_actual, int(usuario["id"]), websocket)
+
+                if connection_id is None:
+                    connection_id = await maps_ws_registrar(zona_actual, int(usuario["id"]), websocket)
+                else:
+                    await maps_ws_registrar(zona_actual, int(usuario["id"]), websocket)
+
+                otras_conexiones = await maps_ws_desregistrar_otras_conexiones_usuario(
+                    int(usuario["id"]),
+                    excluir_connection_id=connection_id
+                )
+
+                for item in otras_conexiones:
+                    ws_anterior = item.get("websocket")
+                    if not ws_anterior:
+                        continue
+                    try:
+                        await ws_anterior.close(code=4409)
+                    except Exception:
+                        pass
+
+                if presencia_anterior and int(presencia_anterior["zona_id"]) != int(zona_id):
+                    await maps_ws_broadcast_zona(
+                        int(presencia_anterior["zona_id"]),
+                        {
+                            "type": "remove",
+                            "usuario_id": int(usuario["id"])
+                        },
+                        excluir_connection_id=None
+                    )
 
                 snapshot = obtener_jugadores_presencia_zona_data(zona_actual, excluir_usuario_id=usuario["id"])
                 jugador_payload = construir_payload_presencia_usuario(usuario, zona_actual, nodo_id, updated_at)
@@ -2002,6 +2055,7 @@ async def websocket_maps(websocket: WebSocket):
 
                 conn = get_connection()
                 cursor = get_cursor(conn)
+
                 try:
                     limpiar_presencia_expirada(cursor)
                     updated_at = registrar_presencia_usuario(cursor, usuario["id"], zona_actual, nodo_id)
@@ -2044,7 +2098,9 @@ async def websocket_maps(websocket: WebSocket):
                 continue
 
             if action == "leave":
-                if zona_actual is not None:
+                conexion_activa = await maps_ws_es_conexion_activa(zona_actual, connection_id)
+
+                if conexion_activa and zona_actual is not None:
                     conn = get_connection()
                     cursor = get_cursor(conn)
                     try:
@@ -2065,9 +2121,9 @@ async def websocket_maps(websocket: WebSocket):
                         excluir_connection_id=connection_id
                     )
 
-                    await maps_ws_quitar(zona_actual, connection_id)
-                    zona_actual = None
-                    connection_id = None
+                await maps_ws_quitar(zona_actual, connection_id)
+                zona_actual = None
+                connection_id = None
 
                 await websocket.send_json({"type": "left"})
                 continue
@@ -2088,7 +2144,9 @@ async def websocket_maps(websocket: WebSocket):
         except Exception:
             pass
     finally:
-        if zona_actual is not None:
+        conexion_activa = await maps_ws_es_conexion_activa(zona_actual, connection_id)
+
+        if conexion_activa and zona_actual is not None:
             conn = get_connection()
             cursor = get_cursor(conn)
             try:
