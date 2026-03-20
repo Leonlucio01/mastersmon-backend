@@ -54,11 +54,14 @@ def decode_access_token(token: str) -> dict:
         )
 
 
-def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    token = credentials.credentials
-    payload = decode_access_token(token)
-
-    user_id = int(payload["sub"])
+def obtener_usuario_desde_payload(payload: dict) -> dict:
+    try:
+        user_id = int(payload["sub"])
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token inválido"
+        )
 
     conn = get_connection()
     cursor = get_cursor(conn)
@@ -91,3 +94,19 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
     finally:
         cursor.close()
         release_connection(conn)
+
+
+def get_current_user_from_token(token: str) -> dict:
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token requerido"
+        )
+
+    payload = decode_access_token(token)
+    return obtener_usuario_desde_payload(payload)
+
+
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    token = credentials.credentials
+    return get_current_user_from_token(token)

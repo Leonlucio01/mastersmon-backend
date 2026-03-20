@@ -1,15 +1,22 @@
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
-import random
+import asyncio
 import re
+import random
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
+from pydantic import BaseModel
 
 from database import get_connection, get_cursor, release_connection
-from auth import verify_google_token, create_access_token, get_current_user
+from auth import verify_google_token, create_access_token, get_current_user, get_current_user_from_token
 
 router = APIRouter()
 MAX_NIVEL_POKEMON = 200
 AVATAR_ID_DEFAULT = "steven"
 AVATAR_ID_REGEX = re.compile(r"^[a-z0-9_-]{1,60}$")
+MAPS_NODE_ID_REGEX = re.compile(r"^[a-z0-9_-]{1,60}$")
+MAPS_PRESENCIA_TTL_SEGUNDOS = 25
+MAPS_WEBSOCKET_CONEXIONES = {}
+MAPS_WEBSOCKET_LOCK = asyncio.Lock()
 
 
 # =========================================================
@@ -85,6 +92,11 @@ class ActualizarAvatarPayload(BaseModel):
     avatar_id: str
 
 
+class PresenciaMapaPayload(BaseModel):
+    zona_id: int
+    nodo_id: str
+
+
 # =========================================================
 # HELPERS
 # =========================================================
@@ -143,6 +155,24 @@ def validar_avatar_id(avatar_id: str | None) -> str:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="avatar_id inválido"
+        )
+
+    return valor
+
+
+def validar_nodo_mapa_id(nodo_id: str | None) -> str:
+    valor = str(nodo_id or "").strip().lower()
+
+    if not valor:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="nodo_id es obligatorio"
+        )
+
+    if not MAPS_NODE_ID_REGEX.fullmatch(valor):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="nodo_id inválido"
         )
 
     return valor
@@ -667,6 +697,201 @@ def obtener_ranking_capturas_unicas_data(limit: int = 10):
     finally:
         cursor.close()
         release_connection(conn)
+
+
+# =========================================================
+# MAPS / PRESENCIA HELPERS
+# =========================================================
+
+def construir_payload_presencia_usuario(usuario: dict, zona_id: int, nodo_id: str, updated_at=None):
+    marca_tiempo = updated_at
+    if marca_tiempo is None:
+        marca_tiempo = datetime.now(timezone.utc)
+
+    if hasattr(marca_tiempo, "isoformat"):
+        marca_tiempo = marca_tiempo.isoformat()
+
+    return {
+        "usuario_id": int(usuario["id"]),
+        "nombre": usuario.get("nombre"),
+        "foto": usuario.get("foto"),
+        "avatar_url": usuario.get("avatar_url"),
+        "avatar_id": normalizar_avatar_id(usuario.get("avatar_id")),
+        "zona_id": int(zona_id),
+        "nodo_id": str(nodo_id),
+        "updated_at": marca_tiempo
+    }
+
+
+def limpiar_presencia_expirada(cursor, ttl_segundos: int = MAPS_PRESENCIA_TTL_SEGUNDOS):
+    cursor.execute(
+        """
+        DELETE FROM mapa_presencia
+        WHERE updated_at < (NOW() - (%s * INTERVAL '1 second'))
+        """,
+        (int(ttl_segundos),)
+    )
+
+
+def registrar_presencia_usuario(cursor, usuario_id: int, zona_id: int, nodo_id: str):
+    cursor.execute("DELETE FROM mapa_presencia WHERE usuario_id = %s", (usuario_id,))
+    cursor.execute(
+        """
+        INSERT INTO mapa_presencia (usuario_id, zona_id, nodo_id, updated_at)
+        VALUES (%s, %s, %s, NOW())
+        RETURNING updated_at
+        """,
+        (usuario_id, zona_id, nodo_id)
+    )
+    row = cursor.fetchone()
+    return row["updated_at"] if row else None
+
+
+def eliminar_presencia_usuario(cursor, usuario_id: int):
+    cursor.execute("DELETE FROM mapa_presencia WHERE usuario_id = %s", (usuario_id,))
+
+
+def obtener_presencia_usuario_actual(cursor, usuario_id: int):
+    cursor.execute(
+        """
+        SELECT usuario_id, zona_id, nodo_id, updated_at
+        FROM mapa_presencia
+        WHERE usuario_id = %s
+        ORDER BY updated_at DESC NULLS LAST
+        LIMIT 1
+        """,
+        (usuario_id,)
+    )
+    return cursor.fetchone()
+
+
+def validar_zona_existente(cursor, zona_id: int):
+    cursor.execute("SELECT id FROM zonas WHERE id = %s LIMIT 1", (zona_id,))
+    zona = cursor.fetchone()
+    if not zona:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Zona no encontrada"
+        )
+
+
+def obtener_jugadores_presencia_zona_data(zona_id: int, excluir_usuario_id: int | None = None):
+    conn = get_connection()
+    cursor = get_cursor(conn)
+
+    try:
+        limpiar_presencia_expirada(cursor)
+
+        params = [zona_id, MAPS_PRESENCIA_TTL_SEGUNDOS]
+        where_extra = ""
+
+        if excluir_usuario_id is not None:
+            where_extra = "AND mp.usuario_id <> %s"
+            params.append(excluir_usuario_id)
+
+        cursor.execute(
+            f"""
+            SELECT
+                mp.usuario_id,
+                mp.zona_id,
+                mp.nodo_id,
+                mp.updated_at,
+                u.nombre,
+                u.foto,
+                u.avatar_url,
+                u.avatar_id
+            FROM mapa_presencia mp
+            JOIN usuarios u ON u.id = mp.usuario_id
+            WHERE mp.zona_id = %s
+              AND mp.updated_at >= (NOW() - (%s * INTERVAL '1 second'))
+              {where_extra}
+            ORDER BY mp.updated_at DESC, u.nombre ASC
+            """,
+            tuple(params)
+        )
+        rows = cursor.fetchall()
+
+        return [
+            {
+                "usuario_id": int(row["usuario_id"]),
+                "nombre": row["nombre"],
+                "foto": row["foto"],
+                "avatar_url": row["avatar_url"],
+                "avatar_id": normalizar_avatar_id(row.get("avatar_id")),
+                "zona_id": int(row["zona_id"]),
+                "nodo_id": row["nodo_id"],
+                "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None
+            }
+            for row in rows
+        ]
+    finally:
+        cursor.close()
+        release_connection(conn)
+
+
+async def maps_ws_registrar(zona_id: int, usuario_id: int, websocket: WebSocket) -> str:
+    connection_id = f"{usuario_id}:{id(websocket)}"
+
+    async with MAPS_WEBSOCKET_LOCK:
+        zona_conexiones = MAPS_WEBSOCKET_CONEXIONES.setdefault(zona_id, {})
+        zona_conexiones[connection_id] = {
+            "usuario_id": usuario_id,
+            "websocket": websocket
+        }
+
+    return connection_id
+
+
+async def maps_ws_quitar(zona_id: int | None, connection_id: str | None):
+    if zona_id is None or not connection_id:
+        return
+
+    async with MAPS_WEBSOCKET_LOCK:
+        zona_conexiones = MAPS_WEBSOCKET_CONEXIONES.get(zona_id)
+        if not zona_conexiones:
+            return
+
+        zona_conexiones.pop(connection_id, None)
+
+        if not zona_conexiones:
+            MAPS_WEBSOCKET_CONEXIONES.pop(zona_id, None)
+
+
+async def maps_ws_broadcast_zona(zona_id: int, payload: dict, excluir_connection_id: str | None = None):
+    async with MAPS_WEBSOCKET_LOCK:
+        zona_conexiones = MAPS_WEBSOCKET_CONEXIONES.get(zona_id, {})
+        conexiones = list(zona_conexiones.items())
+
+    caidas = []
+
+    for connection_id, data in conexiones:
+        if excluir_connection_id and connection_id == excluir_connection_id:
+            continue
+
+        websocket = data.get("websocket")
+        if not websocket:
+            caidas.append(connection_id)
+            continue
+
+        try:
+            await websocket.send_json(payload)
+        except Exception:
+            caidas.append(connection_id)
+
+    for connection_id in caidas:
+        await maps_ws_quitar(zona_id, connection_id)
+
+
+def obtener_token_desde_websocket(websocket: WebSocket) -> str:
+    auth_header = websocket.headers.get("authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[7:].strip()
+
+    token = websocket.query_params.get("token", "")
+    if token.lower().startswith("bearer "):
+        token = token[7:]
+
+    return token.strip()
 
 
 # =========================================================
@@ -1586,6 +1811,305 @@ def obtener_zonas():
     finally:
         cursor.close()
         release_connection(conn)
+
+
+@router.get("/maps/presencia/{zona_id}")
+def obtener_presencia_maps(zona_id: int, usuario=Depends(get_current_user)):
+    conn = get_connection()
+    cursor = get_cursor(conn)
+
+    try:
+        validar_zona_existente(cursor, zona_id)
+    finally:
+        cursor.close()
+        release_connection(conn)
+
+    jugadores = obtener_jugadores_presencia_zona_data(zona_id, excluir_usuario_id=usuario["id"])
+
+    return {
+        "ok": True,
+        "zona_id": int(zona_id),
+        "ttl_segundos": MAPS_PRESENCIA_TTL_SEGUNDOS,
+        "jugadores": jugadores
+    }
+
+
+@router.post("/maps/presencia")
+def actualizar_presencia_maps(payload: PresenciaMapaPayload, usuario=Depends(get_current_user)):
+    zona_id = int(payload.zona_id or 0)
+    nodo_id = validar_nodo_mapa_id(payload.nodo_id)
+
+    if zona_id <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="zona_id inválida"
+        )
+
+    conn = get_connection()
+    cursor = get_cursor(conn)
+
+    try:
+        validar_zona_existente(cursor, zona_id)
+        limpiar_presencia_expirada(cursor)
+        updated_at = registrar_presencia_usuario(cursor, usuario["id"], zona_id, nodo_id)
+        conn.commit()
+
+        return {
+            "ok": True,
+            "jugador": construir_payload_presencia_usuario(usuario, zona_id, nodo_id, updated_at)
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        release_connection(conn)
+
+
+@router.delete("/maps/presencia")
+def eliminar_presencia_maps(usuario=Depends(get_current_user)):
+    conn = get_connection()
+    cursor = get_cursor(conn)
+
+    try:
+        eliminar_presencia_usuario(cursor, usuario["id"])
+        conn.commit()
+        return {
+            "ok": True,
+            "mensaje": "Presencia eliminada"
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        release_connection(conn)
+
+
+@router.websocket("/ws/maps")
+async def websocket_maps(websocket: WebSocket):
+    token = obtener_token_desde_websocket(websocket)
+
+    try:
+        usuario = get_current_user_from_token(token)
+    except HTTPException:
+        await websocket.close(code=4401)
+        return
+
+    await websocket.accept()
+
+    zona_actual = None
+    connection_id = None
+
+    try:
+        await websocket.send_json({
+            "type": "connected",
+            "usuario_id": int(usuario["id"]),
+            "ttl_segundos": MAPS_PRESENCIA_TTL_SEGUNDOS
+        })
+
+        while True:
+            data = await websocket.receive_json()
+            action = str(data.get("action") or data.get("type") or "").strip().lower()
+
+            if action == "ping":
+                await websocket.send_json({"type": "pong"})
+                continue
+
+            if action == "join":
+                zona_id = int(data.get("zona_id") or 0)
+                nodo_id = validar_nodo_mapa_id(data.get("nodo_id"))
+
+                if zona_id <= 0:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "zona_id inválida"
+                    })
+                    continue
+
+                conn = get_connection()
+                cursor = get_cursor(conn)
+                try:
+                    validar_zona_existente(cursor, zona_id)
+                    limpiar_presencia_expirada(cursor)
+
+                    presencia_anterior = obtener_presencia_usuario_actual(cursor, usuario["id"])
+                    updated_at = registrar_presencia_usuario(cursor, usuario["id"], zona_id, nodo_id)
+                    conn.commit()
+                except Exception as error:
+                    conn.rollback()
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": str(error)
+                    })
+                    cursor.close()
+                    release_connection(conn)
+                    continue
+                finally:
+                    try:
+                        cursor.close()
+                    except Exception:
+                        pass
+                    try:
+                        release_connection(conn)
+                    except Exception:
+                        pass
+
+                if zona_actual is not None and connection_id is not None:
+                    await maps_ws_quitar(zona_actual, connection_id)
+                    if presencia_anterior and int(presencia_anterior["zona_id"]) != int(zona_id):
+                        await maps_ws_broadcast_zona(
+                            int(presencia_anterior["zona_id"]),
+                            {
+                                "type": "remove",
+                                "usuario_id": int(usuario["id"])
+                            },
+                            excluir_connection_id=None
+                        )
+
+                zona_actual = zona_id
+                connection_id = await maps_ws_registrar(zona_actual, int(usuario["id"]), websocket)
+
+                snapshot = obtener_jugadores_presencia_zona_data(zona_actual, excluir_usuario_id=usuario["id"])
+                jugador_payload = construir_payload_presencia_usuario(usuario, zona_actual, nodo_id, updated_at)
+
+                await websocket.send_json({
+                    "type": "snapshot",
+                    "zona_id": int(zona_actual),
+                    "jugadores": snapshot,
+                    "self": jugador_payload
+                })
+
+                await maps_ws_broadcast_zona(
+                    zona_actual,
+                    {
+                        "type": "upsert",
+                        "jugador": jugador_payload
+                    },
+                    excluir_connection_id=connection_id
+                )
+                continue
+
+            if action == "move":
+                if zona_actual is None:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "Debes enviar join antes de move"
+                    })
+                    continue
+
+                nodo_id = validar_nodo_mapa_id(data.get("nodo_id"))
+
+                conn = get_connection()
+                cursor = get_cursor(conn)
+                try:
+                    limpiar_presencia_expirada(cursor)
+                    updated_at = registrar_presencia_usuario(cursor, usuario["id"], zona_actual, nodo_id)
+                    conn.commit()
+                except Exception as error:
+                    conn.rollback()
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": str(error)
+                    })
+                    cursor.close()
+                    release_connection(conn)
+                    continue
+                finally:
+                    try:
+                        cursor.close()
+                    except Exception:
+                        pass
+                    try:
+                        release_connection(conn)
+                    except Exception:
+                        pass
+
+                jugador_payload = construir_payload_presencia_usuario(usuario, zona_actual, nodo_id, updated_at)
+
+                await maps_ws_broadcast_zona(
+                    zona_actual,
+                    {
+                        "type": "upsert",
+                        "jugador": jugador_payload
+                    },
+                    excluir_connection_id=connection_id
+                )
+
+                await websocket.send_json({
+                    "type": "ack",
+                    "action": "move",
+                    "self": jugador_payload
+                })
+                continue
+
+            if action == "leave":
+                if zona_actual is not None:
+                    conn = get_connection()
+                    cursor = get_cursor(conn)
+                    try:
+                        eliminar_presencia_usuario(cursor, usuario["id"])
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                    finally:
+                        cursor.close()
+                        release_connection(conn)
+
+                    await maps_ws_broadcast_zona(
+                        zona_actual,
+                        {
+                            "type": "remove",
+                            "usuario_id": int(usuario["id"])
+                        },
+                        excluir_connection_id=connection_id
+                    )
+
+                    await maps_ws_quitar(zona_actual, connection_id)
+                    zona_actual = None
+                    connection_id = None
+
+                await websocket.send_json({"type": "left"})
+                continue
+
+            await websocket.send_json({
+                "type": "error",
+                "message": "Acción no soportada"
+            })
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as error:
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "message": str(error)
+            })
+        except Exception:
+            pass
+    finally:
+        if zona_actual is not None:
+            conn = get_connection()
+            cursor = get_cursor(conn)
+            try:
+                eliminar_presencia_usuario(cursor, usuario["id"])
+                conn.commit()
+            except Exception:
+                conn.rollback()
+            finally:
+                cursor.close()
+                release_connection(conn)
+
+            await maps_ws_broadcast_zona(
+                zona_actual,
+                {
+                    "type": "remove",
+                    "usuario_id": int(usuario["id"])
+                },
+                excluir_connection_id=connection_id
+            )
+
+        await maps_ws_quitar(zona_actual, connection_id)
 
 
 @router.post("/maps/encuentro")
