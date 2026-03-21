@@ -45,14 +45,14 @@ ACTIVIDAD_ACCIONES_VALIDAS = {
 MAPS_RATE_LIMIT_CONFIG = {
     "encuentro": {
         "window_seconds": 10,
-        "max_requests": 20,
-        "min_interval_ms": 150,
+        "max_requests": 35,
+        "min_interval_ms": 80,
     },
     "intentar-captura": {
         "window_seconds": 10,
         "max_requests": 8,
         "min_interval_ms": 400,
-    },
+    }
 }
 
 
