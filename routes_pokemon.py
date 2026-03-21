@@ -822,21 +822,34 @@ def validar_ids_pokemon_equipo(cursor, usuario_id: int, usuario_pokemon_ids: lis
 def guardar_equipo_usuario(cursor, usuario_id: int, usuario_pokemon_ids: list[int]) -> list[int]:
     ids_limpios = validar_ids_pokemon_equipo(cursor, usuario_id, usuario_pokemon_ids)
 
-    cursor.execute("DELETE FROM equipo_usuario WHERE usuario_id = %s", (usuario_id,))
+    # Borramos el equipo actual del usuario
+    cursor.execute(
+        "DELETE FROM equipo_usuario WHERE usuario_id = %s",
+        (usuario_id,)
+    )
+
+    tiene_creado_en = existe_columna(cursor, "equipo_usuario", "creado_en")
+    tiene_actualizado_en = existe_columna(cursor, "equipo_usuario", "actualizado_en")
 
     for posicion, usuario_pokemon_id in enumerate(ids_limpios, start=1):
-        cursor.execute(
-            """
-            INSERT INTO equipo_usuario (usuario_id, usuario_pokemon_id, posicion, creado_en, actualizado_en)
-            VALUES (%s, %s, %s, NOW(), NOW())
-            ON CONFLICT (usuario_id, posicion)
-            DO UPDATE SET usuario_pokemon_id = EXCLUDED.usuario_pokemon_id, actualizado_en = NOW()
-            """,
-            (usuario_id, usuario_pokemon_id, posicion)
-        )
+        if tiene_creado_en and tiene_actualizado_en:
+            cursor.execute(
+                """
+                INSERT INTO equipo_usuario (usuario_id, usuario_pokemon_id, posicion, creado_en, actualizado_en)
+                VALUES (%s, %s, %s, NOW(), NOW())
+                """,
+                (usuario_id, usuario_pokemon_id, posicion)
+            )
+        else:
+            cursor.execute(
+                """
+                INSERT INTO equipo_usuario (usuario_id, usuario_pokemon_id, posicion)
+                VALUES (%s, %s, %s)
+                """,
+                (usuario_id, usuario_pokemon_id, posicion)
+            )
 
     return ids_limpios
-
 
 def obtener_equipo_guardado_ids(cursor, usuario_id: int) -> list[int]:
     cursor.execute(
@@ -1952,16 +1965,23 @@ def obtener_equipo_me(usuario=Depends(get_current_user)):
 def guardar_equipo_me(payload: GuardarEquipoPayload, usuario=Depends(get_current_user)):
     conn = get_connection()
     cursor = get_cursor(conn)
+
     try:
         ids_guardados = guardar_equipo_usuario(cursor, usuario["id"], payload.usuario_pokemon_ids)
-        registrar_actividad_usuario(
-            cursor,
-            usuario["id"],
-            pagina="battle-arena",
-            accion="team_save",
-            detalle=f"equipo:{len(ids_guardados)}"
-        )
+
+        try:
+            registrar_actividad_usuario(
+                cursor,
+                usuario["id"],
+                pagina="battle",
+                accion="team_save",
+                detalle=f"equipo:{len(ids_guardados)}"
+            )
+        except Exception as actividad_error:
+            print("Aviso actividad guardar equipo:", repr(actividad_error))
+
         conn.commit()
+
         return {
             "ok": True,
             "mensaje": "Equipo guardado correctamente",
@@ -1969,13 +1989,17 @@ def guardar_equipo_me(payload: GuardarEquipoPayload, usuario=Depends(get_current
             "equipo_ids": ids_guardados,
             "equipo": obtener_equipo_usuario_data(usuario["id"])
         }
+
     except HTTPException:
         conn.rollback()
         raise
     except Exception as error:
         conn.rollback()
-        print("Error en /usuario/me/equipo:", error)
-        return {"ok": False, "mensaje": "No se pudo guardar el equipo"}
+        print("Error en /usuario/me/equipo:", repr(error))
+        return {
+            "ok": False,
+            "mensaje": "No se pudo guardar el equipo"
+        }
     finally:
         cursor.close()
         release_connection(conn)
