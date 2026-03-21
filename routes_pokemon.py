@@ -4,6 +4,7 @@ import re
 import random
 import secrets
 import time
+from collections import deque
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect, status
@@ -45,15 +46,23 @@ ACTIVIDAD_ACCIONES_VALIDAS = {
 MAPS_RATE_LIMIT_CONFIG = {
     "encuentro": {
         "window_seconds": 10,
-        "max_requests": 35,
-        "min_interval_ms": 80,
+        "max_requests": 12,
+        "min_interval_ms": 200,
     },
     "intentar-captura": {
         "window_seconds": 10,
-        "max_requests": 8,
-        "min_interval_ms": 400,
-    }
+        "max_requests": 6,
+        "min_interval_ms": 500,
+    },
 }
+
+MAPS_RATE_LIMIT_MEMORIA = {
+    endpoint: {}
+    for endpoint in MAPS_RATE_LIMIT_CONFIG.keys()
+}
+
+TABLAS_OPERATIVAS_CLEANUP_CADA_SEGUNDOS = 300
+TABLAS_OPERATIVAS_ULTIMO_CLEANUP = 0
 
 
 # =========================================================
@@ -292,6 +301,119 @@ def obtener_ip_request(request: Request | None) -> str | None:
     return None
 
 
+
+def limpiar_rate_limit_memoria(endpoint: str | None = None, now_ms: int | None = None):
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+
+    endpoints = [endpoint] if endpoint else list(MAPS_RATE_LIMIT_MEMORIA.keys())
+
+    for ep in endpoints:
+        config = MAPS_RATE_LIMIT_CONFIG.get(ep)
+        if not config:
+            continue
+
+        ventana_ms = int(config["window_seconds"]) * 1000
+        buckets = MAPS_RATE_LIMIT_MEMORIA.setdefault(ep, {})
+
+        for usuario_id in list(buckets.keys()):
+            cola = buckets.get(usuario_id)
+            if cola is None:
+                buckets.pop(usuario_id, None)
+                continue
+
+            limite_inferior = now_ms - ventana_ms
+
+            while cola and cola[0] < limite_inferior:
+                cola.popleft()
+
+            if not cola:
+                buckets.pop(usuario_id, None)
+
+
+def limpiar_tablas_operativas_si_corresponde(cursor):
+    global TABLAS_OPERATIVAS_ULTIMO_CLEANUP
+
+    ahora = int(time.time())
+    if (ahora - int(TABLAS_OPERATIVAS_ULTIMO_CLEANUP or 0)) < TABLAS_OPERATIVAS_CLEANUP_CADA_SEGUNDOS:
+        return
+
+    TABLAS_OPERATIVAS_ULTIMO_CLEANUP = ahora
+
+    try:
+        if existe_tabla(cursor, "maps_request_log"):
+            cursor.execute("""
+                DELETE FROM maps_request_log
+                WHERE created_at < NOW() - INTERVAL '3 days'
+            """)
+
+        if existe_tabla(cursor, "usuario_actividad"):
+            cursor.execute("""
+                UPDATE usuario_actividad
+                SET online = FALSE,
+                    actualizado_en = NOW()
+                WHERE online = TRUE
+                  AND ultima_actividad < NOW() - INTERVAL '10 minutes'
+            """)
+
+            cursor.execute("""
+                DELETE FROM usuario_actividad
+                WHERE ultima_actividad < NOW() - INTERVAL '2 days'
+            """)
+
+        if existe_tabla(cursor, "battle_sesiones"):
+            cursor.execute("""
+                UPDATE battle_sesiones
+                SET activo = FALSE,
+                    resultado = CASE
+                        WHEN resultado = 'pendiente' THEN 'expirada'
+                        ELSE resultado
+                    END,
+                    cancelado_en = COALESCE(cancelado_en, NOW())
+                WHERE activo = TRUE
+                  AND expira_en <= NOW()
+            """)
+
+            cursor.execute("""
+                DELETE FROM battle_sesiones
+                WHERE activo = FALSE
+                  AND COALESCE(reclamado_en, finalizado_en, cancelado_en, expira_en, creado_en)
+                      < NOW() - INTERVAL '30 days'
+            """)
+
+        if existe_tabla(cursor, "mapa_encuentros"):
+            cursor.execute("""
+                UPDATE mapa_encuentros
+                SET activo = FALSE,
+                    cancelado_en = COALESCE(cancelado_en, NOW())
+                WHERE activo = TRUE
+                  AND expira_en <= NOW()
+            """)
+
+            cursor.execute("""
+                DELETE FROM mapa_encuentros
+                WHERE activo = FALSE
+                  AND COALESCE(consumido_en, cancelado_en, expira_en, creado_en)
+                      < NOW() - INTERVAL '1 day'
+            """)
+    except Exception as error:
+        print("Error limpiando tablas operativas:", error)
+
+
+def debe_registrar_log_maps(endpoint: str, status_code: int, motivo: str | None = None) -> bool:
+    endpoint = str(endpoint or "").strip().lower()
+    status_code = int(status_code or 0)
+    motivo_normalizado = str(motivo or "").strip().lower()
+
+    if status_code >= 400:
+        return True
+
+    if endpoint == "intentar-captura" and motivo_normalizado == "capturado":
+        return True
+
+    return False
+
+
 def registrar_log_maps(
     cursor,
     *,
@@ -304,7 +426,12 @@ def registrar_log_maps(
     zona_id: int | None = None,
     encuentro_id: int | None = None,
 ):
+    limpiar_tablas_operativas_si_corresponde(cursor)
+
     if not existe_tabla(cursor, "maps_request_log"):
+        return
+
+    if not debe_registrar_log_maps(endpoint, status_code, motivo):
         return
 
     ip = obtener_ip_request(request)
@@ -336,46 +463,35 @@ def registrar_log_maps(
 
 
 def validar_rate_limit_maps(cursor, usuario_id: int, endpoint: str) -> str | None:
-    if not existe_tabla(cursor, "maps_request_log"):
-        return None
+    limpiar_tablas_operativas_si_corresponde(cursor)
 
     config = MAPS_RATE_LIMIT_CONFIG.get(endpoint)
     if not config:
         return None
 
-    cursor.execute(
-        """
-        SELECT
-            COUNT(*) AS total,
-            MAX(created_at) AS ultima_fecha
-        FROM maps_request_log
-        WHERE usuario_id = %s
-          AND endpoint = %s
-          AND created_at >= (CURRENT_TIMESTAMP - (%s || ' seconds')::interval)
-        """,
-        (int(usuario_id), str(endpoint), int(config["window_seconds"]))
-    )
-    row = cursor.fetchone() or {}
+    now_ms = int(time.time() * 1000)
+    limpiar_rate_limit_memoria(endpoint, now_ms)
 
-    total = int(row.get("total") or 0)
-    ultima_fecha = row.get("ultima_fecha")
+    buckets = MAPS_RATE_LIMIT_MEMORIA.setdefault(endpoint, {})
+    usuario_key = int(usuario_id)
+    cola = buckets.setdefault(usuario_key, deque())
 
-    if ultima_fecha is not None:
-        diferencia_ms = max(0, int((datetime.now() - ultima_fecha).total_seconds() * 1000))
+    if cola:
+        diferencia_ms = max(0, now_ms - int(cola[-1]))
         if diferencia_ms < int(config["min_interval_ms"]):
             return (
                 f"Demasiadas acciones seguidas en {endpoint}. "
                 f"Espera {int(config['min_interval_ms'])} ms antes de intentar otra vez."
             )
 
-    if total >= int(config["max_requests"]):
+    if len(cola) >= int(config["max_requests"]):
         return (
             f"Demasiadas solicitudes recientes en {endpoint}. "
             f"Límite: {int(config['max_requests'])} cada {int(config['window_seconds'])} segundos."
         )
 
+    cola.append(now_ms)
     return None
-
 
 def limpiar_cache_temporal(diccionario: dict, now_ts: int | None = None):
     if now_ts is None:
@@ -460,46 +576,41 @@ def obtener_select_stats_especiales(cursor, table_name: str, alias: str):
     )
 
 
+
 def registrar_actividad_usuario(cursor, usuario_id: int, pagina: str = "global", accion: str = "heartbeat", detalle: str | None = None, sesion_token: str | None = None, online: bool = True):
+    limpiar_tablas_operativas_si_corresponde(cursor)
+
     if not existe_tabla(cursor, "usuario_actividad"):
         return None
 
     pagina = normalizar_pagina_actividad(pagina)
     accion = normalizar_accion_actividad(accion)
-    sesion_token = str(sesion_token or "").strip() or None
     detalle = str(detalle or "").strip() or None
 
-    if sesion_token:
-        cursor.execute(
-            """
-            INSERT INTO usuario_actividad
-                (usuario_id, pagina, accion, detalle, sesion_token, online, ultima_actividad, creado_en, actualizado_en)
-            VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW(), NOW())
-            ON CONFLICT (usuario_id, sesion_token)
-            DO UPDATE SET
-                pagina = EXCLUDED.pagina,
-                accion = EXCLUDED.accion,
-                detalle = EXCLUDED.detalle,
-                online = EXCLUDED.online,
-                ultima_actividad = NOW(),
-                actualizado_en = NOW()
-            RETURNING id, ultima_actividad
-            """,
-            (usuario_id, pagina, accion, detalle, sesion_token, bool(online))
-        )
-        return cursor.fetchone()
+    sesion_token = str(sesion_token or "").strip()
+    if not sesion_token:
+        sesion_token = f"fallback:{pagina}"
+
+    sesion_token = sesion_token[:120]
 
     cursor.execute(
         """
         INSERT INTO usuario_actividad
             (usuario_id, pagina, accion, detalle, sesion_token, online, ultima_actividad, creado_en, actualizado_en)
-        VALUES (%s, %s, %s, %s, NULL, %s, NOW(), NOW(), NOW())
+        VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW(), NOW())
+        ON CONFLICT (usuario_id, sesion_token)
+        DO UPDATE SET
+            pagina = EXCLUDED.pagina,
+            accion = EXCLUDED.accion,
+            detalle = EXCLUDED.detalle,
+            online = EXCLUDED.online,
+            ultima_actividad = NOW(),
+            actualizado_en = NOW()
         RETURNING id, ultima_actividad
         """,
-        (usuario_id, pagina, accion, detalle, bool(online))
+        (usuario_id, pagina, accion, detalle, sesion_token, bool(online))
     )
     return cursor.fetchone()
-
 
 def obtener_usuarios_activos_resumen_data(ttl_segundos: int = USUARIO_ACTIVIDAD_TTL_SEGUNDOS):
     conn = get_connection()
@@ -699,7 +810,10 @@ def crear_token_simple(longitud: int = 32) -> str:
     return secrets.token_urlsafe(longitud)
 
 
+
 def invalidar_encuentros_activos_usuario(cursor, usuario_id: int):
+    limpiar_tablas_operativas_si_corresponde(cursor)
+
     if not existe_tabla(cursor, "mapa_encuentros"):
         return
     cursor.execute(
@@ -712,7 +826,6 @@ def invalidar_encuentros_activos_usuario(cursor, usuario_id: int):
         """,
         (usuario_id,)
     )
-
 
 def obtener_encuentro_activo_por_token(cursor, token: str, usuario_id: int, for_update: bool = False):
     if not existe_tabla(cursor, "mapa_encuentros"):
@@ -736,7 +849,10 @@ def obtener_encuentro_activo_por_token(cursor, token: str, usuario_id: int, for_
     return cursor.fetchone()
 
 
+
 def invalidar_sesiones_battle_activas(cursor, usuario_id: int):
+    limpiar_tablas_operativas_si_corresponde(cursor)
+
     if not existe_tabla(cursor, "battle_sesiones"):
         return
     cursor.execute(
@@ -750,7 +866,6 @@ def invalidar_sesiones_battle_activas(cursor, usuario_id: int):
         """,
         (usuario_id,)
     )
-
 
 def obtener_sesion_battle_por_token(cursor, token: str, usuario_id: int, for_update: bool = False):
     if not existe_tabla(cursor, "battle_sesiones"):
@@ -3345,9 +3460,6 @@ def intentar_captura(request: Request, payload: IntentoCapturaPayload, usuario=D
                 "item_id": int(payload.item_id),
             }
 
-        # IMPORTANTE:
-        # si falla la captura, NO consumimos el encuentro.
-        # Solo se descuenta la Poké Ball y el jugador puede volver a intentar.
         registrar_log_maps(
             cursor,
             usuario_id=usuario["id"],
@@ -3382,6 +3494,7 @@ def intentar_captura(request: Request, payload: IntentoCapturaPayload, usuario=D
     finally:
         cursor.close()
         release_connection(conn)
+
 
 @router.get("/tienda/items")
 def obtener_items_tienda():
