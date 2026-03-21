@@ -593,24 +593,69 @@ def registrar_actividad_usuario(cursor, usuario_id: int, pagina: str = "global",
 
     sesion_token = sesion_token[:120]
 
-    cursor.execute(
-        """
-        INSERT INTO usuario_actividad
-            (usuario_id, pagina, accion, detalle, sesion_token, online, ultima_actividad, creado_en, actualizado_en)
-        VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW(), NOW())
-        ON CONFLICT (usuario_id, sesion_token)
-        DO UPDATE SET
-            pagina = EXCLUDED.pagina,
-            accion = EXCLUDED.accion,
-            detalle = EXCLUDED.detalle,
-            online = EXCLUDED.online,
-            ultima_actividad = NOW(),
-            actualizado_en = NOW()
-        RETURNING id, ultima_actividad
-        """,
-        (usuario_id, pagina, accion, detalle, sesion_token, bool(online))
-    )
-    return cursor.fetchone()
+    try:
+        cursor.execute(
+            """
+            INSERT INTO usuario_actividad
+                (usuario_id, pagina, accion, detalle, sesion_token, online, ultima_actividad, creado_en, actualizado_en)
+            VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW(), NOW())
+            ON CONFLICT (usuario_id, sesion_token)
+            DO UPDATE SET
+                pagina = EXCLUDED.pagina,
+                accion = EXCLUDED.accion,
+                detalle = EXCLUDED.detalle,
+                online = EXCLUDED.online,
+                ultima_actividad = NOW(),
+                actualizado_en = NOW()
+            RETURNING id, ultima_actividad
+            """,
+            (usuario_id, pagina, accion, detalle, sesion_token, bool(online))
+        )
+        return cursor.fetchone()
+    except Exception as error:
+        print("Aviso registrar_actividad_usuario, fallback manual:", error)
+
+        cursor.execute(
+            """
+            SELECT id
+            FROM usuario_actividad
+            WHERE usuario_id = %s
+              AND sesion_token = %s
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (usuario_id, sesion_token)
+        )
+        existente = cursor.fetchone()
+
+        if existente:
+            cursor.execute(
+                """
+                UPDATE usuario_actividad
+                SET pagina = %s,
+                    accion = %s,
+                    detalle = %s,
+                    online = %s,
+                    ultima_actividad = NOW(),
+                    actualizado_en = NOW()
+                WHERE id = %s
+                RETURNING id, ultima_actividad
+                """,
+                (pagina, accion, detalle, bool(online), int(existente["id"]))
+            )
+            return cursor.fetchone()
+
+        cursor.execute(
+            """
+            INSERT INTO usuario_actividad
+                (usuario_id, pagina, accion, detalle, sesion_token, online, ultima_actividad, creado_en, actualizado_en)
+            VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW(), NOW())
+            RETURNING id, ultima_actividad
+            """,
+            (usuario_id, pagina, accion, detalle, sesion_token, bool(online))
+        )
+        return cursor.fetchone()
+
 
 def obtener_usuarios_activos_resumen_data(ttl_segundos: int = USUARIO_ACTIVIDAD_TTL_SEGUNDOS):
     conn = get_connection()
@@ -3443,13 +3488,16 @@ def intentar_captura(request: Request, payload: IntentoCapturaPayload, usuario=D
                 zona_id=int(encuentro["zona_id"]),
                 encuentro_id=encuentro_id,
             )
-            registrar_actividad_usuario(
-                cursor,
-                usuario["id"],
-                pagina="maps",
-                accion="capture",
-                detalle=f"pokemon:{int(encuentro['pokemon_id'])}"
-            )
+            try:
+                registrar_actividad_usuario(
+                    cursor,
+                    usuario["id"],
+                    pagina="maps",
+                    accion="capture",
+                    detalle=f"pokemon:{int(encuentro['pokemon_id'])}"
+                )
+            except Exception as actividad_error:
+                print("Aviso actividad capture maps:", actividad_error)
             conn.commit()
 
             return {
@@ -3486,7 +3534,7 @@ def intentar_captura(request: Request, payload: IntentoCapturaPayload, usuario=D
         raise
     except Exception as error:
         conn.rollback()
-        print("Error en /maps/intentar-captura:", error)
+        print("Error en /maps/intentar-captura:", repr(error))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="No se pudo procesar el intento de captura"
