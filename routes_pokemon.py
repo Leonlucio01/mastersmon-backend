@@ -6,7 +6,7 @@ import secrets
 import time
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 from pydantic import BaseModel
 
 from database import get_connection, get_cursor, release_connection
@@ -41,6 +41,18 @@ ACTIVIDAD_PAGINAS_VALIDAS = {
 }
 ACTIVIDAD_ACCIONES_VALIDAS = {
     "heartbeat", "login", "logout", "view", "move", "battle_start", "battle_end", "capture", "shop", "evolution", "team_save"
+}
+MAPS_RATE_LIMIT_CONFIG = {
+    "encuentro": {
+        "window_seconds": 10,
+        "max_requests": 12,
+        "min_interval_ms": 200,
+    },
+    "intentar-captura": {
+        "window_seconds": 10,
+        "max_requests": 6,
+        "min_interval_ms": 500,
+    },
 }
 
 
@@ -258,6 +270,111 @@ def validar_usuario_payload(usuario_id_payload: int | None, usuario_id_real: int
             status_code=status.HTTP_403_FORBIDDEN,
             detail="No puedes operar sobre otro usuario"
         )
+
+
+def obtener_ip_request(request: Request | None) -> str | None:
+    if request is None:
+        return None
+
+    try:
+        forwarded_for = str(request.headers.get("x-forwarded-for", "") or "").split(",")[0].strip()
+        if forwarded_for:
+            return forwarded_for[:64]
+    except Exception:
+        pass
+
+    try:
+        if request.client and request.client.host:
+            return str(request.client.host)[:64]
+    except Exception:
+        pass
+
+    return None
+
+
+def registrar_log_maps(
+    cursor,
+    *,
+    usuario_id: int,
+    endpoint: str,
+    request: Request | None = None,
+    status_code: int = 200,
+    motivo: str | None = None,
+    token: str | None = None,
+    zona_id: int | None = None,
+    encuentro_id: int | None = None,
+):
+    if not existe_tabla(cursor, "maps_request_log"):
+        return
+
+    ip = obtener_ip_request(request)
+    user_agent = None
+    if request is not None:
+        try:
+            user_agent = str(request.headers.get("user-agent", "") or "")[:500]
+        except Exception:
+            user_agent = None
+
+    cursor.execute(
+        """
+        INSERT INTO maps_request_log
+        (usuario_id, endpoint, ip, user_agent, status_code, motivo, token, zona_id, encuentro_id)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            int(usuario_id),
+            str(endpoint),
+            ip,
+            user_agent,
+            int(status_code),
+            motivo,
+            token,
+            zona_id,
+            encuentro_id,
+        )
+    )
+
+
+def validar_rate_limit_maps(cursor, usuario_id: int, endpoint: str) -> str | None:
+    if not existe_tabla(cursor, "maps_request_log"):
+        return None
+
+    config = MAPS_RATE_LIMIT_CONFIG.get(endpoint)
+    if not config:
+        return None
+
+    cursor.execute(
+        """
+        SELECT
+            COUNT(*) AS total,
+            MAX(created_at) AS ultima_fecha
+        FROM maps_request_log
+        WHERE usuario_id = %s
+          AND endpoint = %s
+          AND created_at >= (CURRENT_TIMESTAMP - (%s || ' seconds')::interval)
+        """,
+        (int(usuario_id), str(endpoint), int(config["window_seconds"]))
+    )
+    row = cursor.fetchone() or {}
+
+    total = int(row.get("total") or 0)
+    ultima_fecha = row.get("ultima_fecha")
+
+    if ultima_fecha is not None:
+        diferencia_ms = max(0, int((datetime.now() - ultima_fecha).total_seconds() * 1000))
+        if diferencia_ms < int(config["min_interval_ms"]):
+            return (
+                f"Demasiadas acciones seguidas en {endpoint}. "
+                f"Espera {int(config['min_interval_ms'])} ms antes de intentar otra vez."
+            )
+
+    if total >= int(config["max_requests"]):
+        return (
+            f"Demasiadas solicitudes recientes en {endpoint}. "
+            f"Límite: {int(config['max_requests'])} cada {int(config['window_seconds'])} segundos."
+        )
+
+    return None
 
 
 def limpiar_cache_temporal(diccionario: dict, now_ts: int | None = None):
@@ -2778,12 +2895,29 @@ async def websocket_maps(websocket: WebSocket):
 
 
 @router.post("/maps/encuentro")
-def generar_encuentro(payload: EncuentroPayload, usuario=Depends(get_current_user)):
+def generar_encuentro(request: Request, payload: EncuentroPayload, usuario=Depends(get_current_user)):
     conn = get_connection()
     cursor = get_cursor(conn)
 
     try:
         validar_usuario_payload(payload.usuario_id, usuario["id"])
+
+        bloqueo_rate = validar_rate_limit_maps(cursor, usuario["id"], "encuentro")
+        if bloqueo_rate:
+            registrar_log_maps(
+                cursor,
+                usuario_id=usuario["id"],
+                endpoint="encuentro",
+                request=request,
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                motivo=bloqueo_rate,
+                zona_id=int(payload.zona_id),
+            )
+            conn.commit()
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=bloqueo_rate,
+            )
 
         if not existe_tabla(cursor, "mapa_encuentros"):
             raise HTTPException(
@@ -2818,6 +2952,16 @@ def generar_encuentro(payload: EncuentroPayload, usuario=Depends(get_current_use
         rows = cursor.fetchall()
 
         if not rows:
+            registrar_log_maps(
+                cursor,
+                usuario_id=usuario["id"],
+                endpoint="encuentro",
+                request=request,
+                status_code=status.HTTP_404_NOT_FOUND,
+                motivo="No hay Pokémon configurados para esta zona",
+                zona_id=int(payload.zona_id),
+            )
+            conn.commit()
             return {"error": "No hay Pokémon configurados para esta zona"}
 
         pesos = [float(r["probabilidad"] or 0) for r in rows]
@@ -2869,6 +3013,17 @@ def generar_encuentro(payload: EncuentroPayload, usuario=Depends(get_current_use
             )
         )
         encuentro_row = cursor.fetchone()
+
+        registrar_log_maps(
+            cursor,
+            usuario_id=usuario["id"],
+            endpoint="encuentro",
+            request=request,
+            status_code=status.HTTP_200_OK,
+            token=encuentro_token,
+            zona_id=int(payload.zona_id),
+            encuentro_id=int(encuentro_row["id"]) if encuentro_row and encuentro_row.get("id") else None,
+        )
         conn.commit()
 
         return {
@@ -2892,20 +3047,55 @@ def generar_encuentro(payload: EncuentroPayload, usuario=Depends(get_current_use
             "encuentro_ttl_segundos": ENCUENTRO_TOKEN_TTL_SEGUNDOS,
             "expira_en": encuentro_row["expira_en"].isoformat() if encuentro_row and encuentro_row.get("expira_en") else None,
         }
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as error:
+        conn.rollback()
+        print("Error en /maps/encuentro:", error)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="No se pudo generar el encuentro"
+        )
     finally:
         cursor.close()
         release_connection(conn)
 
-
 @router.post("/maps/intentar-captura")
-def intentar_captura(payload: IntentoCapturaPayload, usuario=Depends(get_current_user)):
+def intentar_captura(request: Request, payload: IntentoCapturaPayload, usuario=Depends(get_current_user)):
     conn = get_connection()
     cursor = get_cursor(conn)
 
     try:
         validar_usuario_payload(payload.usuario_id, usuario["id"])
 
+        bloqueo_rate = validar_rate_limit_maps(cursor, usuario["id"], "intentar-captura")
+        if bloqueo_rate:
+            registrar_log_maps(
+                cursor,
+                usuario_id=usuario["id"],
+                endpoint="intentar-captura",
+                request=request,
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                motivo=bloqueo_rate,
+                token=payload.encuentro_token,
+            )
+            conn.commit()
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=bloqueo_rate,
+            )
+
         if not payload.encuentro_token:
+            registrar_log_maps(
+                cursor,
+                usuario_id=usuario["id"],
+                endpoint="intentar-captura",
+                request=request,
+                status_code=status.HTTP_400_BAD_REQUEST,
+                motivo="encuentro_token es obligatorio",
+            )
+            conn.commit()
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="encuentro_token es obligatorio"
@@ -2919,203 +3109,251 @@ def intentar_captura(payload: IntentoCapturaPayload, usuario=Depends(get_current
 
         encuentro = obtener_encuentro_activo_por_token(cursor, payload.encuentro_token, usuario["id"], for_update=True)
         if not encuentro:
+            registrar_log_maps(
+                cursor,
+                usuario_id=usuario["id"],
+                endpoint="intentar-captura",
+                request=request,
+                status_code=status.HTTP_400_BAD_REQUEST,
+                motivo="Encuentro inválido, expirado o ya consumido",
+                token=payload.encuentro_token,
+            )
+            conn.commit()
             return {
                 "capturado": False,
                 "mensaje": "Este encuentro expiró o ya no es válido"
             }
 
+        encuentro_id = int(encuentro["id"])
+
         if int(payload.pokemon_id or 0) != int(encuentro["pokemon_id"]):
+            registrar_log_maps(
+                cursor,
+                usuario_id=usuario["id"],
+                endpoint="intentar-captura",
+                request=request,
+                status_code=status.HTTP_400_BAD_REQUEST,
+                motivo="El Pokémon enviado no coincide con el encuentro",
+                token=payload.encuentro_token,
+                zona_id=int(encuentro["zona_id"]),
+                encuentro_id=encuentro_id,
+            )
+            conn.commit()
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="El Pokémon del encuentro no coincide con el enviado"
             )
 
         if int(payload.nivel or 0) != int(encuentro["nivel"]):
+            registrar_log_maps(
+                cursor,
+                usuario_id=usuario["id"],
+                endpoint="intentar-captura",
+                request=request,
+                status_code=status.HTTP_400_BAD_REQUEST,
+                motivo="El nivel enviado no coincide con el encuentro",
+                token=payload.encuentro_token,
+                zona_id=int(encuentro["zona_id"]),
+                encuentro_id=encuentro_id,
+            )
+            conn.commit()
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="El nivel del encuentro no coincide con el enviado"
             )
 
         if bool(payload.es_shiny) != bool(encuentro["es_shiny"]):
+            registrar_log_maps(
+                cursor,
+                usuario_id=usuario["id"],
+                endpoint="intentar-captura",
+                request=request,
+                status_code=status.HTTP_400_BAD_REQUEST,
+                motivo="La variante shiny no coincide con el encuentro",
+                token=payload.encuentro_token,
+                zona_id=int(encuentro["zona_id"]),
+                encuentro_id=encuentro_id,
+            )
+            conn.commit()
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="La variante del encuentro no coincide con la enviada"
+                detail="La variante shiny del encuentro no coincide con la enviada"
             )
 
         cursor.execute("""
-            SELECT id, nombre, bonus_captura
-            FROM items
-            WHERE id = %s
-        """, (payload.item_id,))
-        item_db = cursor.fetchone()
-
-        if not item_db:
-            return {
-                "capturado": False,
-                "mensaje": "El item seleccionado no existe"
-            }
-
-        cursor.execute("""
-            UPDATE usuario_items
-            SET cantidad = cantidad - 1
-            WHERE usuario_id = %s
-              AND item_id = %s
-              AND cantidad > 0
-            RETURNING id, cantidad
+            SELECT ui.id, ui.item_id, ui.cantidad, i.nombre, i.bonus_captura
+            FROM usuario_items ui
+            INNER JOIN items i ON i.id = ui.item_id
+            WHERE ui.usuario_id = %s
+              AND ui.item_id = %s
+            FOR UPDATE
         """, (usuario["id"], payload.item_id))
         item_usuario = cursor.fetchone()
 
-        if not item_usuario:
+        if not item_usuario or int(item_usuario["cantidad"] or 0) <= 0:
+            registrar_log_maps(
+                cursor,
+                usuario_id=usuario["id"],
+                endpoint="intentar-captura",
+                request=request,
+                status_code=status.HTTP_400_BAD_REQUEST,
+                motivo="Item inexistente o sin stock",
+                token=payload.encuentro_token,
+                zona_id=int(encuentro["zona_id"]),
+                encuentro_id=encuentro_id,
+            )
+            conn.commit()
             return {
                 "capturado": False,
-                "mensaje": f"No tienes {item_db['nombre']}"
+                "mensaje": "No tienes ese item disponible"
             }
 
-        nombre_item = item_db["nombre"]
-        es_shiny = bool(encuentro["es_shiny"])
+        bonus_captura = int(item_usuario["bonus_captura"] or 0)
+        nombre_item = item_usuario["nombre"]
+        probabilidad_base = 35 + bonus_captura
+        if bool(encuentro["es_shiny"]) and str(nombre_item).strip().lower() != "master ball":
+            probabilidad_base -= 10
+        probabilidad = max(1, min(100, probabilidad_base))
+        capturado = random.randint(1, 100) <= probabilidad
 
-        if nombre_item == "Poke Ball":
-            probabilidad = 50
-        elif nombre_item == "Super Ball":
-            probabilidad = 65
-        elif nombre_item == "Ultra Ball":
-            probabilidad = 80
-        elif nombre_item == "Master Ball":
-            probabilidad = 100
-        else:
-            probabilidad = 35 + int(item_db["bonus_captura"] or 0)
+        cursor.execute(
+            """
+            UPDATE usuario_items
+            SET cantidad = cantidad - 1
+            WHERE id = %s
+            """,
+            (item_usuario["id"],)
+        )
 
-        if es_shiny and nombre_item != "Master Ball":
-            probabilidad -= 10
-
-        probabilidad = max(1, min(probabilidad, 100))
-        captura_exitosa = random.randint(1, 100) <= probabilidad
-
-        if captura_exitosa:
-            p_atk_sp_sql, p_def_sp_sql = obtener_select_stats_especiales(cursor, "pokemon", "p")
-            cursor.execute(f"""
-                SELECT hp, ataque, defensa, velocidad, {p_atk_sp_sql}, {p_def_sp_sql}
-                FROM pokemon p
-                WHERE id = %s
-            """, (encuentro["pokemon_id"],))
-            base = cursor.fetchone()
-
-            if not base:
-                conn.rollback()
-                return {
-                    "capturado": False,
-                    "mensaje": "Pokémon no encontrado"
-                }
-
-            nivel_captura = max(1, min(int(encuentro["nivel"] or 1), MAX_NIVEL_POKEMON))
-            stats = calcular_stats(
-                base["hp"],
-                base["ataque"],
-                base["defensa"],
-                base["velocidad"],
-                nivel_captura,
-                es_shiny,
-                0,
-                0,
-                0,
-                0,
-                base.get("ataque_especial", base["ataque"]),
-                base.get("defensa_especial", base["defensa"]),
-            )
-            experiencia_total_inicial = calcular_experiencia_total_base(nivel_captura, 0)
-
-            if stats_especiales_habilitados(cursor, "usuario_pokemon"):
-                cursor.execute("""
-                    INSERT INTO usuario_pokemon
-                    (
-                        usuario_id, pokemon_id, nivel, experiencia, experiencia_total, victorias_total,
-                        hp_actual, hp_max, ataque, defensa, velocidad, ataque_especial, defensa_especial, es_shiny
-                    )
-                    VALUES (%s, %s, %s, 0, %s, 0, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    usuario["id"],
-                    encuentro["pokemon_id"],
-                    nivel_captura,
-                    experiencia_total_inicial,
-                    stats["hp_max"],
-                    stats["hp_max"],
-                    stats["ataque"],
-                    stats["defensa"],
-                    stats["velocidad"],
-                    stats["ataque_especial"],
-                    stats["defensa_especial"],
-                    es_shiny,
-                ))
-            else:
-                cursor.execute("""
-                    INSERT INTO usuario_pokemon
-                    (
-                        usuario_id, pokemon_id, nivel, experiencia, experiencia_total, victorias_total,
-                        hp_actual, hp_max, ataque, defensa, velocidad, es_shiny
-                    )
-                    VALUES (%s, %s, %s, 0, %s, 0, %s, %s, %s, %s, %s, %s)
-                """, (
-                    usuario["id"],
-                    encuentro["pokemon_id"],
-                    nivel_captura,
-                    experiencia_total_inicial,
-                    stats["hp_max"],
-                    stats["hp_max"],
-                    stats["ataque"],
-                    stats["defensa"],
-                    stats["velocidad"],
-                    es_shiny,
-                ))
-
-            cursor.execute("""
+        if capturado:
+            cursor.execute(
+                """
                 UPDATE mapa_encuentros
                 SET activo = FALSE,
                     consumido_en = NOW()
                 WHERE id = %s
                   AND activo = TRUE
                   AND consumido_en IS NULL
-            """, (encuentro["id"],))
+                """,
+                (encuentro_id,)
+            )
 
+            if cursor.rowcount != 1:
+                registrar_log_maps(
+                    cursor,
+                    usuario_id=usuario["id"],
+                    endpoint="intentar-captura",
+                    request=request,
+                    status_code=status.HTTP_409_CONFLICT,
+                    motivo="El encuentro ya fue consumido por otra solicitud",
+                    token=payload.encuentro_token,
+                    zona_id=int(encuentro["zona_id"]),
+                    encuentro_id=encuentro_id,
+                )
+                conn.commit()
+                return {
+                    "capturado": False,
+                    "mensaje": "Este encuentro ya fue utilizado en otra solicitud"
+                }
+
+            cursor.execute("""
+                INSERT INTO usuario_pokemon (
+                    usuario_id, pokemon_id, nivel, experiencia, experiencia_total, es_shiny,
+                    hp_actual, hp_max, ataque, defensa, velocidad,
+                    ataque_especial, defensa_especial,
+                    bonus_hp_renacer, bonus_ataque_renacer, bonus_defensa_renacer, bonus_velocidad_renacer,
+                    victorias_total
+                )
+                VALUES (%s, %s, %s, 0, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0, 0, 0, 0, 0)
+                RETURNING id
+            """, (
+                usuario["id"],
+                int(encuentro["pokemon_id"]),
+                int(encuentro["nivel"]),
+                calcular_experiencia_total_base(int(encuentro["nivel"]), 0),
+                bool(encuentro["es_shiny"]),
+                int(encuentro["hp_max"]),
+                int(encuentro["hp_max"]),
+                int(encuentro["ataque"]),
+                int(encuentro["defensa"]),
+                int(encuentro["velocidad"]),
+                int(encuentro.get("ataque_especial") or encuentro["ataque"]),
+                int(encuentro.get("defensa_especial") or encuentro["defensa"]),
+            ))
+            usuario_pokemon_insertado = cursor.fetchone()
+
+            registrar_log_maps(
+                cursor,
+                usuario_id=usuario["id"],
+                endpoint="intentar-captura",
+                request=request,
+                status_code=status.HTTP_200_OK,
+                motivo="capturado",
+                token=payload.encuentro_token,
+                zona_id=int(encuentro["zona_id"]),
+                encuentro_id=encuentro_id,
+            )
             registrar_actividad_usuario(
                 cursor,
                 usuario["id"],
                 pagina="maps",
                 accion="capture",
-                detalle=f"pokemon:{encuentro['pokemon_id']}"
+                detalle=f"pokemon:{int(encuentro['pokemon_id'])}"
             )
             conn.commit()
 
             return {
                 "capturado": True,
-                "mensaje": f"¡{nombre_item} usada con éxito! Pokémon capturado.",
+                "mensaje": f"¡Has capturado a {encuentro['pokemon_id']} con {nombre_item}!",
                 "probabilidad": probabilidad,
-                "item_id": payload.item_id,
-                "experiencia_total": experiencia_total_inicial,
-                "victorias_total": 0
+                "usuario_pokemon_id": int(usuario_pokemon_insertado["id"]) if usuario_pokemon_insertado else None,
+                "item_id": int(item_usuario["item_id"]),
             }
 
+        cursor.execute(
+            """
+            UPDATE mapa_encuentros
+            SET activo = FALSE,
+                consumido_en = NOW()
+            WHERE id = %s
+              AND activo = TRUE
+              AND consumido_en IS NULL
+            """,
+            (encuentro_id,)
+        )
+
+        registrar_log_maps(
+            cursor,
+            usuario_id=usuario["id"],
+            endpoint="intentar-captura",
+            request=request,
+            status_code=status.HTTP_200_OK,
+            motivo="escape",
+            token=payload.encuentro_token,
+            zona_id=int(encuentro["zona_id"]),
+            encuentro_id=encuentro_id,
+        )
         conn.commit()
+
         return {
             "capturado": False,
             "mensaje": f"{nombre_item} usada, pero el Pokémon escapó.",
             "probabilidad": probabilidad,
-            "item_id": payload.item_id
+            "item_id": int(item_usuario["item_id"])
         }
     except HTTPException:
         conn.rollback()
         raise
+    except Exception as error:
+        conn.rollback()
+        print("Error en /maps/intentar-captura:", error)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="No se pudo procesar el intento de captura"
+        )
     finally:
         cursor.close()
         release_connection(conn)
-
-
-# =========================================================
-# TIENDA
-# =========================================================
-
-# =========================================================
-# TIENDA
-# =========================================================
 
 @router.get("/tienda/items")
 def obtener_items_tienda():
