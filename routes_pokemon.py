@@ -1,13 +1,16 @@
 import asyncio
 import re
 import random
+import secrets
+import time
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
 from pydantic import BaseModel
 
 from database import get_connection, get_cursor, release_connection
-from auth import verify_google_token, create_access_token, get_current_user, get_current_user_from_token
+from auth import verify_google_token, create_access_token, get_current_user, get_current_user_from_token, JWT_SECRET, JWT_ALGORITHM
+from jose import jwt, JWTError
 
 router = APIRouter()
 MAX_NIVEL_POKEMON = 200
@@ -17,6 +20,16 @@ MAPS_NODE_ID_REGEX = re.compile(r"^[a-z0-9_-]{1,60}$")
 MAPS_PRESENCIA_TTL_SEGUNDOS = 25
 MAPS_WEBSOCKET_CONEXIONES = {}
 MAPS_WEBSOCKET_LOCK = asyncio.Lock()
+ENCUENTRO_TOKEN_TTL_SEGUNDOS = 60 * 5
+BATTLE_RECOMPENSA_COOLDOWN_SEGUNDOS = 12
+BATTLE_RECOMPENSA_ULTIMO_USO = {}
+MAPS_ENCUENTROS_CONSUMIDOS = {}
+RECOMPENSAS_ARENA_PERMITIDAS = {
+    (2500, 2500): {"codigo": "normal", "exp": 2500, "pokedolares": 2500},
+    (3500, 5000): {"codigo": "challenge", "exp": 3500, "pokedolares": 5000},
+    (4500, 10000): {"codigo": "expert", "exp": 4500, "pokedolares": 10000},
+    (6000, 15000): {"codigo": "master", "exp": 6000, "pokedolares": 15000},
+}
 
 
 # =========================================================
@@ -28,25 +41,26 @@ class GoogleLoginPayload(BaseModel):
 
 
 class CapturaPayload(BaseModel):
-    usuario_id: int
+    usuario_id: int | None = None
     pokemon_id: int
     nivel: int = 1
     es_shiny: bool = False
 
 
 class EncuentroPayload(BaseModel):
-    usuario_id: int
+    usuario_id: int | None = None
     zona_id: int
 
 
 class IntentoCapturaPayload(BaseModel):
-    usuario_id: int
+    usuario_id: int | None = None
     pokemon_id: int
     nivel: int
     es_shiny: bool = False
     hp_actual: int = 100
     hp_maximo: int = 100
     item_id: int
+    encuentro_token: str | None = None
 
 
 class ExpPayload(BaseModel):
@@ -60,14 +74,14 @@ class PokedolaresPayload(BaseModel):
 
 
 class RecompensaBatallaPayload(BaseModel):
-    usuario_id: int
+    usuario_id: int | None = None
     usuario_pokemon_ids: list[int]
     exp_ganada: int = 25
     pokedolares_ganados: int = 500
 
 
 class CompraItemPayload(BaseModel):
-    usuario_id: int
+    usuario_id: int | None = None
     item_id: int
     cantidad: int = 1
 
@@ -75,17 +89,17 @@ class CompraItemPayload(BaseModel):
 class EvolucionItemPayload(BaseModel):
     usuario_pokemon_id: int
     item_id: int
-    usuario_id: int
+    usuario_id: int | None = None
 
 
 class SoltarPokemonPayload(BaseModel):
     usuario_pokemon_id: int
-    usuario_id: int
+    usuario_id: int | None = None
 
 
 class EvolucionNivelPayload(BaseModel):
     usuario_pokemon_id: int
-    usuario_id: int
+    usuario_id: int | None = None
 
 
 class ActualizarAvatarPayload(BaseModel):
@@ -185,6 +199,134 @@ def normalizar_limit(limit: int | None, default: int = 10, maximo: int = 100) ->
         valor = default
 
     return max(1, min(valor, maximo))
+
+
+def validar_usuario_payload(usuario_id_payload: int | None, usuario_id_real: int):
+    if usuario_id_payload is None:
+        return
+
+    try:
+        usuario_id_payload = int(usuario_id_payload)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="usuario_id inválido"
+        )
+
+    if int(usuario_id_payload) != int(usuario_id_real):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No puedes operar sobre otro usuario"
+        )
+
+
+def limpiar_cache_temporal(diccionario: dict, now_ts: int | None = None):
+    if now_ts is None:
+        now_ts = int(time.time())
+
+    expirados = [clave for clave, expira_en in diccionario.items() if int(expira_en or 0) <= now_ts]
+    for clave in expirados:
+        diccionario.pop(clave, None)
+
+
+def validar_cooldown_recompensa_batalla(usuario_id: int):
+    now_ts = int(time.time())
+    limpiar_cache_temporal(BATTLE_RECOMPENSA_ULTIMO_USO, now_ts)
+
+    ultimo_uso = int(BATTLE_RECOMPENSA_ULTIMO_USO.get(int(usuario_id), 0) or 0)
+    restante = ultimo_uso - now_ts
+
+    if restante > 0:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Espera {restante}s antes de reclamar otra recompensa de batalla"
+        )
+
+
+def registrar_cooldown_recompensa_batalla(usuario_id: int):
+    BATTLE_RECOMPENSA_ULTIMO_USO[int(usuario_id)] = int(time.time()) + BATTLE_RECOMPENSA_COOLDOWN_SEGUNDOS
+
+
+def obtener_recompensa_batalla_permitida(exp_ganada: int, pokedolares_ganados: int) -> dict:
+    try:
+        clave = (max(0, int(exp_ganada or 0)), max(0, int(pokedolares_ganados or 0)))
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Recompensa de batalla inválida"
+        )
+
+    recompensa = RECOMPENSAS_ARENA_PERMITIDAS.get(clave)
+    if not recompensa:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="La recompensa enviada no coincide con una dificultad válida"
+        )
+
+    return dict(recompensa)
+
+
+def crear_token_encuentro(usuario_id: int, zona_id: int, pokemon_id: int, nivel: int, es_shiny: bool) -> str:
+    now_ts = int(time.time())
+    payload = {
+        "type": "maps_encounter",
+        "sub": str(usuario_id),
+        "zona_id": int(zona_id),
+        "pokemon_id": int(pokemon_id),
+        "nivel": int(nivel),
+        "es_shiny": bool(es_shiny),
+        "jti": secrets.token_urlsafe(18),
+        "iat": now_ts,
+        "exp": now_ts + ENCUENTRO_TOKEN_TTL_SEGUNDOS
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def decodificar_token_encuentro(token: str) -> dict:
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="encuentro_token es obligatorio"
+        )
+
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="encuentro_token inválido o expirado"
+        )
+
+    if payload.get("type") != "maps_encounter":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="encuentro_token inválido"
+        )
+
+    try:
+        return {
+            "usuario_id": int(payload["sub"]),
+            "zona_id": int(payload["zona_id"]),
+            "pokemon_id": int(payload["pokemon_id"]),
+            "nivel": int(payload["nivel"]),
+            "es_shiny": bool(payload.get("es_shiny", False)),
+            "jti": str(payload["jti"])
+        }
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="encuentro_token incompleto"
+        )
+
+
+def encuentro_ya_fue_consumido(jti: str) -> bool:
+    now_ts = int(time.time())
+    limpiar_cache_temporal(MAPS_ENCUENTROS_CONSUMIDOS, now_ts)
+    return str(jti) in MAPS_ENCUENTROS_CONSUMIDOS
+
+
+def marcar_encuentro_consumido(jti: str):
+    MAPS_ENCUENTROS_CONSUMIDOS[str(jti)] = int(time.time()) + ENCUENTRO_TOKEN_TTL_SEGUNDOS
 
 
 def existe_tabla(cursor, table_name: str) -> bool:
@@ -1308,266 +1450,82 @@ def obtener_items_usuario(usuario_id: int):
 
 
 @router.post("/usuario/capturar")
-def capturar_pokemon(payload: CapturaPayload):
-    conn = get_connection()
-    cursor = get_cursor(conn)
-
-    try:
-        cursor.execute("""
-            SELECT hp, ataque, defensa, velocidad
-            FROM pokemon
-            WHERE id = %s
-        """, (payload.pokemon_id,))
-        base = cursor.fetchone()
-
-        if not base:
-            return {"mensaje": "Pokémon no encontrado"}
-
-        nivel_captura = max(1, min(int(payload.nivel or 1), MAX_NIVEL_POKEMON))
-
-        stats = calcular_stats(
-            base["hp"],
-            base["ataque"],
-            base["defensa"],
-            base["velocidad"],
-            nivel_captura,
-            payload.es_shiny
-        )
-
-        experiencia_total_inicial = calcular_experiencia_total_base(nivel_captura, 0)
-
-        cursor.execute("""
-            INSERT INTO usuario_pokemon
-            (
-                usuario_id, pokemon_id, nivel, experiencia, experiencia_total, victorias_total,
-                hp_actual, hp_max, ataque, defensa, velocidad, es_shiny
-            )
-            VALUES (%s, %s, %s, 0, %s, 0, %s, %s, %s, %s, %s, %s)
-        """, (
-            payload.usuario_id,
-            payload.pokemon_id,
-            nivel_captura,
-            experiencia_total_inicial,
-            stats["hp_max"],
-            stats["hp_max"],
-            stats["ataque"],
-            stats["defensa"],
-            stats["velocidad"],
-            payload.es_shiny
-        ))
-
-        conn.commit()
-
-        return {
-            "mensaje": "Pokémon agregado al usuario",
-            "stats": stats,
-            "experiencia_total": experiencia_total_inicial,
-            "victorias_total": 0
-        }
-    finally:
-        cursor.close()
-        release_connection(conn)
+def capturar_pokemon(payload: CapturaPayload, usuario=Depends(get_current_user)):
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Ruta deshabilitada por seguridad. Usa /maps/intentar-captura."
+    )
 
 
 @router.post("/usuario/ganar-exp")
-def ganar_experiencia(payload: ExpPayload):
-    conn = get_connection()
-    cursor = get_cursor(conn)
-
-    try:
-        cursor.execute("""
-            SELECT
-                up.id,
-                up.pokemon_id,
-                up.nivel,
-                up.experiencia,
-                COALESCE(up.experiencia_total, 0) AS experiencia_total,
-                up.es_shiny,
-                up.bonus_hp_renacer,
-                up.bonus_ataque_renacer,
-                up.bonus_defensa_renacer,
-                up.bonus_velocidad_renacer
-            FROM usuario_pokemon up
-            WHERE up.id = %s
-        """, (payload.usuario_pokemon_id,))
-        poke = cursor.fetchone()
-
-        if not poke:
-            return {"mensaje": "Pokémon del usuario no encontrado"}
-
-        nivel_actual = int(poke["nivel"] or 1)
-        exp_actual = int(poke["experiencia"] or 0)
-        exp_total_actual = int(poke["experiencia_total"] or 0)
-        exp_ganada = max(0, int(payload.exp_ganada or 0))
-        nuevo_exp_total = exp_total_actual + exp_ganada
-
-        cursor.execute("""
-            SELECT hp, ataque, defensa, velocidad
-            FROM pokemon
-            WHERE id = %s
-        """, (poke["pokemon_id"],))
-        base = cursor.fetchone()
-
-        if not base:
-            return {"mensaje": "Pokémon base no encontrado"}
-
-        if nivel_actual >= MAX_NIVEL_POKEMON:
-            stats = calcular_stats(
-                base["hp"],
-                base["ataque"],
-                base["defensa"],
-                base["velocidad"],
-                MAX_NIVEL_POKEMON,
-                bool(poke["es_shiny"]),
-                poke["bonus_hp_renacer"],
-                poke["bonus_ataque_renacer"],
-                poke["bonus_defensa_renacer"],
-                poke["bonus_velocidad_renacer"]
-            )
-
-            cursor.execute("""
-                UPDATE usuario_pokemon
-                SET nivel = %s,
-                    experiencia = %s,
-                    experiencia_total = %s,
-                    hp_max = %s,
-                    hp_actual = LEAST(hp_actual, %s),
-                    ataque = %s,
-                    defensa = %s,
-                    velocidad = %s
-                WHERE id = %s
-            """, (
-                MAX_NIVEL_POKEMON,
-                0,
-                nuevo_exp_total,
-                stats["hp_max"],
-                stats["hp_max"],
-                stats["ataque"],
-                stats["defensa"],
-                stats["velocidad"],
-                payload.usuario_pokemon_id
-            ))
-
-            conn.commit()
-
-            return {
-                "mensaje": "Este Pokémon ya alcanzó el nivel máximo, pero su EXP total fue acumulada",
-                "nivel": MAX_NIVEL_POKEMON,
-                "experiencia": 0,
-                "experiencia_total": nuevo_exp_total,
-                "stats": stats
-            }
-
-        nueva_exp = exp_actual + exp_ganada
-        nuevo_nivel = nivel_actual
-
-        while nuevo_nivel < MAX_NIVEL_POKEMON and nueva_exp >= (nuevo_nivel * 50):
-            nueva_exp -= (nuevo_nivel * 50)
-            nuevo_nivel += 1
-
-        if nuevo_nivel >= MAX_NIVEL_POKEMON:
-            nuevo_nivel = MAX_NIVEL_POKEMON
-            nueva_exp = 0
-
-        stats = calcular_stats(
-            base["hp"],
-            base["ataque"],
-            base["defensa"],
-            base["velocidad"],
-            nuevo_nivel,
-            bool(poke["es_shiny"]),
-            poke["bonus_hp_renacer"],
-            poke["bonus_ataque_renacer"],
-            poke["bonus_defensa_renacer"],
-            poke["bonus_velocidad_renacer"]
-        )
-
-        cursor.execute("""
-            UPDATE usuario_pokemon
-            SET nivel = %s,
-                experiencia = %s,
-                experiencia_total = %s,
-                hp_max = %s,
-                hp_actual = %s,
-                ataque = %s,
-                defensa = %s,
-                velocidad = %s
-            WHERE id = %s
-        """, (
-            nuevo_nivel,
-            nueva_exp,
-            nuevo_exp_total,
-            stats["hp_max"],
-            stats["hp_max"],
-            stats["ataque"],
-            stats["defensa"],
-            stats["velocidad"],
-            payload.usuario_pokemon_id
-        ))
-
-        conn.commit()
-
-        return {
-            "mensaje": "Experiencia actualizada",
-            "nivel": nuevo_nivel,
-            "experiencia": nueva_exp,
-            "experiencia_total": nuevo_exp_total,
-            "stats": stats
-        }
-    finally:
-        cursor.close()
-        release_connection(conn)
+def ganar_experiencia(payload: ExpPayload, usuario=Depends(get_current_user)):
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Ruta deshabilitada por seguridad. La EXP ahora se otorga desde rutas controladas."
+    )
 
 
 @router.post("/battle/recompensa-victoria")
-def recompensa_victoria_batalla(payload: RecompensaBatallaPayload):
+def recompensa_victoria_batalla(payload: RecompensaBatallaPayload, usuario=Depends(get_current_user)):
     conn = get_connection()
     cursor = get_cursor(conn)
 
     try:
-        if payload.usuario_id <= 0:
+        validar_usuario_payload(payload.usuario_id, usuario["id"])
+        validar_cooldown_recompensa_batalla(usuario["id"])
+
+        recompensa = obtener_recompensa_batalla_permitida(payload.exp_ganada, payload.pokedolares_ganados)
+        exp_ganada = int(recompensa["exp"])
+        pokedolares_ganados = int(recompensa["pokedolares"])
+
+        ids_limpios = []
+        for raw_id in payload.usuario_pokemon_ids:
+            try:
+                pokemon_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+
+            if pokemon_id <= 0 or pokemon_id in ids_limpios:
+                continue
+
+            ids_limpios.append(pokemon_id)
+
+        if not ids_limpios:
             return {
                 "ok": False,
-                "mensaje": "Usuario inválido"
+                "mensaje": "No se encontraron Pokémon válidos para otorgar recompensas"
             }
 
-        if payload.pokedolares_ganados < 0:
+        if len(ids_limpios) > 6:
             return {
                 "ok": False,
-                "mensaje": "Los pokedólares no pueden ser negativos"
-            }
-
-        if payload.exp_ganada < 0:
-            return {
-                "ok": False,
-                "mensaje": "La experiencia no puede ser negativa"
+                "mensaje": "No puedes reclamar recompensa para más de 6 Pokémon"
             }
 
         cursor.execute("""
             SELECT id, pokedolares
             FROM usuarios
             WHERE id = %s
-        """, (payload.usuario_id,))
-        usuario = cursor.fetchone()
+        """, (usuario["id"],))
+        usuario_db = cursor.fetchone()
 
-        if not usuario:
+        if not usuario_db:
             return {
                 "ok": False,
                 "mensaje": "Usuario no encontrado"
             }
 
-        nuevos_pokedolares = int(usuario["pokedolares"] or 0) + int(payload.pokedolares_ganados)
+        nuevos_pokedolares = int(usuario_db["pokedolares"] or 0) + pokedolares_ganados
 
         cursor.execute("""
             UPDATE usuarios
             SET pokedolares = %s
             WHERE id = %s
-        """, (nuevos_pokedolares, payload.usuario_id))
+        """, (nuevos_pokedolares, usuario["id"]))
 
         pokemon_actualizados = []
-        exp_ganada = max(0, int(payload.exp_ganada or 0))
 
-        for usuario_pokemon_id in payload.usuario_pokemon_ids:
+        for usuario_pokemon_id in ids_limpios:
             cursor.execute("""
                 SELECT
                     up.id,
@@ -1584,7 +1542,7 @@ def recompensa_victoria_batalla(payload: RecompensaBatallaPayload):
                     up.bonus_velocidad_renacer
                 FROM usuario_pokemon up
                 WHERE up.id = %s AND up.usuario_id = %s
-            """, (usuario_pokemon_id, payload.usuario_id))
+            """, (usuario_pokemon_id, usuario["id"]))
             poke = cursor.fetchone()
 
             if not poke:
@@ -1723,17 +1681,22 @@ def recompensa_victoria_batalla(payload: RecompensaBatallaPayload):
             })
 
         conn.commit()
+        registrar_cooldown_recompensa_batalla(usuario["id"])
 
         return {
             "ok": True,
             "mensaje": "Recompensas aplicadas correctamente",
-            "usuario_id": payload.usuario_id,
-            "pokedolares_ganados": payload.pokedolares_ganados,
+            "usuario_id": usuario["id"],
+            "recompensa_codigo": recompensa["codigo"],
+            "pokedolares_ganados": pokedolares_ganados,
             "pokedolares_actuales": nuevos_pokedolares,
-            "exp_ganada": payload.exp_ganada,
+            "exp_ganada": exp_ganada,
             "pokemon_actualizados": pokemon_actualizados
         }
 
+    except HTTPException:
+        conn.rollback()
+        raise
     except Exception as error:
         conn.rollback()
         print("Error en /battle/recompensa-victoria:", error)
@@ -1747,16 +1710,18 @@ def recompensa_victoria_batalla(payload: RecompensaBatallaPayload):
 
 
 @router.post("/usuario/soltar-pokemon")
-def soltar_pokemon(payload: SoltarPokemonPayload):
+def soltar_pokemon(payload: SoltarPokemonPayload, usuario=Depends(get_current_user)):
     conn = get_connection()
     cursor = get_cursor(conn)
 
     try:
+        validar_usuario_payload(payload.usuario_id, usuario["id"])
+
         cursor.execute("""
             SELECT id
             FROM usuario_pokemon
             WHERE id = %s AND usuario_id = %s
-        """, (payload.usuario_pokemon_id, payload.usuario_id))
+        """, (payload.usuario_pokemon_id, usuario["id"]))
         pokemon = cursor.fetchone()
 
         if not pokemon:
@@ -1765,10 +1730,24 @@ def soltar_pokemon(payload: SoltarPokemonPayload):
         cursor.execute("""
             DELETE FROM usuario_pokemon
             WHERE id = %s AND usuario_id = %s
-        """, (payload.usuario_pokemon_id, payload.usuario_id))
+        """, (payload.usuario_pokemon_id, usuario["id"]))
         conn.commit()
 
-        return {"mensaje": "Pokémon liberado correctamente"}
+        return {
+            "ok": True,
+            "mensaje": "Pokémon liberado correctamente",
+            "usuario_pokemon_id": payload.usuario_pokemon_id
+        }
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as error:
+        conn.rollback()
+        print("Error en /usuario/soltar-pokemon:", error)
+        return {
+            "ok": False,
+            "mensaje": "No se pudo liberar el Pokémon"
+        }
     finally:
         cursor.close()
         release_connection(conn)
@@ -2171,11 +2150,13 @@ async def websocket_maps(websocket: WebSocket):
 
 
 @router.post("/maps/encuentro")
-def generar_encuentro(payload: EncuentroPayload):
+def generar_encuentro(payload: EncuentroPayload, usuario=Depends(get_current_user)):
     conn = get_connection()
     cursor = get_cursor(conn)
 
     try:
+        validar_usuario_payload(payload.usuario_id, usuario["id"])
+
         cursor.execute("""
             SELECT 
                 zp.pokemon_id,
@@ -2220,6 +2201,14 @@ def generar_encuentro(payload: EncuentroPayload):
             es_shiny
         )
 
+        encuentro_token = crear_token_encuentro(
+            usuario_id=usuario["id"],
+            zona_id=payload.zona_id,
+            pokemon_id=int(elegido["pokemon_id"]),
+            nivel=nivel,
+            es_shiny=es_shiny
+        )
+
         return {
             "pokemon_id": int(elegido["pokemon_id"]),
             "nombre": elegido["nombre"],
@@ -2234,7 +2223,9 @@ def generar_encuentro(payload: EncuentroPayload):
             "hp_max": stats["hp_max"],
             "velocidad": stats["velocidad"],
             "nivel": nivel,
-            "es_shiny": es_shiny
+            "es_shiny": es_shiny,
+            "encuentro_token": encuentro_token,
+            "encuentro_ttl_segundos": ENCUENTRO_TOKEN_TTL_SEGUNDOS
         }
     finally:
         cursor.close()
@@ -2242,11 +2233,45 @@ def generar_encuentro(payload: EncuentroPayload):
 
 
 @router.post("/maps/intentar-captura")
-def intentar_captura(payload: IntentoCapturaPayload):
+def intentar_captura(payload: IntentoCapturaPayload, usuario=Depends(get_current_user)):
     conn = get_connection()
     cursor = get_cursor(conn)
 
     try:
+        validar_usuario_payload(payload.usuario_id, usuario["id"])
+
+        encuentro = decodificar_token_encuentro(payload.encuentro_token)
+
+        if int(encuentro["usuario_id"]) != int(usuario["id"]):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="El encuentro no pertenece al usuario autenticado"
+            )
+
+        if encuentro_ya_fue_consumido(encuentro["jti"]):
+            return {
+                "capturado": False,
+                "mensaje": "Este encuentro ya fue capturado y ya no es válido"
+            }
+
+        if int(payload.pokemon_id or 0) != int(encuentro["pokemon_id"]):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="El Pokémon del encuentro no coincide con el enviado"
+            )
+
+        if int(payload.nivel or 0) != int(encuentro["nivel"]):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="El nivel del encuentro no coincide con el enviado"
+            )
+
+        if bool(payload.es_shiny) != bool(encuentro["es_shiny"]):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="La variante del encuentro no coincide con la enviada"
+            )
+
         cursor.execute("""
             SELECT id, nombre, bonus_captura
             FROM items
@@ -2264,7 +2289,7 @@ def intentar_captura(payload: IntentoCapturaPayload):
             SELECT id, cantidad
             FROM usuario_items
             WHERE usuario_id = %s AND item_id = %s
-        """, (payload.usuario_id, payload.item_id))
+        """, (usuario["id"], payload.item_id))
         item_usuario = cursor.fetchone()
 
         if not item_usuario or item_usuario["cantidad"] <= 0:
@@ -2274,6 +2299,7 @@ def intentar_captura(payload: IntentoCapturaPayload):
             }
 
         nombre_item = item_db["nombre"]
+        es_shiny = bool(encuentro["es_shiny"])
 
         if nombre_item == "Poke Ball":
             probabilidad = 50
@@ -2286,7 +2312,7 @@ def intentar_captura(payload: IntentoCapturaPayload):
         else:
             probabilidad = 35 + int(item_db["bonus_captura"] or 0)
 
-        if payload.es_shiny and nombre_item != "Master Ball":
+        if es_shiny and nombre_item != "Master Ball":
             probabilidad -= 10
 
         probabilidad = max(1, min(probabilidad, 100))
@@ -2303,7 +2329,7 @@ def intentar_captura(payload: IntentoCapturaPayload):
                 SELECT hp, ataque, defensa, velocidad
                 FROM pokemon
                 WHERE id = %s
-            """, (payload.pokemon_id,))
+            """, (encuentro["pokemon_id"],))
             base = cursor.fetchone()
 
             if not base:
@@ -2313,7 +2339,7 @@ def intentar_captura(payload: IntentoCapturaPayload):
                     "mensaje": "Pokémon no encontrado"
                 }
 
-            nivel_captura = max(1, min(int(payload.nivel or 1), MAX_NIVEL_POKEMON))
+            nivel_captura = max(1, min(int(encuentro["nivel"] or 1), MAX_NIVEL_POKEMON))
 
             stats = calcular_stats(
                 base["hp"],
@@ -2321,7 +2347,7 @@ def intentar_captura(payload: IntentoCapturaPayload):
                 base["defensa"],
                 base["velocidad"],
                 nivel_captura,
-                payload.es_shiny
+                es_shiny
             )
 
             experiencia_total_inicial = calcular_experiencia_total_base(nivel_captura, 0)
@@ -2334,8 +2360,8 @@ def intentar_captura(payload: IntentoCapturaPayload):
                 )
                 VALUES (%s, %s, %s, 0, %s, 0, %s, %s, %s, %s, %s, %s)
             """, (
-                payload.usuario_id,
-                payload.pokemon_id,
+                usuario["id"],
+                encuentro["pokemon_id"],
                 nivel_captura,
                 experiencia_total_inicial,
                 stats["hp_max"],
@@ -2343,10 +2369,11 @@ def intentar_captura(payload: IntentoCapturaPayload):
                 stats["ataque"],
                 stats["defensa"],
                 stats["velocidad"],
-                payload.es_shiny
+                es_shiny
             ))
 
             conn.commit()
+            marcar_encuentro_consumido(encuentro["jti"])
 
             return {
                 "capturado": True,
@@ -2364,6 +2391,9 @@ def intentar_captura(payload: IntentoCapturaPayload):
             "probabilidad": probabilidad,
             "item_id": payload.item_id
         }
+    except HTTPException:
+        conn.rollback()
+        raise
     finally:
         cursor.close()
         release_connection(conn)
@@ -2404,13 +2434,19 @@ def obtener_items_tienda():
 
 
 @router.post("/tienda/comprar")
-def comprar_item(payload: CompraItemPayload):
+def comprar_item(payload: CompraItemPayload, usuario=Depends(get_current_user)):
     conn = get_connection()
     cursor = get_cursor(conn)
 
     try:
-        if payload.cantidad <= 0:
-            return {"mensaje": "La cantidad debe ser mayor a 0"}
+        validar_usuario_payload(payload.usuario_id, usuario["id"])
+
+        cantidad = int(payload.cantidad or 0)
+        if cantidad <= 0:
+            return {"ok": False, "mensaje": "La cantidad debe ser mayor a 0"}
+
+        if cantidad > 999:
+            return {"ok": False, "mensaje": "La cantidad máxima por compra es 999"}
 
         cursor.execute("""
             SELECT id, nombre, precio
@@ -2420,30 +2456,30 @@ def comprar_item(payload: CompraItemPayload):
         item = cursor.fetchone()
 
         if not item:
-            return {"mensaje": "Item no encontrado"}
+            return {"ok": False, "mensaje": "Item no encontrado"}
 
         cursor.execute("""
             SELECT id, pokedolares
             FROM usuarios
             WHERE id = %s
-        """, (payload.usuario_id,))
-        usuario = cursor.fetchone()
+        """, (usuario["id"],))
+        usuario_db = cursor.fetchone()
 
-        if not usuario:
-            return {"mensaje": "Usuario no encontrado"}
+        if not usuario_db:
+            return {"ok": False, "mensaje": "Usuario no encontrado"}
 
-        total = item["precio"] * payload.cantidad
+        total = int(item["precio"] or 0) * cantidad
 
-        if usuario["pokedolares"] < total:
-            return {"mensaje": "No tienes suficientes pokedólares"}
+        if int(usuario_db["pokedolares"] or 0) < total:
+            return {"ok": False, "mensaje": "No tienes suficientes pokedólares"}
 
-        nuevo_saldo = usuario["pokedolares"] - total
+        nuevo_saldo = int(usuario_db["pokedolares"] or 0) - total
 
         cursor.execute("""
             UPDATE usuarios
             SET pokedolares = %s
             WHERE id = %s
-        """, (nuevo_saldo, payload.usuario_id))
+        """, (nuevo_saldo, usuario["id"]))
 
         cursor.execute("""
             INSERT INTO usuario_items (usuario_id, item_id, cantidad)
@@ -2451,21 +2487,25 @@ def comprar_item(payload: CompraItemPayload):
             ON CONFLICT (usuario_id, item_id)
             DO UPDATE SET cantidad = usuario_items.cantidad + EXCLUDED.cantidad
             RETURNING cantidad
-        """, (payload.usuario_id, payload.item_id, payload.cantidad))
+        """, (usuario["id"], payload.item_id, cantidad))
 
-        cantidad_actual = cursor.fetchone()["cantidad"]
+        cantidad_actual = int(cursor.fetchone()["cantidad"] or 0)
 
         conn.commit()
 
         return {
             "ok": True,
-            "mensaje": f"Compraste {payload.cantidad} x {item['nombre']}",
+            "mensaje": f"Compraste {cantidad} x {item['nombre']}",
             "item_id": item["id"],
             "item_nombre": item["nombre"],
-            "cantidad_comprada": payload.cantidad,
+            "cantidad_comprada": cantidad,
             "cantidad_actual": cantidad_actual,
-            "pokedolares_actual": nuevo_saldo
+            "pokedolares_actual": nuevo_saldo,
+            "usuario_id": usuario["id"]
         }
+    except HTTPException:
+        conn.rollback()
+        raise
     except Exception as error:
         conn.rollback()
         print("Error en /tienda/comprar:", error)
@@ -2483,11 +2523,13 @@ def comprar_item(payload: CompraItemPayload):
 # =========================================================
 
 @router.post("/pokemon/evolucionar-item")
-def evolucionar_con_item(payload: EvolucionItemPayload):
+def evolucionar_con_item(payload: EvolucionItemPayload, usuario=Depends(get_current_user)):
     conn = get_connection()
     cursor = get_cursor(conn)
 
     try:
+        validar_usuario_payload(payload.usuario_id, usuario["id"])
+
         cursor.execute("""
             SELECT
                 pokemon_id,
@@ -2500,11 +2542,11 @@ def evolucionar_con_item(payload: EvolucionItemPayload):
                 bonus_velocidad_renacer
             FROM usuario_pokemon
             WHERE id = %s AND usuario_id = %s
-        """, (payload.usuario_pokemon_id, payload.usuario_id))
+        """, (payload.usuario_pokemon_id, usuario["id"]))
         poke = cursor.fetchone()
 
         if not poke:
-            return {"mensaje": "Pokémon del usuario no encontrado"}
+            return {"ok": False, "mensaje": "Pokémon del usuario no encontrado"}
 
         cursor.execute("""
             SELECT evoluciona_a
@@ -2514,17 +2556,17 @@ def evolucionar_con_item(payload: EvolucionItemPayload):
         evo = cursor.fetchone()
 
         if not evo:
-            return {"mensaje": "Ese Pokémon no evoluciona con este item"}
+            return {"ok": False, "mensaje": "Ese Pokémon no evoluciona con este item"}
 
         cursor.execute("""
             SELECT id, cantidad
             FROM usuario_items
             WHERE usuario_id = %s AND item_id = %s
-        """, (payload.usuario_id, payload.item_id))
+        """, (usuario["id"], payload.item_id))
         item_user = cursor.fetchone()
 
-        if not item_user or item_user["cantidad"] <= 0:
-            return {"mensaje": "No tienes ese item"}
+        if not item_user or int(item_user["cantidad"] or 0) <= 0:
+            return {"ok": False, "mensaje": "No tienes ese item"}
 
         cursor.execute("""
             UPDATE usuario_items
@@ -2533,11 +2575,14 @@ def evolucionar_con_item(payload: EvolucionItemPayload):
         """, (item_user["id"],))
 
         cursor.execute("""
-            SELECT hp, ataque, defensa, velocidad
+            SELECT hp, ataque, defensa, velocidad, nombre
             FROM pokemon
             WHERE id = %s
         """, (evo["evoluciona_a"],))
         base = cursor.fetchone()
+
+        if not base:
+            return {"ok": False, "mensaje": "La evolución configurada no existe"}
 
         stats = calcular_stats(
             base["hp"],
@@ -2560,7 +2605,7 @@ def evolucionar_con_item(payload: EvolucionItemPayload):
                 ataque = %s,
                 defensa = %s,
                 velocidad = %s
-            WHERE id = %s
+            WHERE id = %s AND usuario_id = %s
         """, (
             evo["evoluciona_a"],
             stats["hp_max"],
@@ -2568,18 +2613,32 @@ def evolucionar_con_item(payload: EvolucionItemPayload):
             stats["ataque"],
             stats["defensa"],
             stats["velocidad"],
-            payload.usuario_pokemon_id
+            payload.usuario_pokemon_id,
+            usuario["id"]
         ))
 
         conn.commit()
-        return {"mensaje": "¡Tu Pokémon evolucionó con éxito!"}
+        return {
+            "ok": True,
+            "mensaje": "¡Tu Pokémon evolucionó con éxito!",
+            "usuario_pokemon_id": payload.usuario_pokemon_id,
+            "pokemon_id": evo["evoluciona_a"],
+            "pokemon_nombre": base["nombre"]
+        }
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as error:
+        conn.rollback()
+        print("Error en /pokemon/evolucionar-item:", error)
+        return {"ok": False, "mensaje": "No se pudo evolucionar el Pokémon con item"}
     finally:
         cursor.close()
         release_connection(conn)
 
 
 @router.get("/usuario/pokemon/{usuario_pokemon_id}/evolucion")
-def revisar_evolucion(usuario_pokemon_id: int):
+def revisar_evolucion(usuario_pokemon_id: int, usuario=Depends(get_current_user)):
     conn = get_connection()
     cursor = get_cursor(conn)
 
@@ -2593,8 +2652,8 @@ def revisar_evolucion(usuario_pokemon_id: int):
                 p.nombre
             FROM usuario_pokemon up
             JOIN pokemon p ON p.id = up.pokemon_id
-            WHERE up.id = %s
-        """, (usuario_pokemon_id,))
+            WHERE up.id = %s AND up.usuario_id = %s
+        """, (usuario_pokemon_id, usuario["id"]))
         poke = cursor.fetchone()
 
         if not poke:
@@ -2700,11 +2759,13 @@ def revisar_evolucion(usuario_pokemon_id: int):
 
 
 @router.post("/pokemon/evolucionar-nivel")
-def evolucionar_por_nivel(payload: EvolucionNivelPayload):
+def evolucionar_por_nivel(payload: EvolucionNivelPayload, usuario=Depends(get_current_user)):
     conn = get_connection()
     cursor = get_cursor(conn)
 
     try:
+        validar_usuario_payload(payload.usuario_id, usuario["id"])
+
         cursor.execute("""
             SELECT
                 up.id,
@@ -2717,11 +2778,11 @@ def evolucionar_por_nivel(payload: EvolucionNivelPayload):
                 up.bonus_velocidad_renacer
             FROM usuario_pokemon up
             WHERE up.id = %s AND up.usuario_id = %s
-        """, (payload.usuario_pokemon_id, payload.usuario_id))
+        """, (payload.usuario_pokemon_id, usuario["id"]))
         poke = cursor.fetchone()
 
         if not poke:
-            return {"mensaje": "Pokémon no encontrado"}
+            return {"ok": False, "mensaje": "Pokémon no encontrado"}
 
         cursor.execute("""
             SELECT e.evoluciona_a
@@ -2733,14 +2794,17 @@ def evolucionar_por_nivel(payload: EvolucionNivelPayload):
         evo = cursor.fetchone()
 
         if not evo:
-            return {"mensaje": "Este Pokémon aún no puede evolucionar por nivel"}
+            return {"ok": False, "mensaje": "Este Pokémon aún no puede evolucionar por nivel"}
 
         cursor.execute("""
-            SELECT hp, ataque, defensa, velocidad
+            SELECT hp, ataque, defensa, velocidad, nombre
             FROM pokemon
             WHERE id = %s
         """, (evo["evoluciona_a"],))
         base = cursor.fetchone()
+
+        if not base:
+            return {"ok": False, "mensaje": "La evolución configurada no existe"}
 
         stats = calcular_stats(
             base["hp"],
@@ -2763,7 +2827,7 @@ def evolucionar_por_nivel(payload: EvolucionNivelPayload):
                 ataque = %s,
                 defensa = %s,
                 velocidad = %s
-            WHERE id = %s
+            WHERE id = %s AND usuario_id = %s
         """, (
             evo["evoluciona_a"],
             stats["hp_max"],
@@ -2771,11 +2835,25 @@ def evolucionar_por_nivel(payload: EvolucionNivelPayload):
             stats["ataque"],
             stats["defensa"],
             stats["velocidad"],
-            payload.usuario_pokemon_id
+            payload.usuario_pokemon_id,
+            usuario["id"]
         ))
 
         conn.commit()
-        return {"mensaje": "¡Tu Pokémon evolucionó por nivel!"}
+        return {
+            "ok": True,
+            "mensaje": "¡Tu Pokémon evolucionó por nivel!",
+            "usuario_pokemon_id": payload.usuario_pokemon_id,
+            "pokemon_id": evo["evoluciona_a"],
+            "pokemon_nombre": base["nombre"]
+        }
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as error:
+        conn.rollback()
+        print("Error en /pokemon/evolucionar-nivel:", error)
+        return {"ok": False, "mensaje": "No se pudo evolucionar el Pokémon por nivel"}
     finally:
         cursor.close()
         release_connection(conn)
