@@ -4,6 +4,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from routes_pokemon import router
 from database import get_connection, get_cursor, release_connection
 
+BACKEND_MARKER = "mastersmon-backend-2026-03-21-debug-v1"
+
 app = FastAPI(
     title="MastersMon API",
     version="1.0.0"
@@ -36,7 +38,9 @@ app.include_router(router)
 def root():
     return {
         "status": "ok",
-        "message": "MastersMon API running"
+        "message": "MastersMon API running",
+        "version_backend": BACKEND_MARKER,
+        "router_loaded": "routes_pokemon"
     }
 
 
@@ -48,17 +52,26 @@ def health():
     try:
         conn = get_connection()
         cur = get_cursor(conn)
-        cur.execute("SELECT 1 AS ok;")
+        cur.execute("""
+            SELECT
+                1 AS ok,
+                current_database() AS db_name,
+                current_schema() AS schema_name
+        """)
         result = cur.fetchone()
 
         return {
             "status": "ok",
-            "db": result["ok"]
+            "db": result["ok"],
+            "db_name": result["db_name"],
+            "schema_name": result["schema_name"],
+            "version_backend": BACKEND_MARKER
         }
     except Exception as e:
         return {
             "status": "error",
-            "detail": str(e)
+            "detail": str(e),
+            "version_backend": BACKEND_MARKER
         }
     finally:
         if cur:
