@@ -3107,7 +3107,12 @@ def intentar_captura(request: Request, payload: IntentoCapturaPayload, usuario=D
                 detail="La tabla mapa_encuentros aún no existe. Ejecuta la migración primero."
             )
 
-        encuentro = obtener_encuentro_activo_por_token(cursor, payload.encuentro_token, usuario["id"], for_update=True)
+        encuentro = obtener_encuentro_activo_por_token(
+            cursor,
+            payload.encuentro_token,
+            usuario["id"],
+            for_update=True
+        )
         if not encuentro:
             registrar_log_maps(
                 cursor,
@@ -3115,7 +3120,7 @@ def intentar_captura(request: Request, payload: IntentoCapturaPayload, usuario=D
                 endpoint="intentar-captura",
                 request=request,
                 status_code=status.HTTP_400_BAD_REQUEST,
-                motivo="Encuentro inválido, expirado o ya consumido",
+                motivo="Encuentro inválido, expirado o ya no activo",
                 token=payload.encuentro_token,
             )
             conn.commit()
@@ -3133,7 +3138,7 @@ def intentar_captura(request: Request, payload: IntentoCapturaPayload, usuario=D
                 endpoint="intentar-captura",
                 request=request,
                 status_code=status.HTTP_400_BAD_REQUEST,
-                motivo="El Pokémon enviado no coincide con el encuentro",
+                motivo="pokemon_id no coincide con el encuentro",
                 token=payload.encuentro_token,
                 zona_id=int(encuentro["zona_id"]),
                 encuentro_id=encuentro_id,
@@ -3151,7 +3156,7 @@ def intentar_captura(request: Request, payload: IntentoCapturaPayload, usuario=D
                 endpoint="intentar-captura",
                 request=request,
                 status_code=status.HTTP_400_BAD_REQUEST,
-                motivo="El nivel enviado no coincide con el encuentro",
+                motivo="nivel no coincide con el encuentro",
                 token=payload.encuentro_token,
                 zona_id=int(encuentro["zona_id"]),
                 encuentro_id=encuentro_id,
@@ -3169,7 +3174,7 @@ def intentar_captura(request: Request, payload: IntentoCapturaPayload, usuario=D
                 endpoint="intentar-captura",
                 request=request,
                 status_code=status.HTTP_400_BAD_REQUEST,
-                motivo="La variante shiny no coincide con el encuentro",
+                motivo="es_shiny no coincide con el encuentro",
                 token=payload.encuentro_token,
                 zona_id=int(encuentro["zona_id"]),
                 encuentro_id=encuentro_id,
@@ -3180,14 +3185,17 @@ def intentar_captura(request: Request, payload: IntentoCapturaPayload, usuario=D
                 detail="La variante shiny del encuentro no coincide con la enviada"
             )
 
-        cursor.execute("""
+        cursor.execute(
+            """
             SELECT ui.id, ui.item_id, ui.cantidad, i.nombre, i.bonus_captura
             FROM usuario_items ui
             INNER JOIN items i ON i.id = ui.item_id
             WHERE ui.usuario_id = %s
               AND ui.item_id = %s
             FOR UPDATE
-        """, (usuario["id"], payload.item_id))
+            """,
+            (usuario["id"], payload.item_id)
+        )
         item_usuario = cursor.fetchone()
 
         if not item_usuario or int(item_usuario["cantidad"] or 0) <= 0:
@@ -3209,11 +3217,23 @@ def intentar_captura(request: Request, payload: IntentoCapturaPayload, usuario=D
             }
 
         bonus_captura = int(item_usuario["bonus_captura"] or 0)
-        nombre_item = item_usuario["nombre"]
-        probabilidad_base = 35 + bonus_captura
-        if bool(encuentro["es_shiny"]) and str(nombre_item).strip().lower() != "master ball":
-            probabilidad_base -= 10
-        probabilidad = max(1, min(100, probabilidad_base))
+        nombre_item = str(item_usuario["nombre"] or "").strip()
+
+        if nombre_item == "Poke Ball":
+            probabilidad = 50
+        elif nombre_item == "Super Ball":
+            probabilidad = 65
+        elif nombre_item == "Ultra Ball":
+            probabilidad = 80
+        elif nombre_item == "Master Ball":
+            probabilidad = 100
+        else:
+            probabilidad = 35 + bonus_captura
+
+        if bool(encuentro["es_shiny"]) and nombre_item.lower() != "master ball":
+            probabilidad -= 10
+
+        probabilidad = max(1, min(100, probabilidad))
         capturado = random.randint(1, 100) <= probabilidad
 
         cursor.execute(
@@ -3256,7 +3276,20 @@ def intentar_captura(request: Request, payload: IntentoCapturaPayload, usuario=D
                     "mensaje": "Este encuentro ya fue utilizado en otra solicitud"
                 }
 
-            cursor.execute("""
+            cursor.execute(
+                """
+                SELECT nombre
+                FROM pokemon
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (int(encuentro["pokemon_id"]),)
+            )
+            pokemon_db = cursor.fetchone()
+            nombre_pokemon = pokemon_db["nombre"] if pokemon_db and pokemon_db.get("nombre") else f"Pokémon #{int(encuentro['pokemon_id'])}"
+
+            cursor.execute(
+                """
                 INSERT INTO usuario_pokemon (
                     usuario_id, pokemon_id, nivel, experiencia, experiencia_total, es_shiny,
                     hp_actual, hp_max, ataque, defensa, velocidad,
@@ -3266,20 +3299,22 @@ def intentar_captura(request: Request, payload: IntentoCapturaPayload, usuario=D
                 )
                 VALUES (%s, %s, %s, 0, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0, 0, 0, 0, 0)
                 RETURNING id
-            """, (
-                usuario["id"],
-                int(encuentro["pokemon_id"]),
-                int(encuentro["nivel"]),
-                calcular_experiencia_total_base(int(encuentro["nivel"]), 0),
-                bool(encuentro["es_shiny"]),
-                int(encuentro["hp_max"]),
-                int(encuentro["hp_max"]),
-                int(encuentro["ataque"]),
-                int(encuentro["defensa"]),
-                int(encuentro["velocidad"]),
-                int(encuentro.get("ataque_especial") or encuentro["ataque"]),
-                int(encuentro.get("defensa_especial") or encuentro["defensa"]),
-            ))
+                """,
+                (
+                    usuario["id"],
+                    int(encuentro["pokemon_id"]),
+                    int(encuentro["nivel"]),
+                    calcular_experiencia_total_base(int(encuentro["nivel"]), 0),
+                    bool(encuentro["es_shiny"]),
+                    int(encuentro["hp_max"]),
+                    int(encuentro["hp_max"]),
+                    int(encuentro["ataque"]),
+                    int(encuentro["defensa"]),
+                    int(encuentro["velocidad"]),
+                    int(encuentro.get("ataque_especial") or encuentro["ataque"]),
+                    int(encuentro.get("defensa_especial") or encuentro["defensa"]),
+                )
+            )
             usuario_pokemon_insertado = cursor.fetchone()
 
             registrar_log_maps(
@@ -3304,31 +3339,22 @@ def intentar_captura(request: Request, payload: IntentoCapturaPayload, usuario=D
 
             return {
                 "capturado": True,
-                "mensaje": f"¡Has capturado a {encuentro['pokemon_id']} con {nombre_item}!",
+                "mensaje": f"¡Has capturado a {nombre_pokemon} con {nombre_item}!",
                 "probabilidad": probabilidad,
                 "usuario_pokemon_id": int(usuario_pokemon_insertado["id"]) if usuario_pokemon_insertado else None,
-                "item_id": int(item_usuario["item_id"]),
+                "item_id": int(payload.item_id),
             }
 
-        cursor.execute(
-            """
-            UPDATE mapa_encuentros
-            SET activo = FALSE,
-                consumido_en = NOW()
-            WHERE id = %s
-              AND activo = TRUE
-              AND consumido_en IS NULL
-            """,
-            (encuentro_id,)
-        )
-
+        # IMPORTANTE:
+        # si falla la captura, NO consumimos el encuentro.
+        # Solo se descuenta la Poké Ball y el jugador puede volver a intentar.
         registrar_log_maps(
             cursor,
             usuario_id=usuario["id"],
             endpoint="intentar-captura",
             request=request,
             status_code=status.HTTP_200_OK,
-            motivo="escape",
+            motivo="fallo-captura",
             token=payload.encuentro_token,
             zona_id=int(encuentro["zona_id"]),
             encuentro_id=encuentro_id,
@@ -3337,10 +3363,12 @@ def intentar_captura(request: Request, payload: IntentoCapturaPayload, usuario=D
 
         return {
             "capturado": False,
-            "mensaje": f"{nombre_item} usada, pero el Pokémon escapó.",
+            "mensaje": f"{nombre_item} usada, pero {encuentro.get('nombre') or 'el Pokémon'} escapó.",
             "probabilidad": probabilidad,
-            "item_id": int(item_usuario["item_id"])
+            "item_id": int(payload.item_id),
+            "encuentro_sigue_activo": True,
         }
+
     except HTTPException:
         conn.rollback()
         raise
