@@ -3113,6 +3113,40 @@ def intentar_captura(payload: IntentoCapturaPayload, usuario=Depends(get_current
 # TIENDA
 # =========================================================
 
+# =========================================================
+# TIENDA
+# =========================================================
+
+@router.get("/tienda/items")
+def obtener_items_tienda():
+    conn = get_connection()
+    cursor = get_cursor(conn)
+
+    try:
+        cursor.execute("""
+            SELECT id, nombre, tipo, descripcion, bonus_captura, cura_hp, precio
+            FROM items
+            ORDER BY tipo, precio
+        """)
+        rows = cursor.fetchall()
+
+        return [
+            {
+                "id": row["id"],
+                "nombre": row["nombre"],
+                "tipo": row["tipo"],
+                "descripcion": row["descripcion"],
+                "bonus_captura": row["bonus_captura"],
+                "cura_hp": row["cura_hp"],
+                "precio": row["precio"]
+            }
+            for row in rows
+        ]
+    finally:
+        cursor.close()
+        release_connection(conn)
+
+
 @router.post("/tienda/comprar")
 def comprar_item(payload: CompraItemPayload, usuario=Depends(get_current_user)):
     conn = get_connection()
