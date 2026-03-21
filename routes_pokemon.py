@@ -64,6 +64,7 @@ MAPS_RATE_LIMIT_MEMORIA = {
 TABLAS_OPERATIVAS_CLEANUP_CADA_SEGUNDOS = 300
 TABLAS_OPERATIVAS_ULTIMO_CLEANUP = 0
 
+CAPTURE_DEBUG_MARKER = "capture-debug-2026-03-21-v1"
 
 # =========================================================
 # PAYLOADS
@@ -3245,6 +3246,7 @@ def generar_encuentro(request: Request, payload: EncuentroPayload, usuario=Depen
         cursor.close()
         release_connection(conn)
 
+
 @router.post("/maps/intentar-captura")
 def intentar_captura(request: Request, payload: IntentoCapturaPayload, usuario=Depends(get_current_user)):
     conn = get_connection()
@@ -3500,6 +3502,35 @@ def intentar_captura(request: Request, payload: IntentoCapturaPayload, usuario=D
                 )
             )
             usuario_pokemon_insertado = cursor.fetchone()
+            usuario_pokemon_id = int(usuario_pokemon_insertado["id"]) if usuario_pokemon_insertado else None
+
+            cursor.execute("""
+                SELECT
+                    current_database() AS db_name,
+                    current_schema() AS schema_name,
+                    txid_current() AS txid
+            """)
+            debug_ctx = cursor.fetchone()
+
+            debug_row_precommit = None
+            if usuario_pokemon_id:
+                cursor.execute("""
+                    SELECT id, usuario_id, pokemon_id, nivel
+                    FROM usuario_pokemon
+                    WHERE id = %s
+                    LIMIT 1
+                """, (usuario_pokemon_id,))
+                debug_row_precommit = cursor.fetchone()
+
+            print("[CAPTURE DEBUG][PRE-COMMIT]", {
+                "marker": CAPTURE_DEBUG_MARKER,
+                "usuario_pokemon_id": usuario_pokemon_id,
+                "db_name": debug_ctx["db_name"] if debug_ctx else None,
+                "schema_name": debug_ctx["schema_name"] if debug_ctx else None,
+                "txid": debug_ctx["txid"] if debug_ctx else None,
+                "debug_row_exists_precommit": bool(debug_row_precommit),
+                "debug_row_precommit": dict(debug_row_precommit) if debug_row_precommit else None,
+            })
 
             registrar_log_maps(
                 cursor,
@@ -3522,14 +3553,41 @@ def intentar_captura(request: Request, payload: IntentoCapturaPayload, usuario=D
                 )
             except Exception as actividad_error:
                 print("Aviso actividad capture maps:", actividad_error)
+
             conn.commit()
+
+            debug_row_postcommit = None
+            if usuario_pokemon_id:
+                cursor.execute("""
+                    SELECT id, usuario_id, pokemon_id, nivel
+                    FROM usuario_pokemon
+                    WHERE id = %s
+                    LIMIT 1
+                """, (usuario_pokemon_id,))
+                debug_row_postcommit = cursor.fetchone()
+
+            print("[CAPTURE DEBUG][POST-COMMIT]", {
+                "marker": CAPTURE_DEBUG_MARKER,
+                "usuario_pokemon_id": usuario_pokemon_id,
+                "db_name": debug_ctx["db_name"] if debug_ctx else None,
+                "schema_name": debug_ctx["schema_name"] if debug_ctx else None,
+                "txid": debug_ctx["txid"] if debug_ctx else None,
+                "debug_row_exists_postcommit": bool(debug_row_postcommit),
+                "debug_row_postcommit": dict(debug_row_postcommit) if debug_row_postcommit else None,
+            })
 
             return {
                 "capturado": True,
                 "mensaje": f"¡Has capturado a {nombre_pokemon} con {nombre_item}!",
                 "probabilidad": probabilidad,
-                "usuario_pokemon_id": int(usuario_pokemon_insertado["id"]) if usuario_pokemon_insertado else None,
+                "usuario_pokemon_id": usuario_pokemon_id,
                 "item_id": int(payload.item_id),
+                "debug_marker": CAPTURE_DEBUG_MARKER,
+                "debug_db_name": debug_ctx["db_name"] if debug_ctx else None,
+                "debug_schema_name": debug_ctx["schema_name"] if debug_ctx else None,
+                "debug_txid": debug_ctx["txid"] if debug_ctx else None,
+                "debug_row_exists_precommit": bool(debug_row_precommit),
+                "debug_row_exists_postcommit": bool(debug_row_postcommit),
             }
 
         registrar_log_maps(
@@ -3566,7 +3624,7 @@ def intentar_captura(request: Request, payload: IntentoCapturaPayload, usuario=D
     finally:
         cursor.close()
         release_connection(conn)
-
+        
 
 @router.get("/tienda/items")
 def obtener_items_tienda():
