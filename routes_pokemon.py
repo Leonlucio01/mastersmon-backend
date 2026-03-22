@@ -3533,17 +3533,17 @@ def intentar_captura(request: Request, payload: IntentoCapturaPayload, usuario=D
             })
 
             # DEBUG TEMPORAL: desactivado para aislar problema
-            # registrar_log_maps(
-            #     cursor,
-            #     usuario_id=usuario["id"],
-            #     endpoint="intentar-captura",
-            #     request=request,
-            #     status_code=status.HTTP_200_OK,
-            #     motivo="capturado",
-            #     token=payload.encuentro_token,
-            #     zona_id=int(encuentro["zona_id"]),
-            #     encuentro_id=encuentro_id,
-            # )
+            registrar_log_maps(
+                 cursor,
+                 usuario_id=usuario["id"],
+                 endpoint="intentar-captura",
+                 request=request,
+                 status_code=status.HTTP_200_OK,
+                 motivo="capturado",
+                 token=payload.encuentro_token,
+                 zona_id=int(encuentro["zona_id"]),
+                 encuentro_id=encuentro_id,
+             )
 
             # DEBUG TEMPORAL: desactivado para aislar problema
             # try:
