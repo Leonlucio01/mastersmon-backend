@@ -3532,27 +3532,30 @@ def intentar_captura(request: Request, payload: IntentoCapturaPayload, usuario=D
                 "debug_row_precommit": dict(debug_row_precommit) if debug_row_precommit else None,
             })
 
-            registrar_log_maps(
-                cursor,
-                usuario_id=usuario["id"],
-                endpoint="intentar-captura",
-                request=request,
-                status_code=status.HTTP_200_OK,
-                motivo="capturado",
-                token=payload.encuentro_token,
-                zona_id=int(encuentro["zona_id"]),
-                encuentro_id=encuentro_id,
-            )
-            try:
-                registrar_actividad_usuario(
-                    cursor,
-                    usuario["id"],
-                    pagina="maps",
-                    accion="capture",
-                    detalle=f"pokemon:{int(encuentro['pokemon_id'])}"
-                )
-            except Exception as actividad_error:
-                print("Aviso actividad capture maps:", actividad_error)
+            # DEBUG TEMPORAL: desactivado para aislar problema
+            # registrar_log_maps(
+            #     cursor,
+            #     usuario_id=usuario["id"],
+            #     endpoint="intentar-captura",
+            #     request=request,
+            #     status_code=status.HTTP_200_OK,
+            #     motivo="capturado",
+            #     token=payload.encuentro_token,
+            #     zona_id=int(encuentro["zona_id"]),
+            #     encuentro_id=encuentro_id,
+            # )
+
+            # DEBUG TEMPORAL: desactivado para aislar problema
+            # try:
+            #     registrar_actividad_usuario(
+            #         cursor,
+            #         usuario["id"],
+            #         pagina="maps",
+            #         accion="capture",
+            #         detalle=f"pokemon:{int(encuentro['pokemon_id'])}"
+            #     )
+            # except Exception as actividad_error:
+            #     print("Aviso actividad capture maps:", actividad_error)
 
             conn.commit()
 
@@ -3624,7 +3627,7 @@ def intentar_captura(request: Request, payload: IntentoCapturaPayload, usuario=D
     finally:
         cursor.close()
         release_connection(conn)
-        
+
 
 @router.get("/tienda/items")
 def obtener_items_tienda():
