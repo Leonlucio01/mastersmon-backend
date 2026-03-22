@@ -164,6 +164,11 @@ class PresenciaMapaPayload(BaseModel):
     nodo_id: str
 
 
+class EquiparMovimientoPayload(BaseModel):
+    movimiento_id: int
+    slot: int
+
+
 # =========================================================
 # HELPERS
 # =========================================================
@@ -181,6 +186,8 @@ def calcular_stats(
     bonus_velocidad_renacer: int = 0,
     base_ataque_especial: int | None = None,
     base_defensa_especial: int | None = None,
+    bonus_ataque_especial_renacer: int = 0,
+    bonus_defensa_especial_renacer: int = 0,
 ):
     bonus_hp_shiny = 2 if es_shiny else 0
 
@@ -191,8 +198,8 @@ def calcular_stats(
     ataque = int(base_ataque) + (int(nivel) * 2) + int(bonus_ataque_renacer or 0)
     defensa = int(base_defensa) + (int(nivel) * 2) + int(bonus_defensa_renacer or 0)
     velocidad = int(base_velocidad) + int(nivel) + int(bonus_velocidad_renacer or 0)
-    ataque_especial = int(base_ataque_especial) + (int(nivel) * 2)
-    defensa_especial = int(base_defensa_especial) + (int(nivel) * 2)
+    ataque_especial = int(base_ataque_especial) + (int(nivel) * 2) + int(bonus_ataque_especial_renacer or 0)
+    defensa_especial = int(base_defensa_especial) + (int(nivel) * 2) + int(bonus_defensa_especial_renacer or 0)
 
     return {
         "hp_max": hp_max,
@@ -576,6 +583,341 @@ def obtener_select_stats_especiales(cursor, table_name: str, alias: str):
         f"{alias}.defensa AS defensa_especial",
     )
 
+
+
+def obtener_select_bonus_renacer_especiales(cursor, alias: str):
+    tiene_atk = existe_columna(cursor, "usuario_pokemon", "bonus_ataque_especial_renacer")
+    tiene_def = existe_columna(cursor, "usuario_pokemon", "bonus_defensa_especial_renacer")
+
+    return (
+        f"COALESCE({alias}.bonus_ataque_especial_renacer, 0) AS bonus_ataque_especial_renacer" if tiene_atk else "0 AS bonus_ataque_especial_renacer",
+        f"COALESCE({alias}.bonus_defensa_especial_renacer, 0) AS bonus_defensa_especial_renacer" if tiene_def else "0 AS bonus_defensa_especial_renacer",
+    )
+
+
+def sistema_movimientos_habilitado(cursor) -> bool:
+    tablas_requeridas = (
+        "movimientos",
+        "pokemon_movimientos",
+        "usuario_pokemon_movimientos",
+        "usuario_pokemon_movimientos_equipo",
+    )
+    return all(existe_tabla(cursor, tabla) for tabla in tablas_requeridas)
+
+
+def sincronizar_movimientos_usuario_pokemon(
+    cursor,
+    usuario_pokemon_id: int,
+    pokemon_id: int,
+    nivel: int,
+    origen: str = "nivel",
+    auto_equipar: bool = True,
+) -> dict:
+    if not sistema_movimientos_habilitado(cursor):
+        return {"desbloqueados": 0, "equipados": 0}
+
+    usuario_pokemon_id = int(usuario_pokemon_id or 0)
+    pokemon_id = int(pokemon_id or 0)
+    nivel_seguro = max(1, int(nivel or 1))
+
+    if usuario_pokemon_id <= 0 or pokemon_id <= 0:
+        return {"desbloqueados": 0, "equipados": 0}
+
+    cursor.execute(
+        """
+        INSERT INTO usuario_pokemon_movimientos
+            (usuario_pokemon_id, movimiento_id, desbloqueado_por, nivel_desbloqueado, activo)
+        SELECT
+            %s,
+            pm.movimiento_id,
+            %s,
+            pm.nivel_requerido,
+            TRUE
+        FROM pokemon_movimientos pm
+        WHERE pm.pokemon_id = %s
+          AND pm.activo = TRUE
+          AND pm.nivel_requerido <= %s
+        ON CONFLICT (usuario_pokemon_id, movimiento_id) DO NOTHING
+        """,
+        (usuario_pokemon_id, str(origen or "nivel"), pokemon_id, nivel_seguro),
+    )
+    desbloqueados = max(0, int(cursor.rowcount or 0))
+
+    equipados = 0
+    if auto_equipar:
+        cursor.execute(
+            """
+            SELECT gs.slot
+            FROM generate_series(1, 4) AS gs(slot)
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM usuario_pokemon_movimientos_equipo upme
+                WHERE upme.usuario_pokemon_id = %s
+                  AND upme.slot = gs.slot
+            )
+            ORDER BY gs.slot ASC
+            """,
+            (usuario_pokemon_id,),
+        )
+        slots_libres = [int(row["slot"]) for row in cursor.fetchall()]
+
+        if slots_libres:
+            cursor.execute(
+                """
+                SELECT
+                    upm.id AS usuario_pokemon_movimiento_id
+                FROM usuario_pokemon_movimientos upm
+                JOIN movimientos m
+                    ON m.id = upm.movimiento_id
+                LEFT JOIN pokemon_movimientos pm
+                    ON pm.pokemon_id = %s
+                   AND pm.movimiento_id = upm.movimiento_id
+                LEFT JOIN usuario_pokemon_movimientos_equipo upme
+                    ON upme.usuario_pokemon_id = upm.usuario_pokemon_id
+                   AND upme.usuario_pokemon_movimiento_id = upm.id
+                WHERE upm.usuario_pokemon_id = %s
+                  AND upm.activo = TRUE
+                  AND m.activo = TRUE
+                  AND upme.id IS NULL
+                ORDER BY
+                    COALESCE(pm.nivel_requerido, 0) DESC,
+                    COALESCE(pm.orden_aprendizaje, 0) DESC,
+                    COALESCE(m.potencia, 0) DESC,
+                    upm.id DESC
+                LIMIT %s
+                """,
+                (pokemon_id, usuario_pokemon_id, len(slots_libres)),
+            )
+            candidatos = [int(row["usuario_pokemon_movimiento_id"]) for row in cursor.fetchall()]
+
+            for slot, usuario_pokemon_movimiento_id in zip(slots_libres, candidatos):
+                cursor.execute(
+                    """
+                    INSERT INTO usuario_pokemon_movimientos_equipo
+                        (usuario_pokemon_id, usuario_pokemon_movimiento_id, slot)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (usuario_pokemon_id, slot) DO NOTHING
+                    """,
+                    (usuario_pokemon_id, usuario_pokemon_movimiento_id, slot),
+                )
+                if cursor.rowcount:
+                    equipados += 1
+
+    return {"desbloqueados": desbloqueados, "equipados": equipados}
+
+
+def obtener_movimientos_usuario_pokemon(cursor, usuario_pokemon_id: int, usuario_id: int | None = None) -> list[dict]:
+    if not sistema_movimientos_habilitado(cursor):
+        return []
+
+    filtros = ["upm.usuario_pokemon_id = %s", "upm.activo = TRUE", "m.activo = TRUE"]
+    params = [int(usuario_pokemon_id)]
+
+    if usuario_id is not None:
+        filtros.append("up.usuario_id = %s")
+        params.append(int(usuario_id))
+
+    cursor.execute(
+        f"""
+        SELECT
+            upm.id AS usuario_pokemon_movimiento_id,
+            upm.usuario_pokemon_id,
+            upm.movimiento_id,
+            upm.desbloqueado_por,
+            upm.nivel_desbloqueado,
+            m.codigo,
+            m.nombre,
+            m.tipo,
+            m.categoria,
+            m.potencia,
+            m.precision_pct,
+            m.cooldown_turnos,
+            m.prioridad,
+            m.objetivo,
+            m.efecto_codigo,
+            m.efecto_valor,
+            m.descripcion,
+            COALESCE(pm.nivel_requerido, upm.nivel_desbloqueado, 1) AS nivel_requerido,
+            COALESCE(pm.orden_aprendizaje, 0) AS orden_aprendizaje,
+            upme.slot
+        FROM usuario_pokemon_movimientos upm
+        JOIN movimientos m
+            ON m.id = upm.movimiento_id
+        JOIN usuario_pokemon up
+            ON up.id = upm.usuario_pokemon_id
+        LEFT JOIN pokemon_movimientos pm
+            ON pm.pokemon_id = up.pokemon_id
+           AND pm.movimiento_id = upm.movimiento_id
+        LEFT JOIN usuario_pokemon_movimientos_equipo upme
+            ON upme.usuario_pokemon_id = upm.usuario_pokemon_id
+           AND upme.usuario_pokemon_movimiento_id = upm.id
+        WHERE {' AND '.join(filtros)}
+        ORDER BY
+            CASE WHEN upme.slot IS NULL THEN 1 ELSE 0 END ASC,
+            upme.slot ASC NULLS LAST,
+            COALESCE(pm.nivel_requerido, upm.nivel_desbloqueado, 1) DESC,
+            COALESCE(pm.orden_aprendizaje, 0) DESC,
+            m.nombre ASC
+        """,
+        tuple(params),
+    )
+    rows = cursor.fetchall()
+
+    movimientos = []
+    for row in rows:
+        slot = row.get("slot")
+        movimientos.append({
+            "usuario_pokemon_movimiento_id": int(row["usuario_pokemon_movimiento_id"]),
+            "usuario_pokemon_id": int(row["usuario_pokemon_id"]),
+            "movimiento_id": int(row["movimiento_id"]),
+            "codigo": row["codigo"],
+            "nombre": row["nombre"],
+            "tipo": row["tipo"],
+            "categoria": row["categoria"],
+            "potencia": int(row["potencia"] or 0) if row.get("potencia") is not None else None,
+            "precision_pct": int(row["precision_pct"] or 0),
+            "cooldown_turnos": int(row["cooldown_turnos"] or 0),
+            "prioridad": int(row["prioridad"] or 0),
+            "objetivo": row["objetivo"],
+            "efecto_codigo": row["efecto_codigo"],
+            "efecto_valor": int(row["efecto_valor"] or 0),
+            "descripcion": row["descripcion"],
+            "desbloqueado_por": row["desbloqueado_por"],
+            "nivel_desbloqueado": int(row["nivel_desbloqueado"] or 1),
+            "nivel_requerido": int(row["nivel_requerido"] or 1),
+            "orden_aprendizaje": int(row["orden_aprendizaje"] or 0),
+            "slot": int(slot) if slot is not None else None,
+            "equipado": slot is not None,
+        })
+
+    return movimientos
+
+
+def equipar_movimiento_usuario_pokemon(cursor, usuario_id: int, usuario_pokemon_id: int, movimiento_id: int, slot: int) -> dict:
+    if not sistema_movimientos_habilitado(cursor):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="El sistema de movimientos aún no está disponible. Ejecuta la migración primero."
+        )
+
+    slot = int(slot or 0)
+    if slot < 1 or slot > 4:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="El slot del movimiento debe estar entre 1 y 4"
+        )
+
+    cursor.execute(
+        """
+        SELECT id, usuario_id, pokemon_id, nivel
+        FROM usuario_pokemon
+        WHERE id = %s AND usuario_id = %s
+        """,
+        (int(usuario_pokemon_id), int(usuario_id)),
+    )
+    pokemon_usuario = cursor.fetchone()
+
+    if not pokemon_usuario:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pokémon del usuario no encontrado"
+        )
+
+    sincronizar_movimientos_usuario_pokemon(
+        cursor,
+        int(usuario_pokemon_id),
+        int(pokemon_usuario["pokemon_id"]),
+        int(pokemon_usuario["nivel"] or 1),
+        origen="nivel",
+        auto_equipar=True,
+    )
+
+    cursor.execute(
+        """
+        SELECT upm.id AS usuario_pokemon_movimiento_id, m.nombre
+        FROM usuario_pokemon_movimientos upm
+        JOIN movimientos m
+            ON m.id = upm.movimiento_id
+        WHERE upm.usuario_pokemon_id = %s
+          AND upm.movimiento_id = %s
+          AND upm.activo = TRUE
+          AND m.activo = TRUE
+        LIMIT 1
+        """,
+        (int(usuario_pokemon_id), int(movimiento_id)),
+    )
+    movimiento_usuario = cursor.fetchone()
+
+    if not movimiento_usuario:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Ese movimiento no está desbloqueado para este Pokémon"
+        )
+
+    usuario_pokemon_movimiento_id = int(movimiento_usuario["usuario_pokemon_movimiento_id"])
+
+    cursor.execute(
+        """
+        SELECT id, usuario_pokemon_movimiento_id, slot
+        FROM usuario_pokemon_movimientos_equipo
+        WHERE usuario_pokemon_id = %s AND slot = %s
+        LIMIT 1
+        """,
+        (int(usuario_pokemon_id), slot),
+    )
+    movimiento_en_slot = cursor.fetchone()
+
+    cursor.execute(
+        """
+        SELECT id, slot
+        FROM usuario_pokemon_movimientos_equipo
+        WHERE usuario_pokemon_id = %s AND usuario_pokemon_movimiento_id = %s
+        LIMIT 1
+        """,
+        (int(usuario_pokemon_id), usuario_pokemon_movimiento_id),
+    )
+    movimiento_ya_equipado = cursor.fetchone()
+
+    if movimiento_en_slot and int(movimiento_en_slot["usuario_pokemon_movimiento_id"]) == usuario_pokemon_movimiento_id:
+        return {
+            "slot": slot,
+            "movimiento_id": int(movimiento_id),
+            "usuario_pokemon_movimiento_id": usuario_pokemon_movimiento_id,
+            "nombre": movimiento_usuario["nombre"],
+        }
+
+    if movimiento_en_slot and int(movimiento_en_slot["usuario_pokemon_movimiento_id"]) != usuario_pokemon_movimiento_id:
+        cursor.execute(
+            "DELETE FROM usuario_pokemon_movimientos_equipo WHERE id = %s",
+            (int(movimiento_en_slot["id"]),),
+        )
+
+    if movimiento_ya_equipado:
+        cursor.execute(
+            """
+            UPDATE usuario_pokemon_movimientos_equipo
+            SET slot = %s,
+                fecha_equipo = NOW()
+            WHERE id = %s
+            """,
+            (slot, int(movimiento_ya_equipado["id"])),
+        )
+    else:
+        cursor.execute(
+            """
+            INSERT INTO usuario_pokemon_movimientos_equipo
+                (usuario_pokemon_id, usuario_pokemon_movimiento_id, slot, fecha_equipo)
+            VALUES (%s, %s, %s, NOW())
+            """,
+            (int(usuario_pokemon_id), usuario_pokemon_movimiento_id, slot),
+        )
+
+    return {
+        "slot": slot,
+        "movimiento_id": int(movimiento_id),
+        "usuario_pokemon_movimiento_id": usuario_pokemon_movimiento_id,
+        "nombre": movimiento_usuario["nombre"],
+    }
 
 
 def registrar_actividad_usuario(cursor, usuario_id: int, pagina: str = "global", accion: str = "heartbeat", detalle: str | None = None, sesion_token: str | None = None, online: bool = True):
@@ -1953,6 +2295,122 @@ def obtener_pokemon_me(usuario=Depends(get_current_user)):
     return obtener_pokemon_usuario_data(usuario["id"])
 
 
+@router.get("/usuario/pokemon/{usuario_pokemon_id}/movimientos")
+def obtener_movimientos_pokemon_me(usuario_pokemon_id: int, usuario=Depends(get_current_user)):
+    conn = get_connection()
+    cursor = get_cursor(conn)
+
+    try:
+        if not sistema_movimientos_habilitado(cursor):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="El sistema de movimientos aún no está disponible. Ejecuta la migración primero."
+            )
+
+        cursor.execute(
+            """
+            SELECT up.id, up.usuario_id, up.pokemon_id, up.nivel, up.es_shiny, p.nombre, p.tipo
+            FROM usuario_pokemon up
+            JOIN pokemon p ON p.id = up.pokemon_id
+            WHERE up.id = %s AND up.usuario_id = %s
+            LIMIT 1
+            """,
+            (usuario_pokemon_id, usuario["id"]),
+        )
+        pokemon_usuario = cursor.fetchone()
+
+        if not pokemon_usuario:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Pokémon del usuario no encontrado"
+            )
+
+        sincronizacion = sincronizar_movimientos_usuario_pokemon(
+            cursor,
+            int(pokemon_usuario["id"]),
+            int(pokemon_usuario["pokemon_id"]),
+            int(pokemon_usuario["nivel"] or 1),
+            origen="nivel",
+            auto_equipar=True,
+        )
+
+        movimientos = obtener_movimientos_usuario_pokemon(cursor, int(pokemon_usuario["id"]), usuario["id"])
+        equipados = [mov for mov in movimientos if mov.get("slot") is not None]
+        equipados.sort(key=lambda mov: int(mov.get("slot") or 999))
+
+        conn.commit()
+
+        return {
+            "ok": True,
+            "usuario_pokemon": {
+                "id": int(pokemon_usuario["id"]),
+                "pokemon_id": int(pokemon_usuario["pokemon_id"]),
+                "nombre": pokemon_usuario["nombre"],
+                "tipo": pokemon_usuario["tipo"],
+                "nivel": int(pokemon_usuario["nivel"] or 1),
+                "es_shiny": bool(pokemon_usuario["es_shiny"]),
+            },
+            "sincronizacion": sincronizacion,
+            "movimientos": movimientos,
+            "equipados": equipados,
+        }
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as error:
+        conn.rollback()
+        print("Error en /usuario/pokemon/{usuario_pokemon_id}/movimientos:", repr(error))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="No se pudieron obtener los movimientos del Pokémon"
+        )
+    finally:
+        cursor.close()
+        release_connection(conn)
+
+
+@router.post("/usuario/pokemon/{usuario_pokemon_id}/movimientos/equipar")
+def equipar_movimiento_pokemon_me(usuario_pokemon_id: int, payload: EquiparMovimientoPayload, usuario=Depends(get_current_user)):
+    conn = get_connection()
+    cursor = get_cursor(conn)
+
+    try:
+        resultado = equipar_movimiento_usuario_pokemon(
+            cursor,
+            usuario["id"],
+            usuario_pokemon_id,
+            payload.movimiento_id,
+            payload.slot,
+        )
+
+        movimientos = obtener_movimientos_usuario_pokemon(cursor, usuario_pokemon_id, usuario["id"])
+        equipados = [mov for mov in movimientos if mov.get("slot") is not None]
+        equipados.sort(key=lambda mov: int(mov.get("slot") or 999))
+
+        conn.commit()
+
+        return {
+            "ok": True,
+            "mensaje": "Movimiento equipado correctamente",
+            "resultado": resultado,
+            "movimientos": movimientos,
+            "equipados": equipados,
+        }
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as error:
+        conn.rollback()
+        print("Error en /usuario/pokemon/{usuario_pokemon_id}/movimientos/equipar:", repr(error))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="No se pudo equipar el movimiento"
+        )
+    finally:
+        cursor.close()
+        release_connection(conn)
+
+
 @router.get("/usuario/me/equipo")
 def obtener_equipo_me(usuario=Depends(get_current_user)):
     return {
@@ -2448,6 +2906,7 @@ def recompensa_victoria_batalla(payload: RecompensaBatallaPayload, usuario=Depen
         """, (nuevos_pokedolares, usuario["id"]))
 
         p_atk_sp_sql, p_def_sp_sql = obtener_select_stats_especiales(cursor, "pokemon", "p")
+        bonus_atk_sp_sql, bonus_def_sp_sql = obtener_select_bonus_renacer_especiales(cursor, "up")
         up_has_special = stats_especiales_habilitados(cursor, "usuario_pokemon")
         pokemon_actualizados = []
 
@@ -2466,6 +2925,8 @@ def recompensa_victoria_batalla(payload: RecompensaBatallaPayload, usuario=Depen
                     up.bonus_ataque_renacer,
                     up.bonus_defensa_renacer,
                     up.bonus_velocidad_renacer,
+                    {bonus_atk_sp_sql},
+                    {bonus_def_sp_sql},
                     {('up.ataque_especial AS ataque_especial, up.defensa_especial AS defensa_especial,' if up_has_special else 'up.ataque AS ataque_especial, up.defensa AS defensa_especial,')}
                     p.hp,
                     p.ataque,
@@ -2516,6 +2977,8 @@ def recompensa_victoria_batalla(payload: RecompensaBatallaPayload, usuario=Depen
                 poke["bonus_velocidad_renacer"],
                 poke.get("ataque_especial"),
                 poke.get("defensa_especial"),
+                poke.get("bonus_ataque_especial_renacer"),
+                poke.get("bonus_defensa_especial_renacer"),
             )
 
             if up_has_special:
@@ -2572,6 +3035,15 @@ def recompensa_victoria_batalla(payload: RecompensaBatallaPayload, usuario=Depen
                     stats["velocidad"],
                     usuario_pokemon_id,
                 ))
+
+            sincronizar_movimientos_usuario_pokemon(
+                cursor,
+                usuario_pokemon_id,
+                int(poke["pokemon_id"]),
+                nuevo_nivel,
+                origen="nivel",
+                auto_equipar=True,
+            )
 
             pokemon_actualizados.append({
                 "usuario_pokemon_id": usuario_pokemon_id,
@@ -3503,6 +3975,16 @@ def intentar_captura(request: Request, payload: IntentoCapturaPayload, usuario=D
             usuario_pokemon_insertado = cursor.fetchone()
             usuario_pokemon_id = int(usuario_pokemon_insertado["id"]) if usuario_pokemon_insertado else None
 
+            if usuario_pokemon_id:
+                sincronizar_movimientos_usuario_pokemon(
+                    cursor,
+                    usuario_pokemon_id,
+                    int(encuentro["pokemon_id"]),
+                    int(encuentro["nivel"]),
+                    origen="captura",
+                    auto_equipar=True,
+                )
+
             registrar_log_maps(
                 cursor,
                 usuario_id=usuario["id"],
@@ -3706,18 +4188,21 @@ def evolucionar_con_item(payload: EvolucionItemPayload, usuario=Depends(get_curr
     try:
         validar_usuario_payload(payload.usuario_id, usuario["id"])
 
-        cursor.execute("""
+        bonus_atk_sp_sql, bonus_def_sp_sql = obtener_select_bonus_renacer_especiales(cursor, "up")
+        cursor.execute(f"""
             SELECT
-                pokemon_id,
-                nivel,
-                experiencia,
-                es_shiny,
-                bonus_hp_renacer,
-                bonus_ataque_renacer,
-                bonus_defensa_renacer,
-                bonus_velocidad_renacer
-            FROM usuario_pokemon
-            WHERE id = %s AND usuario_id = %s
+                up.pokemon_id,
+                up.nivel,
+                up.experiencia,
+                up.es_shiny,
+                up.bonus_hp_renacer,
+                up.bonus_ataque_renacer,
+                up.bonus_defensa_renacer,
+                up.bonus_velocidad_renacer,
+                {bonus_atk_sp_sql},
+                {bonus_def_sp_sql}
+            FROM usuario_pokemon up
+            WHERE up.id = %s AND up.usuario_id = %s
         """, (payload.usuario_pokemon_id, usuario["id"]))
         poke = cursor.fetchone()
 
@@ -3774,6 +4259,8 @@ def evolucionar_con_item(payload: EvolucionItemPayload, usuario=Depends(get_curr
             poke["bonus_velocidad_renacer"],
             base.get("ataque_especial", base["ataque"]),
             base.get("defensa_especial", base["defensa"]),
+            poke.get("bonus_ataque_especial_renacer"),
+            poke.get("bonus_defensa_especial_renacer"),
         )
 
         if stats_especiales_habilitados(cursor, "usuario_pokemon"):
@@ -3820,6 +4307,15 @@ def evolucionar_con_item(payload: EvolucionItemPayload, usuario=Depends(get_curr
                 payload.usuario_pokemon_id,
                 usuario["id"]
             ))
+
+        sincronizar_movimientos_usuario_pokemon(
+            cursor,
+            payload.usuario_pokemon_id,
+            int(evo["evoluciona_a"]),
+            int(poke["nivel"] or 1),
+            origen="nivel",
+            auto_equipar=True,
+        )
 
         registrar_actividad_usuario(
             cursor,
@@ -4031,6 +4527,8 @@ def evolucionar_por_nivel(payload: EvolucionNivelPayload, usuario=Depends(get_cu
             poke["bonus_velocidad_renacer"],
             base.get("ataque_especial", base["ataque"]),
             base.get("defensa_especial", base["defensa"]),
+            poke.get("bonus_ataque_especial_renacer"),
+            poke.get("bonus_defensa_especial_renacer"),
         )
 
         if stats_especiales_habilitados(cursor, "usuario_pokemon"):
@@ -4077,6 +4575,15 @@ def evolucionar_por_nivel(payload: EvolucionNivelPayload, usuario=Depends(get_cu
                 payload.usuario_pokemon_id,
                 usuario["id"]
             ))
+
+        sincronizar_movimientos_usuario_pokemon(
+            cursor,
+            payload.usuario_pokemon_id,
+            int(evo["evoluciona_a"]),
+            int(poke["nivel"] or 1),
+            origen="nivel",
+            auto_equipar=True,
+        )
 
         registrar_actividad_usuario(
             cursor,
