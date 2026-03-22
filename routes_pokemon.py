@@ -189,17 +189,23 @@ def calcular_stats(
     bonus_ataque_especial_renacer: int = 0,
     bonus_defensa_especial_renacer: int = 0,
 ):
-    bonus_hp_shiny = 2 if es_shiny else 0
+    nivel = max(1, int(nivel or 1))
+    nivel_factor = nivel - 1
+
+    base_hp = int(base_hp or 0)
+    base_ataque = int(base_ataque or 0)
+    base_defensa = int(base_defensa or 0)
+    base_velocidad = int(base_velocidad or 0)
 
     base_ataque_especial = int(base_ataque if base_ataque_especial is None else base_ataque_especial)
     base_defensa_especial = int(base_defensa if base_defensa_especial is None else base_defensa_especial)
 
-    hp_max = int(base_hp) + (int(nivel) * (5 + bonus_hp_shiny)) + int(bonus_hp_renacer or 0)
-    ataque = int(base_ataque) + (int(nivel) * 2) + int(bonus_ataque_renacer or 0)
-    defensa = int(base_defensa) + (int(nivel) * 2) + int(bonus_defensa_renacer or 0)
-    velocidad = int(base_velocidad) + int(nivel) + int(bonus_velocidad_renacer or 0)
-    ataque_especial = int(base_ataque_especial) + (int(nivel) * 2) + int(bonus_ataque_especial_renacer or 0)
-    defensa_especial = int(base_defensa_especial) + (int(nivel) * 2) + int(bonus_defensa_especial_renacer or 0)
+    hp_max = base_hp + (nivel_factor * 4) + (nivel * 2 if es_shiny else 0) + int(bonus_hp_renacer or 0)
+    ataque = base_ataque + (nivel_factor * 2) + int(bonus_ataque_renacer or 0)
+    defensa = base_defensa + (nivel_factor * 2) + int(bonus_defensa_renacer or 0)
+    velocidad = base_velocidad + nivel_factor + int(bonus_velocidad_renacer or 0)
+    ataque_especial = base_ataque_especial + (nivel_factor * 2) + int(bonus_ataque_especial_renacer or 0)
+    defensa_especial = base_defensa_especial + (nivel_factor * 2) + int(bonus_defensa_especial_renacer or 0)
 
     return {
         "hp_max": hp_max,
