@@ -31,6 +31,7 @@ SERVER_TIMEZONE = ZoneInfo("America/Lima")
 BOSS_EVENT_HORA_INICIO = 20
 BOSS_EVENT_DURACION_HORAS = 1
 BOSS_SESSION_TTL_SEGUNDOS = 60 * 45
+BOSS_TEST_FORCE_ACTIVE = True
 
 IDLE_DURACIONES_PERMITIDAS = {3600, 7200, 14400, 28800}
 IDLE_TIER_CONFIG = {
@@ -102,8 +103,12 @@ def obtener_ventana_boss_para_fecha(fecha_obj: date):
 
 
 def estado_boss_para_fecha(fecha_obj: date):
+    if BOSS_TEST_FORCE_ACTIVE:
+        return "activo"
+
     ahora = ahora_server()
     inicio, fin = obtener_ventana_boss_para_fecha(fecha_obj)
+
     if ahora < inicio:
         return "programado"
     if inicio <= ahora < fin:
