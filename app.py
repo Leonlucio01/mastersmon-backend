@@ -2,9 +2,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from routes_pokemon import router
+from routes_boss_idle import router_boss_idle
 from database import get_connection, get_cursor, release_connection
 
-BACKEND_MARKER = "mastersmon-backend-2026-03-21-debug-v1"
+BACKEND_MARKER = "mastersmon-backend-2026-03-22-boss-idle-v1"
 
 app = FastAPI(
     title="MastersMon API",
@@ -32,6 +33,7 @@ app.add_middleware(
 )
 
 app.include_router(router)
+app.include_router(router_boss_idle)
 
 
 @app.get("/")
@@ -40,7 +42,7 @@ def root():
         "status": "ok",
         "message": "MastersMon API running",
         "version_backend": BACKEND_MARKER,
-        "router_loaded": "routes_pokemon"
+        "router_loaded": "routes_pokemon + routes_boss_idle"
     }
 
 
