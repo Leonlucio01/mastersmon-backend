@@ -173,6 +173,16 @@ class EquiparMovimientoPayload(BaseModel):
 # HELPERS
 # =========================================================
 
+def obtener_bonus_nivel_rival_por_dificultad(codigo: str) -> int:
+    valor = (codigo or "normal").strip().lower()
+    if valor == "master":
+        return 6
+    if valor == "expert":
+        return 4
+    if valor == "challenge":
+        return 2
+    return 0
+
 def calcular_stats(
     base_hp: int,
     base_ataque: int,
@@ -2772,6 +2782,8 @@ def iniciar_batalla_arena(payload: BattleIniciarPayload, usuario=Depends(get_cur
             )
 
         recompensa = obtener_recompensa_batalla_por_codigo(payload.dificultad)
+        codigo_dificultad = str(recompensa.get("codigo") or payload.dificultad or "normal").strip().lower()
+        bonus_nivel_rival = obtener_bonus_nivel_rival_por_dificultad(codigo_dificultad)
 
         usuario_pokemon_ids = payload.usuario_pokemon_ids or []
         if usuario_pokemon_ids:
@@ -2802,8 +2814,8 @@ def iniciar_batalla_arena(payload: BattleIniciarPayload, usuario=Depends(get_cur
             (
                 battle_token,
                 usuario["id"],
-                recompensa["codigo"],
-                int(recompensa.get("bonus_nivel_rival") or 0),
+                codigo_dificultad,
+                int(bonus_nivel_rival),
                 int(recompensa["exp"]),
                 int(recompensa["pokedolares"]),
                 json.dumps(ids_limpios),
@@ -2817,15 +2829,15 @@ def iniciar_batalla_arena(payload: BattleIniciarPayload, usuario=Depends(get_cur
             usuario["id"],
             pagina="battle-arena",
             accion="battle_start",
-            detalle=f"dificultad:{recompensa['codigo']}"
+            detalle=f"dificultad:{codigo_dificultad}"
         )
         conn.commit()
 
         return {
             "ok": True,
             "battle_session_token": battle_token,
-            "dificultad_codigo": recompensa["codigo"],
-            "bonus_nivel_rival": int(recompensa.get("bonus_nivel_rival") or 0),
+            "dificultad_codigo": codigo_dificultad,
+            "bonus_nivel_rival": int(bonus_nivel_rival),
             "exp_ganada": int(recompensa["exp"]),
             "pokedolares_ganados": int(recompensa["pokedolares"]),
             "equipo_usuario_pokemon_ids": ids_limpios,
