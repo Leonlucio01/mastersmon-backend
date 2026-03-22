@@ -3546,16 +3546,16 @@ def intentar_captura(request: Request, payload: IntentoCapturaPayload, usuario=D
              )
 
             # DEBUG TEMPORAL: desactivado para aislar problema
-            # try:
-            #     registrar_actividad_usuario(
-            #         cursor,
-            #         usuario["id"],
-            #         pagina="maps",
-            #         accion="capture",
-            #         detalle=f"pokemon:{int(encuentro['pokemon_id'])}"
-            #     )
-            # except Exception as actividad_error:
-            #     print("Aviso actividad capture maps:", actividad_error)
+            try:
+                 registrar_actividad_usuario(
+                     cursor,
+                     usuario["id"],
+                     pagina="maps",
+                     accion="capture",
+                     detalle=f"pokemon:{int(encuentro['pokemon_id'])}"
+                 )
+            except Exception as actividad_error:
+                 print("Aviso actividad capture maps:", actividad_error)
 
             conn.commit()
 
