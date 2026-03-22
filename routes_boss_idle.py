@@ -88,6 +88,12 @@ def ahora_server():
 def ahora_server_naive():
     return ahora_server().replace(tzinfo=None)
 
+def serializar_datetime_server(valor):
+    if not valor:
+        return None
+    if getattr(valor, "tzinfo", None) is None:
+        return valor.replace(tzinfo=SERVER_TIMEZONE).isoformat()
+    return valor.astimezone(SERVER_TIMEZONE).isoformat()
 
 def obtener_ventana_boss_para_fecha(fecha_obj: date):
     inicio = datetime(fecha_obj.year, fecha_obj.month, fecha_obj.day, BOSS_EVENT_HORA_INICIO, 0, 0, tzinfo=SERVER_TIMEZONE)
@@ -1159,8 +1165,8 @@ def obtener_estado_idle(usuario=Depends(get_current_user)):
                 "tier_codigo": sesion["tier_codigo"],
                 "duracion_segundos": int(sesion["duracion_segundos"]),
                 "estado": sesion["estado"],
-                "iniciado_en": iniciada_en.isoformat() if iniciada_en else None,
-                "termina_en": termina_en.isoformat() if termina_en else None,
+                "iniciado_en": serializar_datetime_server(iniciada_en),
+                "termina_en": serializar_datetime_server(termina_en),
                 "segundos_restantes": restante,
                 "progreso_pct": progreso
             }
@@ -1201,13 +1207,16 @@ def iniciar_idle(payload: IdleIniciarPayload, usuario=Depends(get_current_user))
         snapshot = obtener_snapshot_equipo_para_modo(cursor, usuario["id"], ids_limpios)
         idle_token = crear_token_simple(24)
 
+        iniciado_en = ahora_server_naive()
+        termina_en = iniciado_en + timedelta(seconds=duracion_segundos)
+
         cursor.execute(
             """
             INSERT INTO idle_sesiones
                 (token, usuario_id, equipo_usuario_pokemon_ids, snapshot_equipo_json, tier_codigo, duracion_segundos,
-                 estado, iniciado_en, termina_en, items_ganados_json)
+                estado, iniciado_en, termina_en, items_ganados_json)
             VALUES
-                (%s, %s, %s::jsonb, %s::jsonb, %s, %s, 'activa', NOW(), NOW() + (%s * INTERVAL '1 second'), '[]'::jsonb)
+                (%s, %s, %s::jsonb, %s::jsonb, %s, %s, 'activa', %s, %s, '[]'::jsonb)
             RETURNING iniciado_en, termina_en
             """,
             (
@@ -1217,7 +1226,8 @@ def iniciar_idle(payload: IdleIniciarPayload, usuario=Depends(get_current_user))
                 json.dumps(snapshot),
                 tier_codigo,
                 duracion_segundos,
-                duracion_segundos,
+                iniciado_en,
+                termina_en,
             )
         )
         nueva_sesion = cursor.fetchone()
@@ -1237,8 +1247,8 @@ def iniciar_idle(payload: IdleIniciarPayload, usuario=Depends(get_current_user))
             "idle_session_token": idle_token,
             "tier_codigo": tier_codigo,
             "duracion_segundos": duracion_segundos,
-            "iniciado_en": nueva_sesion["iniciado_en"].isoformat() if nueva_sesion and nueva_sesion.get("iniciado_en") else None,
-            "termina_en": nueva_sesion["termina_en"].isoformat() if nueva_sesion and nueva_sesion.get("termina_en") else None,
+            "iniciado_en": serializar_datetime_server(nueva_sesion["iniciado_en"]) if nueva_sesion and nueva_sesion.get("iniciado_en") else None,
+            "termina_en": serializar_datetime_server(nueva_sesion["termina_en"]) if nueva_sesion and nueva_sesion.get("termina_en") else None,
             "equipo_usuario_pokemon_ids": ids_limpios,
             "snapshot_equipo": snapshot
         }
