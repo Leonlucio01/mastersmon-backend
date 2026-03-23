@@ -229,6 +229,25 @@ def _capturar_orden_paypal(order_id: str):
         raise HTTPException(status_code=502, detail=f"No se pudo capturar la orden PayPal: {response.text[:400]}")
     return response.json()
 
+def _obtener_orden_paypal(order_id: str):
+    token = _paypal_access_token()
+    response = requests.get(
+        f"{PAYPAL_BASE_URL}/v2/checkout/orders/{order_id}",
+        headers=_paypal_headers(token),
+        timeout=30,
+    )
+    if response.status_code >= 300:
+        raise HTTPException(status_code=502, detail=f"No se pudo consultar la orden PayPal: {response.text[:400]}")
+    return response.json()
+
+
+def _extraer_capture_id_paypal(order_data: dict) -> str | None:
+    for pu in order_data.get("purchase_units", []) or []:
+        payments = pu.get("payments") or {}
+        captures = payments.get("captures") or []
+        if captures:
+            return captures[0].get("id")
+    return None
 
 def _verificar_webhook_paypal(headers: dict, body: dict) -> bool | None:
     if not PAYPAL_WEBHOOK_ID:
@@ -490,6 +509,7 @@ def crear_orden_paypal(payload: CreatePayPalOrderPayload, request: Request, usua
         release_connection(conn)
 
 
+
 @router_payments.post("/payments/paypal/order/capture")
 def capturar_orden_paypal(payload: CapturePayPalOrderPayload, usuario=Depends(get_current_user)):
     conn = get_connection()
@@ -525,22 +545,43 @@ def capturar_orden_paypal(payload: CapturePayPalOrderPayload, usuario=Depends(ge
                 "estado": "pagado",
                 "grant_status": compra.get("grant_status"),
                 "grant_payload": _json_safe(compra.get("grant_payload")),
+                "paypal_order_id": compra.get("paypal_order_id"),
+                "paypal_capture_id": compra.get("paypal_capture_id"),
+                "synced": True,
             }
 
-        captured = _capturar_orden_paypal(payload.paypal_order_id)
-        status_paypal = str(captured.get("status") or "")
+        captured = None
+        capture_error_detail = None
+
+        try:
+            captured = _capturar_orden_paypal(payload.paypal_order_id)
+        except HTTPException as exc:
+            detail_text = str(exc.detail or "")
+            capture_error_detail = detail_text
+
+            if "ORDER_ALREADY_CAPTURED" not in detail_text:
+                raise
+
+            # Ya fue capturada en PayPal; reconciliar consultando la orden
+            captured = _obtener_orden_paypal(payload.paypal_order_id)
+
+        status_paypal = str(captured.get("status") or "").upper()
         if status_paypal not in ("COMPLETED", "APPROVED"):
-            raise HTTPException(status_code=409, detail=f"PayPal devolvió un estado no finalizable: {status_paypal}")
+            raise HTTPException(
+                status_code=409,
+                detail=f"PayPal devolvió un estado no finalizable: {status_paypal}"
+            )
 
-        capture_id = None
-        for pu in captured.get("purchase_units", []) or []:
-            payments = pu.get("payments") or {}
-            captures = payments.get("captures") or []
-            if captures:
-                capture_id = captures[0].get("id")
-                break
+        capture_id = _extraer_capture_id_paypal(captured)
 
-        compra_actualizada = _marcar_compra_pagada(cursor, int(compra["id"]), payload.paypal_order_id, capture_id, captured)
+        compra_actualizada = _marcar_compra_pagada(
+            cursor,
+            int(compra["id"]),
+            payload.paypal_order_id,
+            capture_id,
+            captured,
+        )
+
         entrega = _entregar_producto_pagado(cursor, compra_actualizada, producto)
         conn.commit()
 
@@ -550,6 +591,8 @@ def capturar_orden_paypal(payload: CapturePayPalOrderPayload, usuario=Depends(ge
             "estado": "pagado",
             "paypal_order_id": payload.paypal_order_id,
             "paypal_capture_id": capture_id,
+            "paypal_status": status_paypal,
+            "sync_source": "order_lookup_after_already_captured" if capture_error_detail else "capture_api",
             **entrega,
         }
     except HTTPException:
@@ -562,7 +605,7 @@ def capturar_orden_paypal(payload: CapturePayPalOrderPayload, usuario=Depends(ge
     finally:
         cursor.close()
         release_connection(conn)
-
+        
 
 @router_payments.post("/payments/booster/usar")
 def usar_booster(payload: UseBoosterPayload, usuario=Depends(get_current_user)):
