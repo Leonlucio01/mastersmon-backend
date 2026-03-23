@@ -661,19 +661,23 @@ def aplicar_exp_a_equipo(cursor, usuario_id: int, usuario_pokemon_ids: list[int]
     return resultado
 
 
-def obtener_sesion_idle_activa(cursor, usuario_id: int, for_update: bool = False):
+def obtener_sesion_idle_activa(cursor, usuario_id: int, for_update: bool = False, incluir_reclamable: bool = True):
+    estados = ["activa"]
+    if incluir_reclamable:
+        estados.append("reclamable")
+
     sql_for_update = " FOR UPDATE" if for_update else ""
     cursor.execute(
         f"""
         SELECT *
         FROM idle_sesiones
         WHERE usuario_id = %s
-          AND estado = 'activa'
+          AND estado = ANY(%s)
         ORDER BY id DESC
         LIMIT 1
         {sql_for_update}
         """,
-        (usuario_id,)
+        (usuario_id, estados)
     )
     return cursor.fetchone()
 
@@ -1315,12 +1319,12 @@ def reclamar_idle(usuario=Depends(get_current_user)):
     cursor = get_cursor(conn)
     try:
         asegurar_tablas_boss_idle(cursor)
-        sesion = obtener_sesion_idle_activa(cursor, usuario["id"], for_update=True)
+        sesion = obtener_sesion_idle_activa(cursor, usuario["id"], for_update=True, incluir_reclamable=True)
         if not sesion:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No tienes una sesión Idle activa")
 
         ahora = ahora_server_naive()
-        if ahora < sesion["termina_en"]:
+        if sesion["estado"] == "activa" and ahora < sesion["termina_en"]:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="La sesión Idle aún no termina")
 
         resultado = sesion.get("resultado_json")
@@ -1401,7 +1405,7 @@ def cancelar_idle(payload: IdleCancelarPayload, usuario=Depends(get_current_user
     cursor = get_cursor(conn)
     try:
         asegurar_tablas_boss_idle(cursor)
-        sesion = obtener_sesion_idle_activa(cursor, usuario["id"], for_update=True)
+        sesion = obtener_sesion_idle_activa(cursor, usuario["id"], for_update=True, incluir_reclamable=True)
         if not sesion:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No tienes una sesión Idle activa")
 
