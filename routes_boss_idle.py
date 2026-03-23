@@ -8,6 +8,11 @@ from pydantic import BaseModel
 
 from auth import get_current_user
 from database import get_connection, get_cursor, release_connection
+from monetization_utils import (
+    aplicar_multiplicadores_recompensa_batalla,
+    resolver_item_por_codigo,
+    usuario_tiene_beneficio_activo,
+)
 from routes_pokemon import (
     MAX_NIVEL_POKEMON,
     calcular_stats,
@@ -31,30 +36,53 @@ SERVER_TIMEZONE = ZoneInfo("America/Lima")
 BOSS_EVENT_HORA_INICIO = 20
 BOSS_EVENT_DURACION_HORAS = 1
 BOSS_SESSION_TTL_SEGUNDOS = 60 * 45
-BOSS_TEST_FORCE_ACTIVE = True
 
 IDLE_DURACIONES_PERMITIDAS = {3600, 7200, 14400, 28800}
+
 IDLE_TIER_CONFIG = {
     "ruta": {
         "tick_segundos": 45,
         "base_exp": 16,
         "base_pokedolares": 26,
         "enemy_power": 1.00,
-        "drop_pool": [{"item_id": 4, "chance": 0.12}, {"item_id": 1, "chance": 0.08}],
+        "drop_pool": [
+            {"item_code": "potion", "chance": 0.12},
+            {"item_code": "poke_ball", "chance": 0.08},
+        ],
     },
     "elite": {
         "tick_segundos": 55,
         "base_exp": 28,
         "base_pokedolares": 52,
         "enemy_power": 1.25,
-        "drop_pool": [{"item_id": 4, "chance": 0.18}, {"item_id": 2, "chance": 0.10}],
+        "drop_pool": [
+            {"item_code": "potion", "chance": 0.18},
+            {"item_code": "super_ball", "chance": 0.10},
+            {"item_code": "ultra_ball", "chance": 0.035},
+        ],
     },
     "legend": {
         "tick_segundos": 65,
         "base_exp": 42,
         "base_pokedolares": 84,
         "enemy_power": 1.55,
-        "drop_pool": [{"item_id": 4, "chance": 0.22}, {"item_id": 2, "chance": 0.16}],
+        "drop_pool": [
+            {"item_code": "potion", "chance": 0.22},
+            {"item_code": "super_ball", "chance": 0.16},
+            {"item_code": "ultra_ball", "chance": 0.08},
+        ],
+    },
+    "masters": {
+        "tick_segundos": 65,
+        "base_exp": 84,
+        "base_pokedolares": 108,
+        "enemy_power": 1.55,
+        "drop_pool": [
+            {"item_code": "potion", "chance": 0.24},
+            {"item_code": "super_ball", "chance": 0.18},
+            {"item_code": "ultra_ball", "chance": 0.12},
+            {"item_code": "master_ball", "chance": 0.0045},
+        ],
     },
 }
 
@@ -89,12 +117,6 @@ def ahora_server():
 def ahora_server_naive():
     return ahora_server().replace(tzinfo=None)
 
-def serializar_datetime_server(valor):
-    if not valor:
-        return None
-    if getattr(valor, "tzinfo", None) is None:
-        return valor.replace(tzinfo=SERVER_TIMEZONE).isoformat()
-    return valor.astimezone(SERVER_TIMEZONE).isoformat()
 
 def obtener_ventana_boss_para_fecha(fecha_obj: date):
     inicio = datetime(fecha_obj.year, fecha_obj.month, fecha_obj.day, BOSS_EVENT_HORA_INICIO, 0, 0, tzinfo=SERVER_TIMEZONE)
@@ -103,12 +125,8 @@ def obtener_ventana_boss_para_fecha(fecha_obj: date):
 
 
 def estado_boss_para_fecha(fecha_obj: date):
-    if BOSS_TEST_FORCE_ACTIVE:
-        return "activo"
-
     ahora = ahora_server()
     inicio, fin = obtener_ventana_boss_para_fecha(fecha_obj)
-
     if ahora < inicio:
         return "programado"
     if inicio <= ahora < fin:
@@ -679,7 +697,7 @@ def obtener_participacion_boss_por_token(cursor, token: str, usuario_id: int, fo
     return cursor.fetchone()
 
 
-def simular_idle_resultado(session_row: dict) -> dict:
+def simular_idle_resultado(cursor, session_row: dict) -> dict:
     tier = normalizar_tier_idle(session_row.get("tier_codigo"))
     cfg = IDLE_TIER_CONFIG[tier]
     snapshot = session_row.get("snapshot_equipo_json") or []
@@ -719,7 +737,12 @@ def simular_idle_resultado(session_row: dict) -> dict:
     for drop in cfg.get("drop_pool", []):
         cantidad = 0
         chance = float(drop.get("chance") or 0)
+        item_code = str(drop.get("item_code") or "").strip()
         item_id = int(drop.get("item_id") or 0)
+        if item_id <= 0 and item_code:
+            item_row = resolver_item_por_codigo(cursor, item_code)
+            if item_row:
+                item_id = int(item_row["id"])
         if item_id <= 0 or chance <= 0:
             continue
 
@@ -730,6 +753,7 @@ def simular_idle_resultado(session_row: dict) -> dict:
         if cantidad > 0:
             items.append({
                 "item_id": item_id,
+                "item_code": item_code or None,
                 "cantidad": cantidad
             })
 
@@ -993,6 +1017,17 @@ def reclamar_recompensa_boss(payload: BossRecompensaPayload, usuario=Depends(get
 
         detalle = obtener_boss_evento_detalle(cursor, int(participacion["boss_evento_id"]))
         recompensa = calcular_recompensa_boss(detalle, payload.damage_total, payload.boss_derrotado)
+        multiplicadores = aplicar_multiplicadores_recompensa_batalla(
+            cursor,
+            int(usuario["id"]),
+            int(recompensa["exp"]),
+            int(recompensa["pokedolares"]),
+        )
+        recompensa["exp_base"] = int(recompensa["exp"])
+        recompensa["pokedolares_base"] = int(recompensa["pokedolares"])
+        recompensa["exp"] = int(multiplicadores["exp_final"])
+        recompensa["pokedolares"] = int(multiplicadores["pokedolares_final"])
+        recompensa["beneficios_activos"] = multiplicadores["beneficios_activos"]
 
         ids_limpios = validar_ids_pokemon_equipo(cursor, usuario["id"], normalizar_equipo_ids_json(participacion.get("equipo_usuario_pokemon_ids")))
         nuevos_pokedolares = sumar_pokedolares_usuario(cursor, usuario["id"], recompensa["pokedolares"])
@@ -1054,6 +1089,9 @@ def reclamar_recompensa_boss(payload: BossRecompensaPayload, usuario=Depends(get
             "pokedolares_ganados": int(recompensa["pokedolares"]),
             "pokedolares_actuales": int(nuevos_pokedolares),
             "pokemon_actualizados": pokemon_actualizados,
+            "exp_base": int(recompensa.get("exp_base") or recompensa["exp"]),
+            "pokedolares_base": int(recompensa.get("pokedolares_base") or recompensa["pokedolares"]),
+            "beneficios_activos": recompensa.get("beneficios_activos") or [],
         }
     except HTTPException:
         conn.rollback()
@@ -1170,8 +1208,8 @@ def obtener_estado_idle(usuario=Depends(get_current_user)):
                 "tier_codigo": sesion["tier_codigo"],
                 "duracion_segundos": int(sesion["duracion_segundos"]),
                 "estado": sesion["estado"],
-                "iniciado_en": serializar_datetime_server(iniciada_en),
-                "termina_en": serializar_datetime_server(termina_en),
+                "iniciado_en": iniciada_en.isoformat() if iniciada_en else None,
+                "termina_en": termina_en.isoformat() if termina_en else None,
                 "segundos_restantes": restante,
                 "progreso_pct": progreso
             }
@@ -1190,6 +1228,12 @@ def iniciar_idle(payload: IdleIniciarPayload, usuario=Depends(get_current_user))
 
         tier_codigo = normalizar_tier_idle(payload.tier_codigo)
         duracion_segundos = normalizar_duracion_idle(payload.duracion_segundos)
+
+        if tier_codigo == "masters" and not usuario_tiene_beneficio_activo(cursor, int(usuario["id"]), "idle_masters"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="El tier Masters requiere el beneficio Idle Masters activo"
+            )
 
         sesion_activa = obtener_sesion_idle_activa(cursor, usuario["id"], for_update=True)
         if sesion_activa:
@@ -1212,16 +1256,13 @@ def iniciar_idle(payload: IdleIniciarPayload, usuario=Depends(get_current_user))
         snapshot = obtener_snapshot_equipo_para_modo(cursor, usuario["id"], ids_limpios)
         idle_token = crear_token_simple(24)
 
-        iniciado_en = ahora_server_naive()
-        termina_en = iniciado_en + timedelta(seconds=duracion_segundos)
-
         cursor.execute(
             """
             INSERT INTO idle_sesiones
                 (token, usuario_id, equipo_usuario_pokemon_ids, snapshot_equipo_json, tier_codigo, duracion_segundos,
-                estado, iniciado_en, termina_en, items_ganados_json)
+                 estado, iniciado_en, termina_en, items_ganados_json)
             VALUES
-                (%s, %s, %s::jsonb, %s::jsonb, %s, %s, 'activa', %s, %s, '[]'::jsonb)
+                (%s, %s, %s::jsonb, %s::jsonb, %s, %s, 'activa', NOW(), NOW() + (%s * INTERVAL '1 second'), '[]'::jsonb)
             RETURNING iniciado_en, termina_en
             """,
             (
@@ -1231,8 +1272,7 @@ def iniciar_idle(payload: IdleIniciarPayload, usuario=Depends(get_current_user))
                 json.dumps(snapshot),
                 tier_codigo,
                 duracion_segundos,
-                iniciado_en,
-                termina_en,
+                duracion_segundos,
             )
         )
         nueva_sesion = cursor.fetchone()
@@ -1252,8 +1292,8 @@ def iniciar_idle(payload: IdleIniciarPayload, usuario=Depends(get_current_user))
             "idle_session_token": idle_token,
             "tier_codigo": tier_codigo,
             "duracion_segundos": duracion_segundos,
-            "iniciado_en": serializar_datetime_server(nueva_sesion["iniciado_en"]) if nueva_sesion and nueva_sesion.get("iniciado_en") else None,
-            "termina_en": serializar_datetime_server(nueva_sesion["termina_en"]) if nueva_sesion and nueva_sesion.get("termina_en") else None,
+            "iniciado_en": nueva_sesion["iniciado_en"].isoformat() if nueva_sesion and nueva_sesion.get("iniciado_en") else None,
+            "termina_en": nueva_sesion["termina_en"].isoformat() if nueva_sesion and nueva_sesion.get("termina_en") else None,
             "equipo_usuario_pokemon_ids": ids_limpios,
             "snapshot_equipo": snapshot
         }
@@ -1288,7 +1328,7 @@ def reclamar_idle(usuario=Depends(get_current_user)):
             resultado = json.loads(resultado)
 
         if not resultado:
-            resultado = simular_idle_resultado(sesion)
+            resultado = simular_idle_resultado(cursor, sesion)
 
         ids_limpios = validar_ids_pokemon_equipo(cursor, usuario["id"], normalizar_equipo_ids_json(sesion.get("equipo_usuario_pokemon_ids")))
         nuevos_pokedolares = sumar_pokedolares_usuario(cursor, usuario["id"], int(resultado["pokedolares_ganados"]))

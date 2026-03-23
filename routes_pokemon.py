@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 from database import get_connection, get_cursor, release_connection
 from auth import verify_google_token, create_access_token, get_current_user, get_current_user_from_token
+from monetization_utils import aplicar_multiplicadores_recompensa_batalla
 
 router = APIRouter()
 MAX_NIVEL_POKEMON = 200
@@ -2897,9 +2898,17 @@ def recompensa_victoria_batalla(payload: RecompensaBatallaPayload, usuario=Depen
                 detail="La batalla todavía es demasiado reciente para reclamar recompensa"
             )
 
-        exp_ganada = int(sesion["exp_ganada"] or 0)
-        pokedolares_ganados = int(sesion["pokedolares_ganados"] or 0)
-        recompensa = obtener_recompensa_batalla_permitida(exp_ganada, pokedolares_ganados)
+        exp_ganada_base = int(sesion["exp_ganada"] or 0)
+        pokedolares_ganados_base = int(sesion["pokedolares_ganados"] or 0)
+        recompensa = obtener_recompensa_batalla_permitida(exp_ganada_base, pokedolares_ganados_base)
+        multiplicadores = aplicar_multiplicadores_recompensa_batalla(
+            cursor,
+            int(usuario["id"]),
+            exp_ganada_base,
+            pokedolares_ganados_base,
+        )
+        exp_ganada = int(multiplicadores["exp_final"])
+        pokedolares_ganados = int(multiplicadores["pokedolares_final"])
         ids_limpios = validar_ids_pokemon_equipo(cursor, usuario["id"], normalizar_equipo_ids_json(sesion.get("equipo_usuario_pokemon_ids")))
 
         cursor.execute("""
@@ -3103,8 +3112,11 @@ def recompensa_victoria_batalla(payload: RecompensaBatallaPayload, usuario=Depen
             "battle_session_token": payload.battle_session_token,
             "recompensa_codigo": recompensa["codigo"],
             "pokedolares_ganados": pokedolares_ganados,
+            "pokedolares_base": pokedolares_ganados_base,
             "pokedolares_actuales": nuevos_pokedolares,
             "exp_ganada": exp_ganada,
+            "exp_base": exp_ganada_base,
+            "beneficios_activos": multiplicadores["beneficios_activos"],
             "pokemon_actualizados": pokemon_actualizados
         }
     except HTTPException:
