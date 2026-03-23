@@ -661,23 +661,19 @@ def aplicar_exp_a_equipo(cursor, usuario_id: int, usuario_pokemon_ids: list[int]
     return resultado
 
 
-def obtener_sesion_idle_activa(cursor, usuario_id: int, for_update: bool = False, incluir_reclamable: bool = True):
-    estados = ["activa"]
-    if incluir_reclamable:
-        estados.append("reclamable")
-
+def obtener_sesion_idle_activa(cursor, usuario_id: int, for_update: bool = False):
     sql_for_update = " FOR UPDATE" if for_update else ""
     cursor.execute(
         f"""
         SELECT *
         FROM idle_sesiones
         WHERE usuario_id = %s
-          AND estado = ANY(%s)
+          AND estado IN ('activa', 'reclamable')
         ORDER BY id DESC
         LIMIT 1
         {sql_for_update}
         """,
-        (usuario_id, estados)
+        (usuario_id,)
     )
     return cursor.fetchone()
 
@@ -1202,6 +1198,9 @@ def obtener_estado_idle(usuario=Depends(get_current_user)):
             conn.commit()
             sesion["estado"] = "reclamable"
 
+        iniciada_en_iso = iniciada_en.replace(tzinfo=ZoneInfo("America/Lima")).isoformat() if iniciada_en else None
+        termina_en_iso = termina_en.replace(tzinfo=ZoneInfo("America/Lima")).isoformat() if termina_en else None
+
         return {
             "ok": True,
             "activa": sesion["estado"] in ("activa", "reclamable"),
@@ -1212,8 +1211,8 @@ def obtener_estado_idle(usuario=Depends(get_current_user)):
                 "tier_codigo": sesion["tier_codigo"],
                 "duracion_segundos": int(sesion["duracion_segundos"]),
                 "estado": sesion["estado"],
-                "iniciado_en": iniciada_en.isoformat() if iniciada_en else None,
-                "termina_en": termina_en.isoformat() if termina_en else None,
+                "iniciado_en": iniciada_en_iso,
+                "termina_en": termina_en_iso,
                 "segundos_restantes": restante,
                 "progreso_pct": progreso
             }
@@ -1290,14 +1289,21 @@ def iniciar_idle(payload: IdleIniciarPayload, usuario=Depends(get_current_user))
         )
         conn.commit()
 
+        iniciado_en_iso = None
+        termina_en_iso = None
+        if nueva_sesion and nueva_sesion.get("iniciado_en"):
+            iniciado_en_iso = nueva_sesion["iniciado_en"].replace(tzinfo=ZoneInfo("America/Lima")).isoformat()
+        if nueva_sesion and nueva_sesion.get("termina_en"):
+            termina_en_iso = nueva_sesion["termina_en"].replace(tzinfo=ZoneInfo("America/Lima")).isoformat()
+
         return {
             "ok": True,
             "modo": "idle",
             "idle_session_token": idle_token,
             "tier_codigo": tier_codigo,
             "duracion_segundos": duracion_segundos,
-            "iniciado_en": nueva_sesion["iniciado_en"].isoformat() if nueva_sesion and nueva_sesion.get("iniciado_en") else None,
-            "termina_en": nueva_sesion["termina_en"].isoformat() if nueva_sesion and nueva_sesion.get("termina_en") else None,
+            "iniciado_en": iniciado_en_iso,
+            "termina_en": termina_en_iso,
             "equipo_usuario_pokemon_ids": ids_limpios,
             "snapshot_equipo": snapshot
         }
@@ -1319,12 +1325,12 @@ def reclamar_idle(usuario=Depends(get_current_user)):
     cursor = get_cursor(conn)
     try:
         asegurar_tablas_boss_idle(cursor)
-        sesion = obtener_sesion_idle_activa(cursor, usuario["id"], for_update=True, incluir_reclamable=True)
+        sesion = obtener_sesion_idle_activa(cursor, usuario["id"], for_update=True)
         if not sesion:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No tienes una sesión Idle activa")
 
         ahora = ahora_server_naive()
-        if sesion["estado"] == "activa" and ahora < sesion["termina_en"]:
+        if ahora < sesion["termina_en"]:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="La sesión Idle aún no termina")
 
         resultado = sesion.get("resultado_json")
@@ -1405,7 +1411,7 @@ def cancelar_idle(payload: IdleCancelarPayload, usuario=Depends(get_current_user
     cursor = get_cursor(conn)
     try:
         asegurar_tablas_boss_idle(cursor)
-        sesion = obtener_sesion_idle_activa(cursor, usuario["id"], for_update=True, incluir_reclamable=True)
+        sesion = obtener_sesion_idle_activa(cursor, usuario["id"], for_update=True)
         if not sesion:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No tienes una sesión Idle activa")
 
