@@ -754,7 +754,34 @@ async def paypal_webhook(request: Request):
         if order_id:
             cursor.execute(
                 """
-                SELECT uc.*, mp.*
+                SELECT
+                    uc.id AS compra_id,
+                    uc.usuario_id AS compra_usuario_id,
+                    uc.producto_id AS compra_producto_id,
+                    uc.estado AS compra_estado,
+                    uc.moneda AS compra_moneda,
+                    uc.monto AS compra_monto,
+                    uc.proveedor_pago AS compra_proveedor_pago,
+                    uc.referencia_externa AS compra_referencia_externa,
+                    uc.paypal_order_id AS compra_paypal_order_id,
+                    uc.paypal_capture_id AS compra_paypal_capture_id,
+                    uc.grant_status AS compra_grant_status,
+                    uc.grant_payload AS compra_grant_payload,
+                    uc.metadata AS compra_metadata,
+                    uc.pagado_en AS compra_pagado_en,
+                    uc.entregado_en AS compra_entregado_en,
+
+                    mp.id AS producto_id,
+                    mp.codigo AS producto_codigo,
+                    mp.nombre AS producto_nombre,
+                    mp.tipo AS producto_tipo,
+                    mp.precio_usd AS producto_precio_usd,
+                    mp.beneficio_codigo AS producto_beneficio_codigo,
+                    mp.duracion_horas AS producto_duracion_horas,
+                    mp.duracion_dias AS producto_duracion_dias,
+                    mp.duracion_meses AS producto_duracion_meses,
+                    mp.limite_por_cuenta AS producto_limite_por_cuenta,
+                    mp.metadata AS producto_metadata
                 FROM usuario_compras uc
                 JOIN monetizacion_productos mp ON mp.id = uc.producto_id
                 WHERE uc.paypal_order_id = %s
@@ -765,10 +792,54 @@ async def paypal_webhook(request: Request):
                 """,
                 (order_id, order_id)
             )
+
             row = cursor.fetchone()
-            if row and row.get("estado") != "pagado" and event_type == "PAYMENT.CAPTURE.COMPLETED":
-                compra = _marcar_compra_pagada(cursor, int(row["id"]), order_id, capture_id, payload)
-                _entregar_producto_pagado(cursor, compra, dict(row))
+
+            if row and event_type == "PAYMENT.CAPTURE.COMPLETED":
+                row = dict(row)
+
+                compra = {
+                    "id": row["compra_id"],
+                    "usuario_id": row["compra_usuario_id"],
+                    "producto_id": row["compra_producto_id"],
+                    "estado": row["compra_estado"],
+                    "moneda": row["compra_moneda"],
+                    "monto": row["compra_monto"],
+                    "proveedor_pago": row["compra_proveedor_pago"],
+                    "referencia_externa": row["compra_referencia_externa"],
+                    "paypal_order_id": row["compra_paypal_order_id"],
+                    "paypal_capture_id": row["compra_paypal_capture_id"],
+                    "grant_status": row["compra_grant_status"],
+                    "grant_payload": row["compra_grant_payload"],
+                    "metadata": row["compra_metadata"],
+                    "pagado_en": row["compra_pagado_en"],
+                    "entregado_en": row["compra_entregado_en"],
+                }
+
+                producto = {
+                    "id": row["producto_id"],
+                    "codigo": row["producto_codigo"],
+                    "nombre": row["producto_nombre"],
+                    "tipo": row["producto_tipo"],
+                    "precio_usd": row["producto_precio_usd"],
+                    "beneficio_codigo": row["producto_beneficio_codigo"],
+                    "duracion_horas": row["producto_duracion_horas"],
+                    "duracion_dias": row["producto_duracion_dias"],
+                    "duracion_meses": row["producto_duracion_meses"],
+                    "limite_por_cuenta": row["producto_limite_por_cuenta"],
+                    "metadata": row["producto_metadata"],
+                }
+
+                if compra.get("estado") != "pagado":
+                    compra = _marcar_compra_pagada(
+                        cursor,
+                        int(compra["id"]),
+                        order_id,
+                        capture_id,
+                        payload
+                    )
+
+                _entregar_producto_pagado(cursor, compra, producto)
 
         conn.commit()
         return {"ok": True, "event_type": event_type, "verified": verificado}
