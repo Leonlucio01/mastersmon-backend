@@ -104,6 +104,7 @@ def obtener_sesion_gym_por_token(cursor, token: str, usuario_id: int, for_update
     return cursor.fetchone()
 
 
+
 def asegurar_progreso_usuario_gyms(cursor, usuario_id: int):
     cursor.execute(
         """
@@ -131,12 +132,12 @@ def asegurar_progreso_usuario_gyms(cursor, usuario_id: int):
             actualizado_en = CURRENT_TIMESTAMP
         FROM gym_catalogo gc
         LEFT JOIN gym_usuario_progreso prev
-            ON prev.usuario_id = gup.usuario_id
+            ON prev.usuario_id = %s
            AND prev.gym_id = gc.gym_requerido_id
         WHERE gup.usuario_id = %s
           AND gup.gym_id = gc.id
         """,
-        (usuario_id,),
+        (usuario_id, usuario_id),
     )
 
 
