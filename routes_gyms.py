@@ -598,6 +598,13 @@ def obtener_catalogo_gyms(usuario=Depends(get_current_user)):
 
         gyms = []
         for row in catalogo_rows:
+            roster = obtener_equipo_rival_gym(cursor, int(row["id"]))
+            nivel_recomendado_catalogo = int(row["nivel_recomendado"] or 1)
+            nivel_recomendado_real = max(
+                [int(pokemon.get("nivel") or 1) for pokemon in roster],
+                default=nivel_recomendado_catalogo,
+            )
+
             gyms.append(
                 {
                     "id": int(row["id"]),
@@ -611,7 +618,8 @@ def obtener_catalogo_gyms(usuario=Depends(get_current_user)):
                     "medalla_slug": row["medalla_slug"],
                     "tipo_principal": row["tipo_principal"],
                     "orden_region": int(row["orden_region"] or 0),
-                    "nivel_recomendado": int(row["nivel_recomendado"] or 1),
+                    "nivel_recomendado": nivel_recomendado_real,
+                    "nivel_recomendado_catalogo": nivel_recomendado_catalogo,
                     "reward_exp": int(row["reward_exp"] or 0),
                     "reward_pokedolares": int(row["reward_pokedolares"] or 0),
                     "trainer_asset_path": row.get("trainer_asset_path"),
@@ -627,6 +635,8 @@ def obtener_catalogo_gyms(usuario=Depends(get_current_user)):
                     "mejor_turnos": int(row["mejor_turnos"] or 0) if row.get("mejor_turnos") is not None else None,
                     "gym_requerido_codigo": row.get("gym_requerido_codigo"),
                     "gym_requerido_lider": row.get("gym_requerido_lider"),
+                    "roster": roster,
+                    "cantidad_pokemon_rival": len(roster),
                 }
             )
 
