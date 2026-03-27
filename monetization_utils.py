@@ -1,6 +1,25 @@
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
+
+
+
+
+UTC = timezone.utc
+
+
+def utc_now_naive() -> datetime:
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
+def serializar_datetime_api(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value_utc = value.replace(tzinfo=UTC)
+    else:
+        value_utc = value.astimezone(UTC)
+    return value_utc.isoformat().replace("+00:00", "Z")
 
 
 def existe_tabla_local(cursor, tabla: str) -> bool:
@@ -54,6 +73,8 @@ def limpiar_beneficios_expirados(cursor, usuario_id: int | None = None):
     if not existe_tabla_local(cursor, "usuario_beneficios"):
         return
 
+    ahora_utc = utc_now_naive()
+
     if usuario_id is None:
         cursor.execute(
             """
@@ -61,8 +82,9 @@ def limpiar_beneficios_expirados(cursor, usuario_id: int | None = None):
             SET estado = 'expirado', actualizado_en = NOW()
             WHERE estado = 'activo'
               AND expira_en IS NOT NULL
-              AND expira_en <= NOW()
-            """
+              AND expira_en <= %s
+            """,
+            (ahora_utc,)
         )
     else:
         cursor.execute(
@@ -72,9 +94,9 @@ def limpiar_beneficios_expirados(cursor, usuario_id: int | None = None):
             WHERE usuario_id = %s
               AND estado = 'activo'
               AND expira_en IS NOT NULL
-              AND expira_en <= NOW()
+              AND expira_en <= %s
             """,
-            (int(usuario_id),)
+            (int(usuario_id), ahora_utc)
         )
 
 
@@ -83,16 +105,17 @@ def obtener_beneficios_activos(cursor, usuario_id: int) -> list[dict]:
         return []
 
     limpiar_beneficios_expirados(cursor, usuario_id)
+    ahora_utc = utc_now_naive()
     cursor.execute(
         """
         SELECT id, beneficio_codigo, estado, inicia_en, expira_en, usos_totales, usos_consumidos, metadata
         FROM usuario_beneficios
         WHERE usuario_id = %s
           AND estado = 'activo'
-          AND (expira_en IS NULL OR expira_en > NOW())
+          AND (expira_en IS NULL OR expira_en > %s)
         ORDER BY id DESC
         """,
-        (int(usuario_id),)
+        (int(usuario_id), ahora_utc)
     )
     rows = cursor.fetchall() or []
     beneficios = []
@@ -101,8 +124,8 @@ def obtener_beneficios_activos(cursor, usuario_id: int) -> list[dict]:
             "id": int(row["id"]),
             "beneficio_codigo": row["beneficio_codigo"],
             "estado": row["estado"],
-            "inicia_en": row["inicia_en"].isoformat() if row.get("inicia_en") else None,
-            "expira_en": row["expira_en"].isoformat() if row.get("expira_en") else None,
+            "inicia_en": serializar_datetime_api(row.get("inicia_en")),
+            "expira_en": serializar_datetime_api(row.get("expira_en")),
             "usos_totales": int(row["usos_totales"] or 0) if row.get("usos_totales") is not None else None,
             "usos_consumidos": int(row["usos_consumidos"] or 0),
             "metadata": _normalizar_metadata(row.get("metadata")),
@@ -114,6 +137,7 @@ def usuario_tiene_beneficio_activo(cursor, usuario_id: int, beneficio_codigo: st
     if not existe_tabla_local(cursor, "usuario_beneficios"):
         return False
     limpiar_beneficios_expirados(cursor, usuario_id)
+    ahora_utc = utc_now_naive()
     cursor.execute(
         """
         SELECT 1
@@ -121,10 +145,10 @@ def usuario_tiene_beneficio_activo(cursor, usuario_id: int, beneficio_codigo: st
         WHERE usuario_id = %s
           AND beneficio_codigo = %s
           AND estado = 'activo'
-          AND (expira_en IS NULL OR expira_en > NOW())
+          AND (expira_en IS NULL OR expira_en > %s)
         LIMIT 1
         """,
-        (int(usuario_id), str(beneficio_codigo))
+        (int(usuario_id), str(beneficio_codigo), ahora_utc)
     )
     return cursor.fetchone() is not None
 
@@ -149,7 +173,8 @@ def activar_o_extender_beneficio(
 
     extra_dias = int(duracion_dias) + (int(duracion_meses) * 30)
     delta = timedelta(hours=int(duracion_horas), days=extra_dias)
-    expira_en = None if delta.total_seconds() <= 0 else datetime.utcnow() + delta
+    ahora_utc = utc_now_naive()
+    expira_en = None if delta.total_seconds() <= 0 else ahora_utc + delta
 
     cursor.execute(
         """
@@ -168,11 +193,11 @@ def activar_o_extender_beneficio(
     metadata_json = json.dumps(metadata or {})
 
     if actual:
-        base_expira = actual.get("expira_en") or datetime.utcnow()
+        base_expira = actual.get("expira_en") or ahora_utc
         if expira_en is None:
             nueva_expira = None
         else:
-            base = base_expira if base_expira > datetime.utcnow() else datetime.utcnow()
+            base = base_expira if base_expira > ahora_utc else ahora_utc
             nueva_expira = base + delta
 
         cursor.execute(
@@ -195,10 +220,10 @@ def activar_o_extender_beneficio(
         INSERT INTO usuario_beneficios
             (usuario_id, compra_id, beneficio_codigo, origen_tipo, estado, inicia_en, expira_en, metadata)
         VALUES
-            (%s, %s, %s, %s, 'activo', NOW(), %s, %s::jsonb)
+            (%s, %s, %s, %s, 'activo', %s, %s, %s::jsonb)
         RETURNING *
         """,
-        (int(usuario_id), compra_id, str(beneficio_codigo), origen_tipo, expira_en, metadata_json)
+        (int(usuario_id), compra_id, str(beneficio_codigo), origen_tipo, ahora_utc, expira_en, metadata_json)
     )
     return cursor.fetchone()
 

@@ -17,6 +17,7 @@ from monetization_utils import (
     existe_tabla_local,
     obtener_beneficios_activos,
     resolver_item_por_codigo,
+    serializar_datetime_api,
 )
 
 router_payments = APIRouter()
@@ -318,7 +319,7 @@ def _entregar_producto_pagado(cursor, compra: dict, producto: dict):
             metadata={"producto_codigo": producto["codigo"], **metadata},
         )
         grant_payload["beneficio_codigo"] = beneficio_codigo
-        grant_payload["expira_en"] = beneficio["expira_en"].isoformat() if beneficio.get("expira_en") else None
+        grant_payload["expira_en"] = serializar_datetime_api(beneficio.get("expira_en"))
 
     elif producto["tipo"] == "pack_item":
         item_code = str(metadata.get("grant_item_codigo") or "").strip()
@@ -445,8 +446,8 @@ def obtener_mis_compras(limit: int = 20, usuario=Depends(get_current_user)):
                 "grant_status": row.get("grant_status"),
                 "paypal_order_id": row.get("paypal_order_id"),
                 "paypal_capture_id": row.get("paypal_capture_id"),
-                "pagado_en": row["pagado_en"].isoformat() if row.get("pagado_en") else None,
-                "entregado_en": row["entregado_en"].isoformat() if row.get("entregado_en") else None,
+                "pagado_en": serializar_datetime_api(row.get("pagado_en")),
+                "entregado_en": serializar_datetime_api(row.get("entregado_en")),
                 "grant_payload": _json_safe(row.get("grant_payload")),
             })
         return {"ok": True, "compras": compras}
@@ -695,8 +696,8 @@ def usar_booster(payload: UseBoosterPayload, usuario=Depends(get_current_user)):
             "consumo": consumo,
             "beneficio": {
                 "beneficio_codigo": beneficio["beneficio_codigo"],
-                "inicia_en": beneficio["inicia_en"].isoformat() if beneficio.get("inicia_en") else None,
-                "expira_en": beneficio["expira_en"].isoformat() if beneficio.get("expira_en") else None,
+                "inicia_en": serializar_datetime_api(beneficio.get("inicia_en")),
+                "expira_en": serializar_datetime_api(beneficio.get("expira_en")),
             }
         }
     except HTTPException:
