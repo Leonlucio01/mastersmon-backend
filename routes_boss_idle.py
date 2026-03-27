@@ -121,14 +121,19 @@ def ahora_server_naive():
 def serializar_datetime_lima(dt_value: datetime | None) -> str | None:
     if not dt_value:
         return None
-    return dt_value.replace(tzinfo=SERVER_TIMEZONE).isoformat()
+    if dt_value.tzinfo is None:
+        return dt_value.replace(tzinfo=SERVER_TIMEZONE).isoformat()
+    return dt_value.astimezone(SERVER_TIMEZONE).isoformat()
 
 
 def normalizar_datetime_idle_db(dt_value: datetime | None, referencia: datetime | None = None) -> datetime | None:
     if not dt_value:
-        return dt_value
+        return None
 
     ahora_ref = referencia or ahora_server_naive()
+
+    # Si la fecha viene "en el futuro" respecto a la hora Lima del servidor,
+    # asumimos que fue guardada como UTC naive por PostgreSQL y la convertimos.
     if dt_value > (ahora_ref + timedelta(minutes=2)):
         return dt_value.replace(tzinfo=ZoneInfo("UTC")).astimezone(SERVER_TIMEZONE).replace(tzinfo=None)
 
@@ -142,15 +147,24 @@ def normalizar_fechas_sesion_idle(cursor, sesion: dict) -> tuple[datetime | None
     referencia = ahora_server_naive()
     iniciado_raw = sesion.get("iniciado_en")
     termina_raw = sesion.get("termina_en")
+    duracion_segundos = int(sesion.get("duracion_segundos") or 0)
+
     iniciado = normalizar_datetime_idle_db(iniciado_raw, referencia)
     termina = normalizar_datetime_idle_db(termina_raw, referencia)
+
+    if iniciado and duracion_segundos > 0:
+        termina_esperada = iniciado + timedelta(seconds=duracion_segundos)
+        if not termina or abs(int((termina - iniciado).total_seconds()) - duracion_segundos) > 1:
+            termina = termina_esperada
+
     corregido = (iniciado != iniciado_raw) or (termina != termina_raw)
 
     if corregido and sesion.get("id"):
         cursor.execute(
             """
             UPDATE idle_sesiones
-            SET iniciado_en = %s, termina_en = %s
+            SET iniciado_en = %s,
+                termina_en = %s
             WHERE id = %s
             """,
             (iniciado, termina, int(sesion["id"]))
@@ -1223,8 +1237,16 @@ def obtener_estado_idle(usuario=Depends(get_current_user)):
 
         ahora = ahora_server_naive()
         iniciada_en, termina_en, fechas_corregidas = normalizar_fechas_sesion_idle(cursor, sesion)
-        total = max(1, int((termina_en - iniciada_en).total_seconds()))
-        transcurrido = max(0, min(total, int((ahora - iniciada_en).total_seconds())))
+
+        total = int(sesion.get("duracion_segundos") or 0)
+        if total <= 0 and iniciada_en and termina_en:
+            total = max(1, int((termina_en - iniciada_en).total_seconds()))
+        total = max(1, total)
+
+        transcurrido = 0
+        if iniciada_en:
+            transcurrido = max(0, min(total, int((ahora - iniciada_en).total_seconds())))
+
         restante = max(0, total - transcurrido)
         progreso = int(round((transcurrido / total) * 100))
 
@@ -1243,9 +1265,6 @@ def obtener_estado_idle(usuario=Depends(get_current_user)):
         if fechas_corregidas:
             conn.commit()
 
-        iniciada_en_iso = serializar_datetime_lima(iniciada_en)
-        termina_en_iso = serializar_datetime_lima(termina_en)
-
         return {
             "ok": True,
             "activa": sesion["estado"] in ("activa", "reclamable"),
@@ -1256,8 +1275,8 @@ def obtener_estado_idle(usuario=Depends(get_current_user)):
                 "tier_codigo": sesion["tier_codigo"],
                 "duracion_segundos": int(sesion["duracion_segundos"]),
                 "estado": sesion["estado"],
-                "iniciado_en": iniciada_en_iso,
-                "termina_en": termina_en_iso,
+                "iniciado_en": serializar_datetime_lima(iniciada_en),
+                "termina_en": serializar_datetime_lima(termina_en),
                 "segundos_restantes": restante,
                 "progreso_pct": progreso
             }
@@ -1335,17 +1354,14 @@ def iniciar_idle(payload: IdleIniciarPayload, usuario=Depends(get_current_user))
         )
         conn.commit()
 
-        iniciado_en_iso = serializar_datetime_lima(iniciado_en)
-        termina_en_iso = serializar_datetime_lima(termina_en)
-
         return {
             "ok": True,
             "modo": "idle",
             "idle_session_token": idle_token,
             "tier_codigo": tier_codigo,
             "duracion_segundos": duracion_segundos,
-            "iniciado_en": iniciado_en_iso,
-            "termina_en": termina_en_iso,
+            "iniciado_en": serializar_datetime_lima(iniciado_en),
+            "termina_en": serializar_datetime_lima(termina_en),
             "equipo_usuario_pokemon_ids": ids_limpios,
             "snapshot_equipo": snapshot
         }
@@ -1373,7 +1389,7 @@ def reclamar_idle(usuario=Depends(get_current_user)):
 
         ahora = ahora_server_naive()
         _, termina_en, _ = normalizar_fechas_sesion_idle(cursor, sesion)
-        if ahora < termina_en:
+        if termina_en and ahora < termina_en:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="La sesión Idle aún no termina")
 
         resultado = sesion.get("resultado_json")
