@@ -12,7 +12,10 @@ from pydantic import BaseModel
 
 from database import get_connection, get_cursor, release_connection
 from auth import verify_google_token, create_access_token, get_current_user, get_current_user_from_token
-from monetization_utils import aplicar_multiplicadores_recompensa_batalla
+from monetization_utils import (
+    aplicar_multiplicadores_recompensa_batalla,
+    obtener_multiplicadores_recompensa_batalla,
+)
 
 router = APIRouter()
 MAX_NIVEL_POKEMON = 200
@@ -29,10 +32,10 @@ BATTLE_SESSION_MINIMA_SEGUNDOS = 8
 BATTLE_RECOMPENSA_COOLDOWN_SEGUNDOS = 12
 BATTLE_RECOMPENSA_ULTIMO_USO = {}
 RECOMPENSAS_ARENA_PERMITIDAS = {
-    (2500, 2500): {"codigo": "normal", "exp": 2500, "pokedolares": 2500, "bonus_nivel_rival": 0},
-    (3500, 5000): {"codigo": "challenge", "exp": 3500, "pokedolares": 5000, "bonus_nivel_rival": 5},
-    (4500, 10000): {"codigo": "expert", "exp": 4500, "pokedolares": 10000, "bonus_nivel_rival": 10},
-    (6000, 15000): {"codigo": "master", "exp": 6000, "pokedolares": 15000, "bonus_nivel_rival": 15},
+    (2000, 2500): {"codigo": "normal", "exp": 2000, "pokedolares": 2500, "bonus_nivel_rival": 0},
+    (2500, 3000): {"codigo": "challenge", "exp": 2500, "pokedolares": 3000, "bonus_nivel_rival": 2},
+    (3000, 3500): {"codigo": "expert", "exp": 3000, "pokedolares": 3500, "bonus_nivel_rival": 4},
+    (3500, 4000): {"codigo": "master", "exp": 3500, "pokedolares": 4000, "bonus_nivel_rival": 6},
 }
 RECOMPENSAS_ARENA_POR_CODIGO = {
     valor["codigo"]: dict(valor)
@@ -573,6 +576,60 @@ def obtener_recompensa_batalla_por_codigo(dificultad_codigo: str | None) -> dict
             detail="La dificultad de batalla no es válida"
         )
     return dict(recompensa)
+
+
+def battle_booster_snapshot_habilitado(cursor) -> bool:
+    return (
+        existe_columna(cursor, "battle_sesiones", "exp_x2_aplicado")
+        and existe_columna(cursor, "battle_sesiones", "gold_x2_aplicado")
+    )
+
+
+def obtener_snapshot_boosters_batalla(cursor, usuario_id: int) -> dict:
+    multiplicadores = obtener_multiplicadores_recompensa_batalla(cursor, int(usuario_id))
+    exp_multiplier = max(1, int(multiplicadores.get("exp_multiplier") or 1))
+    gold_multiplier = max(1, int(multiplicadores.get("gold_multiplier") or 1))
+    beneficios_activos = [str(codigo) for codigo in (multiplicadores.get("beneficios_activos") or []) if codigo]
+
+    return {
+        "exp_x2_aplicado": exp_multiplier >= 2,
+        "gold_x2_aplicado": gold_multiplier >= 2,
+        "exp_multiplier": exp_multiplier,
+        "gold_multiplier": gold_multiplier,
+        "beneficios_activos": beneficios_activos,
+    }
+
+
+def aplicar_snapshot_multiplicadores_recompensa_batalla(
+    exp_base: int,
+    pokedolares_base: int,
+    *,
+    exp_x2_aplicado: bool = False,
+    gold_x2_aplicado: bool = False,
+) -> dict:
+    exp_multiplier = 2 if bool(exp_x2_aplicado) else 1
+    gold_multiplier = 2 if bool(gold_x2_aplicado) else 1
+    beneficios = []
+
+    if exp_multiplier > 1:
+        beneficios.append("battle_exp_x2")
+    if gold_multiplier > 1:
+        beneficios.append("battle_gold_x2")
+
+    exp_final = max(0, int(exp_base or 0)) * exp_multiplier
+    pokedolares_final = max(0, int(pokedolares_base or 0)) * gold_multiplier
+
+    return {
+        "exp_base": max(0, int(exp_base or 0)),
+        "pokedolares_base": max(0, int(pokedolares_base or 0)),
+        "exp_multiplier": exp_multiplier,
+        "gold_multiplier": gold_multiplier,
+        "exp_final": int(exp_final),
+        "pokedolares_final": int(pokedolares_final),
+        "beneficios_activos": beneficios,
+        "exp_x2_aplicado": bool(exp_x2_aplicado),
+        "gold_x2_aplicado": bool(gold_x2_aplicado),
+    }
 
 
 def normalizar_pagina_actividad(pagina: str | None) -> str:
@@ -1471,6 +1528,7 @@ def obtener_items_usuario_data(usuario_id: int):
         cursor.execute("""
             SELECT
                 i.id AS item_id,
+                i.codigo AS item_codigo,
                 i.nombre,
                 i.tipo,
                 i.descripcion,
@@ -1488,6 +1546,7 @@ def obtener_items_usuario_data(usuario_id: int):
         return [
             {
                 "item_id": row["item_id"],
+                "item_codigo": row.get("item_codigo"),
                 "nombre": row["nombre"],
                 "tipo": row["tipo"],
                 "descripcion": row["descripcion"],
@@ -2803,26 +2862,54 @@ def iniciar_batalla_arena(payload: BattleIniciarPayload, usuario=Depends(get_cur
         invalidar_sesiones_battle_activas(cursor, usuario["id"])
 
         battle_token = crear_token_simple(24)
-        cursor.execute(
-            """
-            INSERT INTO battle_sesiones
-                (token, usuario_id, dificultad_codigo, bonus_nivel_rival, exp_ganada, pokedolares_ganados,
-                 equipo_usuario_pokemon_ids, activo, resultado, creado_en, expira_en)
-            VALUES
-                (%s, %s, %s, %s, %s, %s, %s::jsonb, TRUE, 'pendiente', NOW(), NOW() + (%s * INTERVAL '1 second'))
-            RETURNING id, creado_en, expira_en
-            """,
-            (
-                battle_token,
-                usuario["id"],
-                codigo_dificultad,
-                int(bonus_nivel_rival),
-                int(recompensa["exp"]),
-                int(recompensa["pokedolares"]),
-                json.dumps(ids_limpios),
-                int(BATTLE_SESSION_TTL_SEGUNDOS),
+        booster_snapshot = obtener_snapshot_boosters_batalla(cursor, int(usuario["id"]))
+        snapshot_habilitado = battle_booster_snapshot_habilitado(cursor)
+
+        if snapshot_habilitado:
+            cursor.execute(
+                """
+                INSERT INTO battle_sesiones
+                    (token, usuario_id, dificultad_codigo, bonus_nivel_rival, exp_ganada, pokedolares_ganados,
+                     equipo_usuario_pokemon_ids, exp_x2_aplicado, gold_x2_aplicado,
+                     activo, resultado, creado_en, expira_en)
+                VALUES
+                    (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, TRUE, 'pendiente', NOW(), NOW() + (%s * INTERVAL '1 second'))
+                RETURNING id, creado_en, expira_en
+                """,
+                (
+                    battle_token,
+                    usuario["id"],
+                    codigo_dificultad,
+                    int(bonus_nivel_rival),
+                    int(recompensa["exp"]),
+                    int(recompensa["pokedolares"]),
+                    json.dumps(ids_limpios),
+                    bool(booster_snapshot["exp_x2_aplicado"]),
+                    bool(booster_snapshot["gold_x2_aplicado"]),
+                    int(BATTLE_SESSION_TTL_SEGUNDOS),
+                )
             )
-        )
+        else:
+            cursor.execute(
+                """
+                INSERT INTO battle_sesiones
+                    (token, usuario_id, dificultad_codigo, bonus_nivel_rival, exp_ganada, pokedolares_ganados,
+                     equipo_usuario_pokemon_ids, activo, resultado, creado_en, expira_en)
+                VALUES
+                    (%s, %s, %s, %s, %s, %s, %s::jsonb, TRUE, 'pendiente', NOW(), NOW() + (%s * INTERVAL '1 second'))
+                RETURNING id, creado_en, expira_en
+                """,
+                (
+                    battle_token,
+                    usuario["id"],
+                    codigo_dificultad,
+                    int(bonus_nivel_rival),
+                    int(recompensa["exp"]),
+                    int(recompensa["pokedolares"]),
+                    json.dumps(ids_limpios),
+                    int(BATTLE_SESSION_TTL_SEGUNDOS),
+                )
+            )
         sesion = cursor.fetchone()
 
         registrar_actividad_usuario(
@@ -2842,6 +2929,12 @@ def iniciar_batalla_arena(payload: BattleIniciarPayload, usuario=Depends(get_cur
             "exp_ganada": int(recompensa["exp"]),
             "pokedolares_ganados": int(recompensa["pokedolares"]),
             "equipo_usuario_pokemon_ids": ids_limpios,
+            "booster_snapshot": {
+                "snapshot_habilitado": bool(snapshot_habilitado),
+                "exp_x2_aplicado": bool(booster_snapshot["exp_x2_aplicado"]),
+                "gold_x2_aplicado": bool(booster_snapshot["gold_x2_aplicado"]),
+                "beneficios_activos": booster_snapshot["beneficios_activos"],
+            },
             "creado_en": sesion["creado_en"].isoformat() if sesion and sesion.get("creado_en") else None,
             "expira_en": sesion["expira_en"].isoformat() if sesion and sesion.get("expira_en") else None,
             "ttl_segundos": BATTLE_SESSION_TTL_SEGUNDOS,
@@ -2901,12 +2994,27 @@ def recompensa_victoria_batalla(payload: RecompensaBatallaPayload, usuario=Depen
         exp_ganada_base = int(sesion["exp_ganada"] or 0)
         pokedolares_ganados_base = int(sesion["pokedolares_ganados"] or 0)
         recompensa = obtener_recompensa_batalla_permitida(exp_ganada_base, pokedolares_ganados_base)
-        multiplicadores = aplicar_multiplicadores_recompensa_batalla(
-            cursor,
-            int(usuario["id"]),
-            exp_ganada_base,
-            pokedolares_ganados_base,
+
+        snapshot_habilitado = battle_booster_snapshot_habilitado(cursor)
+        sesion_tiene_snapshot = snapshot_habilitado and (
+            "exp_x2_aplicado" in sesion or "gold_x2_aplicado" in sesion
         )
+
+        if sesion_tiene_snapshot:
+            multiplicadores = aplicar_snapshot_multiplicadores_recompensa_batalla(
+                exp_ganada_base,
+                pokedolares_ganados_base,
+                exp_x2_aplicado=bool(sesion.get("exp_x2_aplicado")),
+                gold_x2_aplicado=bool(sesion.get("gold_x2_aplicado")),
+            )
+        else:
+            multiplicadores = aplicar_multiplicadores_recompensa_batalla(
+                cursor,
+                int(usuario["id"]),
+                exp_ganada_base,
+                pokedolares_ganados_base,
+            )
+
         exp_ganada = int(multiplicadores["exp_final"])
         pokedolares_ganados = int(multiplicadores["pokedolares_final"])
         ids_limpios = validar_ids_pokemon_equipo(cursor, usuario["id"], normalizar_equipo_ids_json(sesion.get("equipo_usuario_pokemon_ids")))
@@ -3117,6 +3225,10 @@ def recompensa_victoria_batalla(payload: RecompensaBatallaPayload, usuario=Depen
             "exp_ganada": exp_ganada,
             "exp_base": exp_ganada_base,
             "beneficios_activos": multiplicadores["beneficios_activos"],
+            "exp_x2_aplicado": bool(multiplicadores.get("exp_x2_aplicado") or int(multiplicadores.get("exp_multiplier") or 1) > 1),
+            "gold_x2_aplicado": bool(multiplicadores.get("gold_x2_aplicado") or int(multiplicadores.get("gold_multiplier") or 1) > 1),
+            "snapshot_habilitado": bool(snapshot_habilitado),
+            "snapshot_usado": bool(sesion_tiene_snapshot),
             "pokemon_actualizados": pokemon_actualizados
         }
     except HTTPException:
