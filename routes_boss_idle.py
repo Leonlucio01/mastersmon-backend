@@ -118,6 +118,49 @@ def ahora_server_naive():
     return ahora_server().replace(tzinfo=None)
 
 
+def serializar_datetime_lima(dt_value: datetime | None) -> str | None:
+    if not dt_value:
+        return None
+    return dt_value.replace(tzinfo=SERVER_TIMEZONE).isoformat()
+
+
+def normalizar_datetime_idle_db(dt_value: datetime | None, referencia: datetime | None = None) -> datetime | None:
+    if not dt_value:
+        return dt_value
+
+    ahora_ref = referencia or ahora_server_naive()
+    if dt_value > (ahora_ref + timedelta(minutes=2)):
+        return dt_value.replace(tzinfo=ZoneInfo("UTC")).astimezone(SERVER_TIMEZONE).replace(tzinfo=None)
+
+    return dt_value
+
+
+def normalizar_fechas_sesion_idle(cursor, sesion: dict) -> tuple[datetime | None, datetime | None, bool]:
+    if not sesion:
+        return None, None, False
+
+    referencia = ahora_server_naive()
+    iniciado_raw = sesion.get("iniciado_en")
+    termina_raw = sesion.get("termina_en")
+    iniciado = normalizar_datetime_idle_db(iniciado_raw, referencia)
+    termina = normalizar_datetime_idle_db(termina_raw, referencia)
+    corregido = (iniciado != iniciado_raw) or (termina != termina_raw)
+
+    if corregido and sesion.get("id"):
+        cursor.execute(
+            """
+            UPDATE idle_sesiones
+            SET iniciado_en = %s, termina_en = %s
+            WHERE id = %s
+            """,
+            (iniciado, termina, int(sesion["id"]))
+        )
+        sesion["iniciado_en"] = iniciado
+        sesion["termina_en"] = termina
+
+    return iniciado, termina, corregido
+
+
 def obtener_ventana_boss_para_fecha(fecha_obj: date):
     inicio = datetime(fecha_obj.year, fecha_obj.month, fecha_obj.day, BOSS_EVENT_HORA_INICIO, 0, 0, tzinfo=SERVER_TIMEZONE)
     fin = inicio + timedelta(hours=BOSS_EVENT_DURACION_HORAS)
@@ -1179,8 +1222,7 @@ def obtener_estado_idle(usuario=Depends(get_current_user)):
             }
 
         ahora = ahora_server_naive()
-        termina_en = sesion["termina_en"]
-        iniciada_en = sesion["iniciado_en"]
+        iniciada_en, termina_en, fechas_corregidas = normalizar_fechas_sesion_idle(cursor, sesion)
         total = max(1, int((termina_en - iniciada_en).total_seconds()))
         transcurrido = max(0, min(total, int((ahora - iniciada_en).total_seconds())))
         restante = max(0, total - transcurrido)
@@ -1195,11 +1237,14 @@ def obtener_estado_idle(usuario=Depends(get_current_user)):
                 """,
                 (int(sesion["id"]),)
             )
-            conn.commit()
             sesion["estado"] = "reclamable"
+            fechas_corregidas = True
 
-        iniciada_en_iso = iniciada_en.replace(tzinfo=ZoneInfo("America/Lima")).isoformat() if iniciada_en else None
-        termina_en_iso = termina_en.replace(tzinfo=ZoneInfo("America/Lima")).isoformat() if termina_en else None
+        if fechas_corregidas:
+            conn.commit()
+
+        iniciada_en_iso = serializar_datetime_lima(iniciada_en)
+        termina_en_iso = serializar_datetime_lima(termina_en)
 
         return {
             "ok": True,
@@ -1258,6 +1303,8 @@ def iniciar_idle(payload: IdleIniciarPayload, usuario=Depends(get_current_user))
 
         snapshot = obtener_snapshot_equipo_para_modo(cursor, usuario["id"], ids_limpios)
         idle_token = crear_token_simple(24)
+        iniciado_en = ahora_server_naive()
+        termina_en = iniciado_en + timedelta(seconds=duracion_segundos)
 
         cursor.execute(
             """
@@ -1265,8 +1312,7 @@ def iniciar_idle(payload: IdleIniciarPayload, usuario=Depends(get_current_user))
                 (token, usuario_id, equipo_usuario_pokemon_ids, snapshot_equipo_json, tier_codigo, duracion_segundos,
                  estado, iniciado_en, termina_en, items_ganados_json)
             VALUES
-                (%s, %s, %s::jsonb, %s::jsonb, %s, %s, 'activa', NOW(), NOW() + (%s * INTERVAL '1 second'), '[]'::jsonb)
-            RETURNING iniciado_en, termina_en
+                (%s, %s, %s::jsonb, %s::jsonb, %s, %s, 'activa', %s, %s, '[]'::jsonb)
             """,
             (
                 idle_token,
@@ -1275,10 +1321,10 @@ def iniciar_idle(payload: IdleIniciarPayload, usuario=Depends(get_current_user))
                 json.dumps(snapshot),
                 tier_codigo,
                 duracion_segundos,
-                duracion_segundos,
+                iniciado_en,
+                termina_en,
             )
         )
-        nueva_sesion = cursor.fetchone()
 
         registrar_actividad_usuario(
             cursor,
@@ -1289,12 +1335,8 @@ def iniciar_idle(payload: IdleIniciarPayload, usuario=Depends(get_current_user))
         )
         conn.commit()
 
-        iniciado_en_iso = None
-        termina_en_iso = None
-        if nueva_sesion and nueva_sesion.get("iniciado_en"):
-            iniciado_en_iso = nueva_sesion["iniciado_en"].replace(tzinfo=ZoneInfo("America/Lima")).isoformat()
-        if nueva_sesion and nueva_sesion.get("termina_en"):
-            termina_en_iso = nueva_sesion["termina_en"].replace(tzinfo=ZoneInfo("America/Lima")).isoformat()
+        iniciado_en_iso = serializar_datetime_lima(iniciado_en)
+        termina_en_iso = serializar_datetime_lima(termina_en)
 
         return {
             "ok": True,
@@ -1330,7 +1372,8 @@ def reclamar_idle(usuario=Depends(get_current_user)):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No tienes una sesión Idle activa")
 
         ahora = ahora_server_naive()
-        if ahora < sesion["termina_en"]:
+        _, termina_en, _ = normalizar_fechas_sesion_idle(cursor, sesion)
+        if ahora < termina_en:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="La sesión Idle aún no termina")
 
         resultado = sesion.get("resultado_json")
