@@ -42,8 +42,8 @@ IDLE_DURACIONES_PERMITIDAS = {3600, 7200, 14400, 28800}
 IDLE_TIER_CONFIG = {
     "ruta": {
         "tick_segundos": 45,
-        "base_exp": 16,
-        "base_pokedolares": 26,
+        "base_exp": 18,
+        "base_pokedolares": 16,
         "enemy_power": 1.00,
         "drop_pool": [
             {"item_code": "potion", "chance": 0.12},
@@ -52,8 +52,8 @@ IDLE_TIER_CONFIG = {
     },
     "elite": {
         "tick_segundos": 55,
-        "base_exp": 28,
-        "base_pokedolares": 52,
+        "base_exp": 48,
+        "base_pokedolares": 40,
         "enemy_power": 1.25,
         "drop_pool": [
             {"item_code": "potion", "chance": 0.18},
@@ -63,8 +63,8 @@ IDLE_TIER_CONFIG = {
     },
     "legend": {
         "tick_segundos": 65,
-        "base_exp": 42,
-        "base_pokedolares": 84,
+        "base_exp": 120,
+        "base_pokedolares": 102,
         "enemy_power": 1.55,
         "drop_pool": [
             {"item_code": "potion", "chance": 0.22},
@@ -74,8 +74,8 @@ IDLE_TIER_CONFIG = {
     },
     "masters": {
         "tick_segundos": 65,
-        "base_exp": 84,
-        "base_pokedolares": 108,
+        "base_exp": 240,
+        "base_pokedolares": 203,
         "enemy_power": 1.55,
         "drop_pool": [
             {"item_code": "potion", "chance": 0.24},
@@ -216,6 +216,83 @@ def asegurar_tablas_boss_idle(cursor):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"Faltan tablas para Boss/Idle: {', '.join(faltantes)}. Ejecuta la migración primero."
+        )
+
+
+def obtener_desbloqueos_idle_por_gyms(cursor, usuario_id: int) -> dict:
+    gym_tables = ("gym_regiones", "gym_catalogo", "gym_usuario_progreso")
+    if any(not existe_tabla(cursor, tabla) for tabla in gym_tables):
+        return {
+            "kanto_completo": False,
+            "johto_completo": False,
+            "hoenn_completo": False,
+            "tres_regiones_completas": False,
+        }
+
+    cursor.execute(
+        """
+        SELECT
+            LOWER(gr.codigo) AS region_codigo,
+            COUNT(gc.id) AS total_gyms,
+            SUM(CASE WHEN COALESCE(gup.completado, FALSE) = TRUE THEN 1 ELSE 0 END) AS completados
+        FROM gym_regiones gr
+        JOIN gym_catalogo gc
+          ON gc.region_id = gr.id
+         AND gc.activo = TRUE
+        LEFT JOIN gym_usuario_progreso gup
+          ON gup.gym_id = gc.id
+         AND gup.usuario_id = %s
+        WHERE gr.activo = TRUE
+        GROUP BY LOWER(gr.codigo)
+        """,
+        (int(usuario_id),)
+    )
+    rows = cursor.fetchall() or []
+    resumen = {
+        str(row["region_codigo"]): {
+            "total": int(row["total_gyms"] or 0),
+            "completados": int(row["completados"] or 0),
+        }
+        for row in rows
+    }
+
+    def region_completa(codigo: str) -> bool:
+        region = resumen.get(codigo, {})
+        return bool(region.get("total", 0) > 0 and region.get("completados", 0) >= region.get("total", 0))
+
+    kanto = region_completa("kanto")
+    johto = region_completa("johto")
+    hoenn = region_completa("hoenn")
+    return {
+        "kanto_completo": kanto,
+        "johto_completo": johto,
+        "hoenn_completo": hoenn,
+        "tres_regiones_completas": kanto and johto and hoenn,
+    }
+
+
+def validar_requisitos_tier_idle(cursor, usuario_id: int, tier_codigo: str):
+    tier = normalizar_tier_idle(tier_codigo)
+    if tier == "ruta":
+        return
+    if tier == "masters":
+        if not usuario_tiene_beneficio_activo(cursor, int(usuario_id), "idle_masters"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="El tier Masters requiere el beneficio Idle Masters activo"
+            )
+        return
+
+    desbloqueos = obtener_desbloqueos_idle_por_gyms(cursor, int(usuario_id))
+    if tier == "elite" and not desbloqueos["kanto_completo"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="El tier Elite requiere completar la ruta de Gyms de Kanto"
+        )
+    if tier == "legend" and not desbloqueos["tres_regiones_completas"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="El tier Legend requiere completar Kanto, Johto y Hoenn"
         )
 
 
@@ -1296,11 +1373,7 @@ def iniciar_idle(payload: IdleIniciarPayload, usuario=Depends(get_current_user))
         tier_codigo = normalizar_tier_idle(payload.tier_codigo)
         duracion_segundos = normalizar_duracion_idle(payload.duracion_segundos)
 
-        if tier_codigo == "masters" and not usuario_tiene_beneficio_activo(cursor, int(usuario["id"]), "idle_masters"):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="El tier Masters requiere el beneficio Idle Masters activo"
-            )
+        validar_requisitos_tier_idle(cursor, int(usuario["id"]), tier_codigo)
 
         sesion_activa = obtener_sesion_idle_activa(cursor, usuario["id"], for_update=True)
         if sesion_activa:
