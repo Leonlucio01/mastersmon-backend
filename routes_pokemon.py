@@ -69,6 +69,39 @@ TABLAS_OPERATIVAS_CLEANUP_CADA_SEGUNDOS = 300
 TABLAS_OPERATIVAS_ULTIMO_CLEANUP = 0
 
 
+ONBOARDING_MISION_CAPTURAS_OBJETIVO = 6
+ONBOARDING_MISION_EQUIPO_OBJETIVO = 6
+ONBOARDING_REWARD_CONFIG = {
+    "capturas": {
+        "codigo": "capturas",
+        "pokedolares": 5000,
+        "items": [("poke_ball", 5)],
+    },
+    "equipo": {
+        "codigo": "equipo",
+        "pokedolares": 7000,
+        "items": [("super_ball", 2)],
+    },
+    "batalla": {
+        "codigo": "batalla",
+        "pokedolares": 10000,
+        "items": [("ultra_ball", 2)],
+    },
+    "final": {
+        "codigo": "final",
+        "pokedolares": 15000,
+        "items": [("ultra_ball", 3), ("super_potion", 2)],
+    },
+}
+ONBOARDING_ITEM_NAME_FALLBACK = {
+    "poke_ball": "Poke Ball",
+    "super_ball": "Super Ball",
+    "ultra_ball": "Ultra Ball",
+    "master_ball": "Master Ball",
+    "potion": "Pocion",
+    "super_potion": "Super Pocion",
+}
+
 
 # =========================================================
 # PAYLOADS
@@ -161,6 +194,10 @@ class EvolucionNivelPayload(BaseModel):
 
 class ActualizarAvatarPayload(BaseModel):
     avatar_id: str
+
+
+class OnboardingBienvenidaPayload(BaseModel):
+    vista: bool = True
 
 
 class PresenciaMapaPayload(BaseModel):
@@ -1720,6 +1757,7 @@ def crear_inventario_inicial(cursor, usuario_id: int):
     items_iniciales = [
         (usuario_id, 1, 5),   # Poke Ball
         (usuario_id, 2, 2),   # Super Ball
+        (usuario_id, 3, 10),   # Ultra Ball
         (usuario_id, 4, 3),   # Pocion
     ]
 
@@ -1730,6 +1768,381 @@ def crear_inventario_inicial(cursor, usuario_id: int):
             ON CONFLICT (usuario_id, item_id)
             DO NOTHING
         """, (uid, item_id, cantidad))
+
+
+def onboarding_tabla_disponible(cursor) -> bool:
+    return existe_tabla(cursor, "usuario_onboarding")
+
+
+def asegurar_usuario_onboarding(cursor, usuario_id: int):
+    if not onboarding_tabla_disponible(cursor):
+        return None
+
+    cursor.execute(
+        """
+        INSERT INTO usuario_onboarding (usuario_id)
+        VALUES (%s)
+        ON CONFLICT (usuario_id) DO NOTHING
+        """,
+        (int(usuario_id),),
+    )
+
+    cursor.execute(
+        """
+        SELECT *
+        FROM usuario_onboarding
+        WHERE usuario_id = %s
+        LIMIT 1
+        """,
+        (int(usuario_id),),
+    )
+    return cursor.fetchone()
+
+
+def obtener_item_por_codigo_onboarding(cursor, item_codigo: str):
+    codigo = str(item_codigo or "").strip().lower()
+    if not codigo:
+        return None
+
+    if existe_columna(cursor, "items", "codigo"):
+        cursor.execute(
+            """
+            SELECT id, codigo, nombre
+            FROM items
+            WHERE LOWER(COALESCE(codigo, '')) = %s
+            LIMIT 1
+            """,
+            (codigo,),
+        )
+        row = cursor.fetchone()
+        if row:
+            return row
+
+    nombre_fallback = ONBOARDING_ITEM_NAME_FALLBACK.get(codigo)
+    if not nombre_fallback:
+        return None
+
+    cursor.execute(
+        """
+        SELECT id, NULL AS codigo, nombre
+        FROM items
+        WHERE LOWER(COALESCE(nombre, '')) = LOWER(%s)
+        LIMIT 1
+        """,
+        (nombre_fallback,),
+    )
+    return cursor.fetchone()
+
+
+def agregar_item_usuario_onboarding(cursor, usuario_id: int, item_codigo: str, cantidad: int):
+    cantidad_segura = max(0, int(cantidad or 0))
+    if cantidad_segura <= 0:
+        return None
+
+    item = obtener_item_por_codigo_onboarding(cursor, item_codigo)
+    if not item:
+        return None
+
+    cursor.execute(
+        """
+        INSERT INTO usuario_items (usuario_id, item_id, cantidad)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (usuario_id, item_id)
+        DO UPDATE SET cantidad = usuario_items.cantidad + EXCLUDED.cantidad
+        RETURNING cantidad
+        """,
+        (int(usuario_id), int(item["id"]), cantidad_segura),
+    )
+    stock = cursor.fetchone()
+
+    return {
+        "item_id": int(item["id"]),
+        "item_codigo": str(item.get("codigo") or item_codigo),
+        "nombre": item["nombre"],
+        "cantidad": cantidad_segura,
+        "stock_total": int(stock["cantidad"] or cantidad_segura) if stock else cantidad_segura,
+    }
+
+
+def construir_resumen_recompensa_onboarding(config: dict) -> dict:
+    items = []
+    for item_codigo, cantidad in config.get("items") or []:
+        items.append({
+            "item_codigo": str(item_codigo),
+            "cantidad": int(cantidad or 0),
+        })
+
+    return {
+        "pokedolares": int(config.get("pokedolares") or 0),
+        "items": items,
+    }
+
+
+def _sumar_pokedolares_onboarding(cursor, usuario_id: int, monto: int) -> int:
+    monto_seguro = max(0, int(monto or 0))
+
+    cursor.execute(
+        """
+        SELECT id, pokedolares
+        FROM usuarios
+        WHERE id = %s
+        FOR UPDATE
+        """,
+        (int(usuario_id),),
+    )
+    usuario_db = cursor.fetchone()
+
+    if not usuario_db:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Usuario no encontrado"
+        )
+
+    total = int(usuario_db["pokedolares"] or 0) + monto_seguro
+    cursor.execute(
+        """
+        UPDATE usuarios
+        SET pokedolares = %s
+        WHERE id = %s
+        """,
+        (total, int(usuario_id)),
+    )
+    return total
+
+
+def _construir_recompensa_aplicada_onboarding(cursor, usuario_id: int, config: dict) -> dict:
+    pokedolares = int(config.get("pokedolares") or 0)
+    saldo_actual = _sumar_pokedolares_onboarding(cursor, usuario_id, pokedolares)
+
+    items_aplicados = []
+    for item_codigo, cantidad in config.get("items") or []:
+        item_resultado = agregar_item_usuario_onboarding(cursor, usuario_id, item_codigo, cantidad)
+        if item_resultado:
+            items_aplicados.append(item_resultado)
+
+    return {
+        "codigo": str(config.get("codigo") or ""),
+        "pokedolares": pokedolares,
+        "saldo_actual": saldo_actual,
+        "items": items_aplicados,
+    }
+
+
+def resolver_onboarding_usuario(cursor, usuario_id: int, completar_batalla: bool = False, marcar_bienvenida: bool | None = None):
+    if not onboarding_tabla_disponible(cursor):
+        return {
+            "ok": True,
+            "habilitado": False,
+            "usuario_id": int(usuario_id),
+            "bienvenida_mostrada": True,
+            "tutorial_completado": False,
+            "progreso": {
+                "completadas": 0,
+                "total": 3,
+                "porcentaje": 0,
+                "capturas": 0,
+                "equipo": 0,
+                "batalla": 0,
+            },
+            "misiones": [],
+            "recompensas_aplicadas": [],
+            "recompensa_final": construir_resumen_recompensa_onboarding(ONBOARDING_REWARD_CONFIG["final"]),
+        }
+
+    asegurar_usuario_onboarding(cursor, usuario_id)
+    cursor.execute(
+        """
+        SELECT *
+        FROM usuario_onboarding
+        WHERE usuario_id = %s
+        FOR UPDATE
+        """,
+        (int(usuario_id),),
+    )
+    row = cursor.fetchone()
+
+    if not row:
+        return {
+            "ok": False,
+            "habilitado": False,
+            "usuario_id": int(usuario_id),
+            "misiones": [],
+            "recompensas_aplicadas": [],
+        }
+
+    if marcar_bienvenida is not None and bool(row.get("bienvenida_mostrada")) != bool(marcar_bienvenida):
+        cursor.execute(
+            """
+            UPDATE usuario_onboarding
+            SET bienvenida_mostrada = %s,
+                actualizado_en = CURRENT_TIMESTAMP
+            WHERE usuario_id = %s
+            """,
+            (bool(marcar_bienvenida), int(usuario_id)),
+        )
+        row["bienvenida_mostrada"] = bool(marcar_bienvenida)
+
+    cursor.execute(
+        """
+        SELECT COUNT(*) AS total
+        FROM usuario_pokemon
+        WHERE usuario_id = %s
+        """,
+        (int(usuario_id),),
+    )
+    total_capturas = int((cursor.fetchone() or {}).get("total") or 0)
+
+    cursor.execute(
+        """
+        SELECT COUNT(*) AS total
+        FROM equipo_usuario
+        WHERE usuario_id = %s
+        """,
+        (int(usuario_id),),
+    )
+    total_equipo = int((cursor.fetchone() or {}).get("total") or 0)
+
+    recompensa_capturas_reclamada = bool(row.get("recompensa_capturas_reclamada"))
+    recompensa_equipo_reclamada = bool(row.get("recompensa_equipo_reclamada"))
+    recompensa_batalla_reclamada = bool(row.get("recompensa_batalla_reclamada"))
+    recompensa_final_reclamada = bool(row.get("recompensa_final_reclamada"))
+
+    capturas_completada = total_capturas >= ONBOARDING_MISION_CAPTURAS_OBJETIVO
+    equipo_completada = total_equipo >= ONBOARDING_MISION_EQUIPO_OBJETIVO
+    batalla_completada = recompensa_batalla_reclamada or bool(completar_batalla)
+
+    recompensas_aplicadas = []
+
+    if capturas_completada and not recompensa_capturas_reclamada:
+        recompensas_aplicadas.append(_construir_recompensa_aplicada_onboarding(cursor, usuario_id, ONBOARDING_REWARD_CONFIG["capturas"]))
+        recompensa_capturas_reclamada = True
+        cursor.execute(
+            """
+            UPDATE usuario_onboarding
+            SET recompensa_capturas_reclamada = TRUE,
+                actualizado_en = CURRENT_TIMESTAMP
+            WHERE usuario_id = %s
+            """,
+            (int(usuario_id),),
+        )
+
+    if equipo_completada and not recompensa_equipo_reclamada:
+        recompensas_aplicadas.append(_construir_recompensa_aplicada_onboarding(cursor, usuario_id, ONBOARDING_REWARD_CONFIG["equipo"]))
+        recompensa_equipo_reclamada = True
+        cursor.execute(
+            """
+            UPDATE usuario_onboarding
+            SET recompensa_equipo_reclamada = TRUE,
+                actualizado_en = CURRENT_TIMESTAMP
+            WHERE usuario_id = %s
+            """,
+            (int(usuario_id),),
+        )
+
+    if batalla_completada and not recompensa_batalla_reclamada:
+        recompensas_aplicadas.append(_construir_recompensa_aplicada_onboarding(cursor, usuario_id, ONBOARDING_REWARD_CONFIG["batalla"]))
+        recompensa_batalla_reclamada = True
+        cursor.execute(
+            """
+            UPDATE usuario_onboarding
+            SET recompensa_batalla_reclamada = TRUE,
+                actualizado_en = CURRENT_TIMESTAMP
+            WHERE usuario_id = %s
+            """,
+            (int(usuario_id),),
+        )
+
+    completadas = sum([1 if capturas_completada else 0, 1 if equipo_completada else 0, 1 if batalla_completada else 0])
+    tutorial_completado = completadas >= 3
+
+    if tutorial_completado and not recompensa_final_reclamada:
+        recompensas_aplicadas.append(_construir_recompensa_aplicada_onboarding(cursor, usuario_id, ONBOARDING_REWARD_CONFIG["final"]))
+        recompensa_final_reclamada = True
+        cursor.execute(
+            """
+            UPDATE usuario_onboarding
+            SET recompensa_final_reclamada = TRUE,
+                tutorial_completado = TRUE,
+                completado_en = COALESCE(completado_en, CURRENT_TIMESTAMP),
+                actualizado_en = CURRENT_TIMESTAMP
+            WHERE usuario_id = %s
+            """,
+            (int(usuario_id),),
+        )
+    elif tutorial_completado:
+        cursor.execute(
+            """
+            UPDATE usuario_onboarding
+            SET tutorial_completado = TRUE,
+                completado_en = COALESCE(completado_en, CURRENT_TIMESTAMP),
+                actualizado_en = CURRENT_TIMESTAMP
+            WHERE usuario_id = %s
+            """,
+            (int(usuario_id),),
+        )
+    else:
+        cursor.execute(
+            """
+            UPDATE usuario_onboarding
+            SET tutorial_completado = FALSE,
+                actualizado_en = CURRENT_TIMESTAMP
+            WHERE usuario_id = %s
+            """,
+            (int(usuario_id),),
+        )
+
+    porcentaje = int(round((completadas / 3) * 100))
+
+    return {
+        "ok": True,
+        "habilitado": True,
+        "usuario_id": int(usuario_id),
+        "bienvenida_mostrada": bool(marcar_bienvenida if marcar_bienvenida is not None else row.get("bienvenida_mostrada")),
+        "tutorial_completado": bool(tutorial_completado),
+        "progreso": {
+            "completadas": int(completadas),
+            "total": 3,
+            "porcentaje": int(porcentaje),
+            "capturas": int(total_capturas),
+            "equipo": int(total_equipo),
+            "batalla": 1 if batalla_completada else 0,
+        },
+        "misiones": [
+            {
+                "codigo": "capturas",
+                "objetivo": ONBOARDING_MISION_CAPTURAS_OBJETIVO,
+                "actual": int(total_capturas),
+                "completada": bool(capturas_completada),
+                "recompensa_reclamada": bool(recompensa_capturas_reclamada),
+                "recompensa": construir_resumen_recompensa_onboarding(ONBOARDING_REWARD_CONFIG["capturas"]),
+            },
+            {
+                "codigo": "equipo",
+                "objetivo": ONBOARDING_MISION_EQUIPO_OBJETIVO,
+                "actual": int(total_equipo),
+                "completada": bool(equipo_completada),
+                "recompensa_reclamada": bool(recompensa_equipo_reclamada),
+                "recompensa": construir_resumen_recompensa_onboarding(ONBOARDING_REWARD_CONFIG["equipo"]),
+            },
+            {
+                "codigo": "batalla",
+                "objetivo": 1,
+                "actual": 1 if batalla_completada else 0,
+                "completada": bool(batalla_completada),
+                "recompensa_reclamada": bool(recompensa_batalla_reclamada),
+                "recompensa": construir_resumen_recompensa_onboarding(ONBOARDING_REWARD_CONFIG["batalla"]),
+            },
+        ],
+        "recompensa_final": {
+            **construir_resumen_recompensa_onboarding(ONBOARDING_REWARD_CONFIG["final"]),
+            "reclamada": bool(recompensa_final_reclamada),
+        },
+        "recompensas_aplicadas": recompensas_aplicadas,
+    }
+
+
+def marcar_bienvenida_onboarding(cursor, usuario_id: int, vista: bool = True):
+    return resolver_onboarding_usuario(cursor, usuario_id, marcar_bienvenida=bool(vista))
 
 
 def obtener_ranking_entrenadores_data(limit: int = 10):
@@ -2260,6 +2673,10 @@ def google_login(payload: GoogleLoginPayload):
                     avatar_id = COALESCE(NULLIF(TRIM(avatar_id), ''), %s)
                 WHERE id = %s
             """, (google_id, nombre, correo, foto, avatar_id_default, usuario_id))
+
+            if onboarding_tabla_disponible(cursor):
+                asegurar_usuario_onboarding(cursor, usuario_id)
+
             conn.commit()
 
             usuario_actualizado = obtener_usuario_por_id(usuario_id)
@@ -2273,7 +2690,8 @@ def google_login(payload: GoogleLoginPayload):
                 "access_token": token,
                 "token_type": "bearer",
                 "usuario": usuario_actualizado,
-                "mensaje": "Usuario existente"
+                "mensaje": "Usuario existente",
+                "usuario_nuevo": False
             }
 
         cursor.execute("""
@@ -2284,6 +2702,10 @@ def google_login(payload: GoogleLoginPayload):
         nuevo_id = cursor.fetchone()["id"]
 
         crear_inventario_inicial(cursor, nuevo_id)
+
+        if onboarding_tabla_disponible(cursor):
+            asegurar_usuario_onboarding(cursor, nuevo_id)
+
         conn.commit()
 
         usuario_nuevo = obtener_usuario_por_id(nuevo_id)
@@ -2297,7 +2719,8 @@ def google_login(payload: GoogleLoginPayload):
             "access_token": token,
             "token_type": "bearer",
             "usuario": usuario_nuevo,
-            "mensaje": "Usuario creado"
+            "mensaje": "Usuario creado",
+            "usuario_nuevo": True
         }
     finally:
         cursor.close()
@@ -2369,6 +2792,58 @@ def obtener_items_me(usuario=Depends(get_current_user)):
 @router.get("/usuario/me/pokemon")
 def obtener_pokemon_me(usuario=Depends(get_current_user)):
     return obtener_pokemon_usuario_data(usuario["id"])
+
+
+@router.get("/onboarding/me")
+def obtener_onboarding_me(usuario=Depends(get_current_user)):
+    conn = get_connection()
+    cursor = get_cursor(conn)
+
+    try:
+        data = resolver_onboarding_usuario(cursor, int(usuario["id"]))
+        conn.commit()
+        return data
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as error:
+        conn.rollback()
+        print("Error en /onboarding/me:", repr(error))
+        return {
+            "ok": False,
+            "habilitado": False,
+            "usuario_id": int(usuario["id"]),
+            "mensaje": "No se pudo cargar el onboarding"
+        }
+    finally:
+        cursor.close()
+        release_connection(conn)
+
+
+@router.post("/onboarding/me/bienvenida")
+def marcar_bienvenida_onboarding_me(payload: OnboardingBienvenidaPayload, usuario=Depends(get_current_user)):
+    conn = get_connection()
+    cursor = get_cursor(conn)
+
+    try:
+        data = marcar_bienvenida_onboarding(cursor, int(usuario["id"]), payload.vista)
+        conn.commit()
+        return data
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as error:
+        conn.rollback()
+        print("Error en /onboarding/me/bienvenida:", repr(error))
+        return {
+            "ok": False,
+            "habilitado": False,
+            "usuario_id": int(usuario["id"]),
+            "mensaje": "No se pudo actualizar la bienvenida del onboarding"
+        }
+    finally:
+        cursor.close()
+        release_connection(conn)
 
 
 @router.get("/usuario/pokemon/{usuario_pokemon_id}/movimientos")
@@ -2515,6 +2990,7 @@ def guardar_equipo_me(payload: GuardarEquipoPayload, usuario=Depends(get_current
         except Exception as actividad_error:
             print("Aviso actividad guardar equipo:", repr(actividad_error))
 
+        onboarding = resolver_onboarding_usuario(cursor, int(usuario["id"]))
         conn.commit()
 
         return {
@@ -2522,7 +2998,8 @@ def guardar_equipo_me(payload: GuardarEquipoPayload, usuario=Depends(get_current
             "mensaje": "Equipo guardado correctamente",
             "usuario_id": int(usuario["id"]),
             "equipo_ids": ids_guardados,
-            "equipo": obtener_equipo_usuario_data(usuario["id"])
+            "equipo": obtener_equipo_usuario_data(usuario["id"]),
+            "onboarding": onboarding
         }
 
     except HTTPException:
@@ -3210,6 +3687,7 @@ def recompensa_victoria_batalla(payload: RecompensaBatallaPayload, usuario=Depen
             accion="battle_end",
             detalle=f"recompensa:{recompensa['codigo']}"
         )
+        onboarding = resolver_onboarding_usuario(cursor, int(usuario["id"]), completar_batalla=True)
         conn.commit()
         registrar_cooldown_recompensa_batalla(usuario["id"])
 
@@ -3229,7 +3707,8 @@ def recompensa_victoria_batalla(payload: RecompensaBatallaPayload, usuario=Depen
             "gold_x2_aplicado": bool(multiplicadores.get("gold_x2_aplicado") or int(multiplicadores.get("gold_multiplier") or 1) > 1),
             "snapshot_habilitado": bool(snapshot_habilitado),
             "snapshot_usado": bool(sesion_tiene_snapshot),
-            "pokemon_actualizados": pokemon_actualizados
+            "pokemon_actualizados": pokemon_actualizados,
+            "onboarding": onboarding
         }
     except HTTPException:
         conn.rollback()
@@ -4150,6 +4629,7 @@ def intentar_captura(request: Request, payload: IntentoCapturaPayload, usuario=D
             except Exception as actividad_error:
                 print("Aviso actividad capture maps:", actividad_error)
 
+            onboarding = resolver_onboarding_usuario(cursor, int(usuario["id"]))
             conn.commit()
 
             return {
@@ -4158,6 +4638,7 @@ def intentar_captura(request: Request, payload: IntentoCapturaPayload, usuario=D
                 "probabilidad": probabilidad,
                 "usuario_pokemon_id": usuario_pokemon_id,
                 "item_id": int(payload.item_id),
+                "onboarding": onboarding,
             }
 
         registrar_log_maps(
