@@ -3780,13 +3780,35 @@ def soltar_pokemon(payload: SoltarPokemonPayload, usuario=Depends(get_current_us
 # ZONAS / MAPS
 # =========================================================
 
+
 @router.get("/zonas")
 def obtener_zonas():
     conn = get_connection()
     cursor = get_cursor(conn)
 
     try:
-        cursor.execute("""
+        tiene_codigo = existe_columna(cursor, "zonas", "codigo")
+        tiene_region_codigo = existe_columna(cursor, "zonas", "region_codigo")
+        tiene_generacion = existe_columna(cursor, "zonas", "generacion")
+        tiene_tema_visual = existe_columna(cursor, "zonas", "tema_visual")
+        tiene_orden = existe_columna(cursor, "zonas", "orden")
+        tiene_activo = existe_columna(cursor, "zonas", "activo")
+        tiene_card_imagen = existe_columna(cursor, "zonas", "card_imagen")
+        tiene_escenario_imagen = existe_columna(cursor, "zonas", "escenario_imagen")
+
+        select_codigo = "z.codigo AS zona_codigo" if tiene_codigo else "NULL::varchar AS zona_codigo"
+        select_region_codigo = "z.region_codigo AS region_codigo" if tiene_region_codigo else "NULL::varchar AS region_codigo"
+        select_generacion = "z.generacion AS generacion" if tiene_generacion else "NULL::int2 AS generacion"
+        select_tema_visual = "z.tema_visual AS tema_visual" if tiene_tema_visual else "NULL::varchar AS tema_visual"
+        select_orden = "z.orden AS zona_orden" if tiene_orden else "z.id AS zona_orden"
+        select_activo = "z.activo AS zona_activo" if tiene_activo else "TRUE AS zona_activo"
+        select_card_imagen = "z.card_imagen AS card_imagen" if tiene_card_imagen else "z.imagen AS card_imagen"
+        select_escenario_imagen = "z.escenario_imagen AS escenario_imagen" if tiene_escenario_imagen else "NULL::varchar AS escenario_imagen"
+
+        where_activo = "WHERE z.activo = TRUE" if tiene_activo else ""
+        order_zona = "COALESCE(z.orden, z.id), z.id" if tiene_orden else "z.id"
+
+        cursor.execute(f"""
             SELECT
                 z.id AS zona_id,
                 z.nombre AS zona_nombre,
@@ -3795,8 +3817,18 @@ def obtener_zonas():
                 z.nivel_min,
                 z.nivel_max,
                 z.imagen,
+                {select_codigo},
+                {select_region_codigo},
+                {select_generacion},
+                {select_tema_visual},
+                {select_orden},
+                {select_activo},
+                {select_card_imagen},
+                {select_escenario_imagen},
                 zp.pokemon_id,
                 p.nombre AS pokemon_nombre,
+                p.tipo AS pokemon_tipo,
+                p.generacion AS pokemon_generacion,
                 zp.probabilidad,
                 zp.nivel_min AS pokemon_nivel_min,
                 zp.nivel_max AS pokemon_nivel_max,
@@ -3804,9 +3836,10 @@ def obtener_zonas():
             FROM zonas z
             LEFT JOIN zona_pokemon zp ON zp.zona_id = z.id
             LEFT JOIN pokemon p ON p.id = zp.pokemon_id
-            ORDER BY z.id, zp.probabilidad DESC, p.nombre ASC
+            {where_activo}
+            ORDER BY {order_zona}, zp.probabilidad DESC, p.nombre ASC
         """)
-        rows = cursor.fetchall()
+        rows = cursor.fetchall() or []
 
         zonas_map = {}
 
@@ -3816,12 +3849,20 @@ def obtener_zonas():
             if zona_id not in zonas_map:
                 zonas_map[zona_id] = {
                     "id": row["zona_id"],
+                    "codigo": row.get("zona_codigo") or f"zona_{row['zona_id']}",
                     "nombre": row["zona_nombre"],
                     "descripcion": row["descripcion"],
                     "tipo_ambiente": row["tipo_ambiente"],
+                    "tema_visual": row.get("tema_visual"),
+                    "region_codigo": row.get("region_codigo"),
+                    "generacion": int(row["generacion"]) if row.get("generacion") is not None else None,
                     "nivel_min": row["nivel_min"],
                     "nivel_max": row["nivel_max"],
+                    "orden": int(row.get("zona_orden") or row["zona_id"]),
+                    "activo": bool(row.get("zona_activo")) if row.get("zona_activo") is not None else True,
                     "imagen": row["imagen"],
+                    "card_imagen": row.get("card_imagen") or row["imagen"],
+                    "escenario_imagen": row.get("escenario_imagen"),
                     "pokemones": []
                 }
 
@@ -3829,13 +3870,20 @@ def obtener_zonas():
                 zonas_map[zona_id]["pokemones"].append({
                     "pokemon_id": row["pokemon_id"],
                     "nombre": row["pokemon_nombre"],
+                    "tipo": row.get("pokemon_tipo"),
+                    "generacion": int(row["pokemon_generacion"]) if row.get("pokemon_generacion") is not None else None,
                     "probabilidad": float(row["probabilidad"]),
                     "nivel_min": row["pokemon_nivel_min"],
                     "nivel_max": row["pokemon_nivel_max"],
                     "puede_ser_shiny": bool(row["puede_ser_shiny"])
                 })
 
-        return list(zonas_map.values())
+        zonas = list(zonas_map.values())
+        for zona in zonas:
+            zona["species_count"] = len(zona.get("pokemones") or [])
+
+        zonas.sort(key=lambda zona: (int(zona.get("orden") or zona["id"]), int(zona["id"])))
+        return zonas
 
     except Exception as error:
         print("Error en /zonas:", error)
