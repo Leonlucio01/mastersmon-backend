@@ -4296,7 +4296,7 @@ def generar_encuentro(request: Request, payload: EncuentroPayload, usuario=Depen
         nivel_min = int(elegido["nivel_min"] or 1)
         nivel_max = int(elegido["nivel_max"] or nivel_min)
         nivel = random.randint(nivel_min, nivel_max)
-        es_shiny = bool(elegido["puede_ser_shiny"]) and (random.randint(1, 35) == 1)
+        es_shiny = bool(elegido["puede_ser_shiny"]) and (random.randint(1, 70) == 1)
 
         stats = calcular_stats(
             int(elegido["hp"] or 1),
