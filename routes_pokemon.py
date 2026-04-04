@@ -24,6 +24,7 @@ AVATAR_ID_REGEX = re.compile(r"^[a-z0-9_-]{1,60}$")
 MAPS_NODE_ID_REGEX = re.compile(r"^[a-z0-9_-]{1,60}$")
 MAPS_PRESENCIA_TTL_SEGUNDOS = 25
 USUARIO_ACTIVIDAD_TTL_SEGUNDOS = 120
+MAPS_STEP_ENCOUNTER_CHANCE = 0.30
 MAPS_WEBSOCKET_CONEXIONES = {}
 MAPS_WEBSOCKET_LOCK = asyncio.Lock()
 ENCUENTRO_TOKEN_TTL_SEGUNDOS = 60 * 5
@@ -4290,13 +4291,22 @@ def generar_encuentro(request: Request, payload: EncuentroPayload, usuario=Depen
             conn.commit()
             return {"error": "No hay Pokémon configurados para esta zona"}
 
+        invalidar_encuentros_activos_usuario(cursor, usuario["id"])
+
+        if random.random() >= MAPS_STEP_ENCOUNTER_CHANCE:
+            conn.commit()
+            return {
+                "encuentro_generado": False,
+                "chance_aplicada": MAPS_STEP_ENCOUNTER_CHANCE,
+            }
+
         pesos = [float(r["probabilidad"] or 0) for r in rows]
         elegido = random.choices(rows, weights=pesos, k=1)[0] if sum(pesos) > 0 else rows[0]
 
         nivel_min = int(elegido["nivel_min"] or 1)
         nivel_max = int(elegido["nivel_max"] or nivel_min)
         nivel = random.randint(nivel_min, nivel_max)
-        es_shiny = bool(elegido["puede_ser_shiny"]) and (random.randint(1, 50) == 1)
+        es_shiny = bool(elegido["puede_ser_shiny"]) and (random.randint(1, 70) == 1)
 
         stats = calcular_stats(
             int(elegido["hp"] or 1),
@@ -4313,7 +4323,6 @@ def generar_encuentro(request: Request, payload: EncuentroPayload, usuario=Depen
             int(elegido.get("defensa_especial") or elegido["defensa"] or 1),
         )
 
-        invalidar_encuentros_activos_usuario(cursor, usuario["id"])
         encuentro_token = crear_token_simple(24)
         cursor.execute(
             """
