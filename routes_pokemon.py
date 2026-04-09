@@ -21,6 +21,8 @@ router = APIRouter()
 MAX_NIVEL_POKEMON = 200
 AVATAR_ID_DEFAULT = "steven"
 AVATAR_ID_REGEX = re.compile(r"^[a-z0-9_-]{1,60}$")
+TRAINER_TEAM_COLOR_DEFAULT = "green"
+TRAINER_TEAM_COLOR_MAP = {"green": "bulbasaur", "red": "charmander", "blue": "squirtle"}
 MAPS_NODE_ID_REGEX = re.compile(r"^[a-z0-9_-]{1,60}$")
 MAPS_PRESENCIA_TTL_SEGUNDOS = 25
 USUARIO_ACTIVIDAD_TTL_SEGUNDOS = 120
@@ -197,6 +199,12 @@ class ActualizarAvatarPayload(BaseModel):
     avatar_id: str
 
 
+class ActualizarTrainerSetupPayload(BaseModel):
+    avatar_id: str | None = None
+    team_color: str | None = None
+    setup_completed: bool | None = None
+
+
 class OnboardingBienvenidaPayload(BaseModel):
     vista: bool = True
 
@@ -300,6 +308,129 @@ def validar_avatar_id(avatar_id: str | None) -> str:
 
     return valor
 
+
+
+
+def normalizar_trainer_team_color(team_color: str | None, default: str | None = None) -> str | None:
+    valor = str(team_color or "").strip().lower()
+    if not valor:
+        return default
+    return valor if valor in TRAINER_TEAM_COLOR_MAP else default
+
+
+def obtener_starter_code_desde_team_color(team_color: str | None) -> str | None:
+    valor = normalizar_trainer_team_color(team_color)
+    if not valor:
+        return None
+    return TRAINER_TEAM_COLOR_MAP.get(valor)
+
+
+def trainer_setup_soportado(cursor) -> bool:
+    return (
+        existe_columna(cursor, "usuarios", "trainer_team_color")
+        and existe_columna(cursor, "usuarios", "trainer_starter_code")
+        and existe_columna(cursor, "usuarios", "trainer_setup_completed")
+        and existe_columna(cursor, "usuarios", "trainer_setup_completed_at")
+    )
+
+
+def construir_trainer_setup_desde_usuario(usuario: dict | None = None) -> dict:
+    usuario = dict(usuario or {})
+    avatar_id = normalizar_avatar_id(usuario.get("avatar_id"))
+    team_color = normalizar_trainer_team_color(usuario.get("trainer_team_color"))
+    starter_code = str(usuario.get("trainer_starter_code") or obtener_starter_code_desde_team_color(team_color) or "").strip().lower() or None
+    setup_completed = bool(usuario.get("trainer_setup_completed"))
+    setup_completed_at = usuario.get("trainer_setup_completed_at")
+    if hasattr(setup_completed_at, "isoformat"):
+        setup_completed_at = setup_completed_at.isoformat()
+
+    return {
+        "avatar_id": avatar_id,
+        "team_color": team_color,
+        "starter_code": starter_code,
+        "setup_completed": setup_completed,
+        "setup_completed_at": setup_completed_at,
+    }
+
+
+def obtener_trainer_setup_usuario(cursor, usuario_id: int) -> dict:
+    usuario_actual = obtener_usuario_por_id(int(usuario_id)) or {}
+    data = construir_trainer_setup_desde_usuario(usuario_actual)
+    data.update({
+        "ok": True,
+        "supported": trainer_setup_soportado(cursor),
+        "usuario": usuario_actual,
+    })
+    return data
+
+
+def actualizar_trainer_setup_usuario(
+    cursor,
+    usuario_id: int,
+    *,
+    avatar_id: str | None = None,
+    team_color: str | None = None,
+    setup_completed: bool | None = None,
+) -> dict:
+    usuario_id = int(usuario_id)
+
+    if avatar_id is not None:
+        avatar_id = validar_avatar_id(avatar_id)
+
+    team_color_normalizado = None
+    starter_code = None
+    if team_color is not None:
+        team_color_normalizado = normalizar_trainer_team_color(team_color)
+        if not team_color_normalizado:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="team_color inválido"
+            )
+        starter_code = obtener_starter_code_desde_team_color(team_color_normalizado)
+
+    if trainer_setup_soportado(cursor):
+        updates = []
+        params = []
+
+        if avatar_id is not None:
+            updates.append("avatar_id = %s")
+            params.append(avatar_id)
+
+        if team_color is not None:
+            updates.extend([
+                "trainer_team_color = %s",
+                "trainer_starter_code = %s"
+            ])
+            params.extend([team_color_normalizado, starter_code])
+
+        if setup_completed is not None:
+            updates.append("trainer_setup_completed = %s")
+            params.append(bool(setup_completed))
+            updates.append("trainer_setup_completed_at = %s")
+            params.append(datetime.now(timezone.utc) if bool(setup_completed) else None)
+
+        if updates:
+            params.append(usuario_id)
+            cursor.execute(
+                f"""
+                UPDATE usuarios
+                SET {', '.join(updates)}
+                WHERE id = %s
+                """,
+                tuple(params)
+            )
+
+    elif avatar_id is not None:
+        cursor.execute(
+            """
+            UPDATE usuarios
+            SET avatar_id = %s
+            WHERE id = %s
+            """,
+            (avatar_id, usuario_id)
+        )
+
+    return obtener_trainer_setup_usuario(cursor, usuario_id)
 
 def validar_nodo_mapa_id(nodo_id: str | None) -> str:
     valor = str(nodo_id or "").strip().lower()
@@ -1527,22 +1658,31 @@ def obtener_meta_pokedex_global(cursor):
     }
 
 
+
 def obtener_usuario_por_id(usuario_id: int):
     conn = get_connection()
     cursor = get_cursor(conn)
     try:
-        cursor.execute("""
+        columnas = [
+            "id",
+            "google_id",
+            "nombre",
+            "correo",
+            "foto",
+            "avatar_url",
+            "avatar_id",
+            "rol",
+            "pokedolares",
+            "fecha_registro",
+        ]
+
+        for extra in ("trainer_team_color", "trainer_starter_code", "trainer_setup_completed", "trainer_setup_completed_at"):
+            if existe_columna(cursor, "usuarios", extra):
+                columnas.append(extra)
+
+        cursor.execute(f"""
             SELECT
-                id,
-                google_id,
-                nombre,
-                correo,
-                foto,
-                avatar_url,
-                avatar_id,
-                rol,
-                pokedolares,
-                fecha_registro
+                {', '.join(columnas)}
             FROM usuarios
             WHERE id = %s
         """, (usuario_id,))
@@ -1553,6 +1693,9 @@ def obtener_usuario_por_id(usuario_id: int):
 
         data = dict(usuario)
         data["avatar_id"] = normalizar_avatar_id(data.get("avatar_id"))
+        data["trainer_team_color"] = normalizar_trainer_team_color(data.get("trainer_team_color"))
+        data["trainer_starter_code"] = str(data.get("trainer_starter_code") or obtener_starter_code_desde_team_color(data.get("trainer_team_color")) or "").strip().lower() or None
+        data["trainer_setup_completed"] = bool(data.get("trainer_setup_completed"))
         return data
     finally:
         cursor.close()
@@ -2784,6 +2927,66 @@ def actualizar_avatar_me(payload: ActualizarAvatarPayload, usuario=Depends(get_c
         cursor.close()
         release_connection(conn)
 
+
+
+
+@router.get("/usuario/me/trainer-setup")
+def obtener_trainer_setup_me(usuario=Depends(get_current_user)):
+    conn = get_connection()
+    cursor = get_cursor(conn)
+
+    try:
+        data = obtener_trainer_setup_usuario(cursor, int(usuario["id"]))
+        conn.commit()
+        return data
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as error:
+        conn.rollback()
+        print("Error en /usuario/me/trainer-setup:", repr(error))
+        usuario_actual = obtener_usuario_por_id(int(usuario["id"])) or {}
+        fallback = construir_trainer_setup_desde_usuario(usuario_actual)
+        fallback.update({
+            "ok": False,
+            "supported": False,
+            "usuario": usuario_actual,
+            "mensaje": "No se pudo cargar el trainer setup"
+        })
+        return fallback
+    finally:
+        cursor.close()
+        release_connection(conn)
+
+
+@router.put("/usuario/me/trainer-setup")
+def actualizar_trainer_setup_me(payload: ActualizarTrainerSetupPayload, usuario=Depends(get_current_user)):
+    conn = get_connection()
+    cursor = get_cursor(conn)
+
+    try:
+        data = actualizar_trainer_setup_usuario(
+            cursor,
+            int(usuario["id"]),
+            avatar_id=payload.avatar_id,
+            team_color=payload.team_color,
+            setup_completed=payload.setup_completed,
+        )
+        conn.commit()
+        return data
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as error:
+        conn.rollback()
+        print("Error en /usuario/me/trainer-setup:", repr(error))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="No se pudo actualizar el trainer setup"
+        )
+    finally:
+        cursor.close()
+        release_connection(conn)
 
 @router.get("/usuario/me/items")
 def obtener_items_me(usuario=Depends(get_current_user)):
