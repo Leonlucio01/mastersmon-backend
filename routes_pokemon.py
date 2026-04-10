@@ -1702,6 +1702,25 @@ def obtener_usuario_por_id(usuario_id: int):
         release_connection(conn)
 
 
+def serializar_usuario_publico(usuario: dict | None) -> dict | None:
+    if not usuario:
+        return None
+
+    return {
+        "id": int(usuario["id"]),
+        "nombre": usuario.get("nombre"),
+        "foto": usuario.get("foto"),
+        "avatar_url": usuario.get("avatar_url"),
+        "avatar_id": usuario.get("avatar_id"),
+        "rol": usuario.get("rol"),
+        "fecha_registro": usuario.get("fecha_registro"),
+        "trainer_team_color": usuario.get("trainer_team_color"),
+        "trainer_starter_code": usuario.get("trainer_starter_code"),
+        "trainer_setup_completed": bool(usuario.get("trainer_setup_completed")),
+        "trainer_setup_completed_at": usuario.get("trainer_setup_completed_at"),
+    }
+
+
 def obtener_items_usuario_data(usuario_id: int):
     conn = get_connection()
     cursor = get_cursor(conn)
@@ -3481,7 +3500,7 @@ def obtener_usuario(usuario_id: int):
     usuario = obtener_usuario_por_id(usuario_id)
     if not usuario:
         return {"mensaje": "Usuario no encontrado"}
-    return usuario
+    return serializar_usuario_publico(usuario)
 
 
 @router.get("/usuario/{usuario_id}/pokemon")

@@ -9,10 +9,13 @@ from google.auth.transport import requests as google_requests
 
 from database import get_connection, get_cursor, release_connection
 
-JWT_SECRET = os.getenv("JWT_SECRET", "cambia-esto-por-una-clave-larga")
+JWT_SECRET = os.getenv("JWT_SECRET", "").strip()
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_HOURS = 24 * 7
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+
+if not JWT_SECRET:
+    raise ValueError("JWT_SECRET es obligatorio y no puede estar vacío.")
 
 security = HTTPBearer()
 

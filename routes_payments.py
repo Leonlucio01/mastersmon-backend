@@ -742,6 +742,15 @@ async def paypal_webhook(request: Request):
             (event_id or str(uuid.uuid4()), event_type, verificado, json.dumps(payload or {}))
         )
 
+        if verificado is not True:
+            conn.commit()
+            return {
+                "ok": False,
+                "event_type": event_type,
+                "verified": verificado,
+                "ignored": True,
+            }
+
         order_id = None
         capture_id = None
         resource = payload.get("resource") or {}
