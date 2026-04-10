@@ -75,7 +75,7 @@ def _paypal_access_token() -> str:
         timeout=25,
     )
     if response.status_code >= 300:
-        raise HTTPException(status_code=502, detail=f"No se pudo autenticar con PayPal: {response.text[:300]}")
+        raise HTTPException(status_code=502, detail="No se pudo autenticar con PayPal")
     data = response.json()
     token = data.get("access_token")
     if not token:
@@ -206,7 +206,7 @@ def _crear_orden_paypal(compra: dict, producto: dict):
         timeout=30,
     )
     if response.status_code >= 300:
-        raise HTTPException(status_code=502, detail=f"No se pudo crear la orden PayPal: {response.text[:400]}")
+        raise HTTPException(status_code=502, detail="No se pudo crear la orden PayPal")
     data = response.json()
     return data
 
@@ -227,7 +227,7 @@ def _capturar_orden_paypal(order_id: str):
         timeout=30,
     )
     if response.status_code >= 300:
-        raise HTTPException(status_code=502, detail=f"No se pudo capturar la orden PayPal: {response.text[:400]}")
+        raise HTTPException(status_code=502, detail="No se pudo capturar la orden PayPal")
     return response.json()
 
 
@@ -239,7 +239,7 @@ def _obtener_orden_paypal(order_id: str):
         timeout=30,
     )
     if response.status_code >= 300:
-        raise HTTPException(status_code=502, detail=f"No se pudo consultar la orden PayPal: {response.text[:400]}")
+        raise HTTPException(status_code=502, detail="No se pudo consultar la orden PayPal")
     return response.json()
 
 

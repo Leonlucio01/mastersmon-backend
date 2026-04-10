@@ -645,9 +645,9 @@ def obtener_catalogo_gyms(usuario=Depends(get_current_user)):
     except HTTPException:
         conn.rollback()
         raise
-    except Exception as error:
+    except Exception:
         conn.rollback()
-        raise HTTPException(status_code=500, detail=f"No se pudo cargar el catálogo de Gyms: {error}")
+        raise HTTPException(status_code=500, detail="No se pudo cargar el catálogo de Gyms")
     finally:
         cursor.close()
         release_connection(conn)
@@ -685,9 +685,9 @@ def obtener_progreso_gyms(usuario=Depends(get_current_user)):
     except HTTPException:
         conn.rollback()
         raise
-    except Exception as error:
+    except Exception:
         conn.rollback()
-        raise HTTPException(status_code=500, detail=f"No se pudo cargar el progreso de Gyms: {error}")
+        raise HTTPException(status_code=500, detail="No se pudo cargar el progreso de Gyms")
     finally:
         cursor.close()
         release_connection(conn)
@@ -829,9 +829,9 @@ def iniciar_gym(payload: GymIniciarPayload, usuario=Depends(get_current_user)):
     except HTTPException:
         conn.rollback()
         raise
-    except Exception as error:
+    except Exception:
         conn.rollback()
-        raise HTTPException(status_code=500, detail=f"No se pudo iniciar el Gym: {error}")
+        raise HTTPException(status_code=500, detail="No se pudo iniciar el Gym")
     finally:
         cursor.close()
         release_connection(conn)
@@ -974,9 +974,9 @@ def reclamar_recompensa_gym(payload: GymRecompensaPayload, usuario=Depends(get_c
     except HTTPException:
         conn.rollback()
         raise
-    except Exception as error:
+    except Exception:
         conn.rollback()
-        raise HTTPException(status_code=500, detail=f"No se pudo cerrar el Gym: {error}")
+        raise HTTPException(status_code=500, detail="No se pudo cerrar el Gym")
     finally:
         cursor.close()
         release_connection(conn)
@@ -1014,9 +1014,9 @@ def cancelar_sesion_gym(payload: GymCancelarPayload, usuario=Depends(get_current
     except HTTPException:
         conn.rollback()
         raise
-    except Exception as error:
+    except Exception:
         conn.rollback()
-        raise HTTPException(status_code=500, detail=f"No se pudo cancelar la sesión de Gym: {error}")
+        raise HTTPException(status_code=500, detail="No se pudo cancelar la sesión de Gym")
     finally:
         cursor.close()
         release_connection(conn)

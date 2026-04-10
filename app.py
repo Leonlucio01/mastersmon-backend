@@ -69,14 +69,11 @@ def health():
         return {
             "status": "ok",
             "db": result["ok"],
-            "db_name": result["db_name"],
-            "schema_name": result["schema_name"],
             "version_backend": BACKEND_MARKER
         }
-    except Exception as e:
+    except Exception:
         return {
             "status": "error",
-            "detail": str(e),
             "version_backend": BACKEND_MARKER
         }
     finally:
