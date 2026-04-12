@@ -40,12 +40,26 @@ STARTER_SPECIES_IDS = [
     912,
 ]
 
+AVATAR_CODES = [
+    "batman",
+    "bryan",
+    "goku",
+    "hades",
+    "jean",
+    "jhonny",
+    "leon",
+    "nathaly",
+    "rafael",
+    "steven",
+]
+
 
 class CompleteOnboardingPayload(BaseModel):
     display_name: str = Field(..., min_length=2, max_length=150)
     trainer_team: str = Field(..., pattern="^(red|blue|green|neutral)$")
     starter_species_id: int
     region_code: str = Field(..., min_length=2, max_length=80)
+    avatar_code: str = Field(default="steven", min_length=2, max_length=80)
     language_code: str = Field(default="es", min_length=2, max_length=8)
     timezone_code: str = Field(default="America/Lima", min_length=2, max_length=80)
 
@@ -91,6 +105,17 @@ def _fetch_starter_options(cursor):
         (STARTER_SPECIES_IDS,),
     )
     return [dict(row) for row in cursor.fetchall()]
+
+
+def _avatar_options():
+    return [
+        {
+            "code": avatar_code,
+            "name": avatar_code.capitalize(),
+            "asset_url": f"/img/avatars/{avatar_code}.png",
+        }
+        for avatar_code in AVATAR_CODES
+    ]
 
 
 def _grant_starter_pokemon(cursor, *, user_id: int, species_id: int, display_name: str):
@@ -339,6 +364,7 @@ def get_onboarding_options(current_user: dict = Depends(get_current_user)):
                 {"code": "green", "name": "Team Green"},
                 {"code": "neutral", "name": "Neutral"},
             ],
+            "avatars": _avatar_options(),
             "starters": starter_options,
             "regions": regions,
         }
@@ -350,6 +376,9 @@ def complete_onboarding(payload: CompleteOnboardingPayload, current_user: dict =
     display_name = payload.display_name.strip()
     if len(display_name) < 2:
         fail("DISPLAY_NAME_INVALID", "El nombre visible es demasiado corto.", 400)
+    avatar_code = payload.avatar_code.strip().lower()
+    if avatar_code not in AVATAR_CODES:
+        fail("AVATAR_INVALID", "El avatar elegido no esta disponible.", 400)
 
     with db_cursor(commit=True) as (_, cursor):
         cursor.execute(
@@ -406,6 +435,7 @@ def complete_onboarding(payload: CompleteOnboardingPayload, current_user: dict =
             UPDATE user_profiles
             SET display_name = %s,
                 trainer_code = %s,
+                avatar_code = %s,
                 trainer_team = %s,
                 starter_species_id = %s,
                 region_start_id = %s,
@@ -419,6 +449,7 @@ def complete_onboarding(payload: CompleteOnboardingPayload, current_user: dict =
             (
                 display_name,
                 trainer_code,
+                avatar_code,
                 payload.trainer_team,
                 payload.starter_species_id,
                 region["id"],
