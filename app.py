@@ -12,6 +12,8 @@ from routes.v2.house import router_v2_house
 from routes.v2.home import router_v2_home
 from routes.v2.onboarding import router_v2_onboarding
 from routes.v2.profile import router_v2_profile
+from routes.v2.ranking import router_v2_ranking
+from routes.v2.shop import router_v2_shop
 from routes.v2.team import router_v2_team
 from routes.v2.trade import router_v2_trade
 
@@ -77,7 +79,9 @@ app.include_router(router_v2_collection)
 app.include_router(router_v2_team)
 app.include_router(router_v2_gyms)
 app.include_router(router_v2_house)
+app.include_router(router_v2_shop)
 app.include_router(router_v2_trade)
+app.include_router(router_v2_ranking)
 
 
 @app.get("/")
