@@ -133,6 +133,7 @@ def _fetch_utility_catalog(cursor, user_id: int):
             is_tradable
         FROM item_catalog
         WHERE is_active = TRUE
+          AND item_kind <> 'booster'
         ORDER BY id ASC
         """,
     )
