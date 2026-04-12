@@ -8,12 +8,27 @@ from database import db_cursor
 router_v2_shop = APIRouter(prefix="/v2/shop", tags=["v2-shop"])
 
 UTILITY_ITEMS = {
-    "poke_ball": {"price_gold": 200, "pack_quantity": 5, "sort_order": 1},
-    "super_ball": {"price_gold": 600, "pack_quantity": 3, "sort_order": 2},
-    "ultra_ball": {"price_gold": 1200, "pack_quantity": 2, "sort_order": 3},
-    "master_ball": {"price_gold": 50000, "pack_quantity": 1, "sort_order": 4},
-    "potion": {"price_gold": 120, "pack_quantity": 2, "sort_order": 5},
-    "super_potion": {"price_gold": 350, "pack_quantity": 2, "sort_order": 6},
+    "poke_ball": {"price_gold": 200, "sort_order": 1},
+    "super_ball": {"price_gold": 600, "sort_order": 2},
+    "ultra_ball": {"price_gold": 1200, "sort_order": 3},
+    "master_ball": {"price_gold": 50000, "sort_order": 4},
+    "potion": {"price_gold": 120, "sort_order": 5},
+    "super_potion": {"price_gold": 350, "sort_order": 6},
+    "booster_battle_exp_x2_24h": {"price_gold": 3500, "sort_order": 7},
+    "booster_battle_gold_x2_24h": {"price_gold": 3500, "sort_order": 8},
+    "piedra_fuego": {"price_gold": 2200, "sort_order": 20},
+    "piedra_agua": {"price_gold": 2200, "sort_order": 21},
+    "piedra_trueno": {"price_gold": 2200, "sort_order": 22},
+    "piedra_hoja": {"price_gold": 2200, "sort_order": 23},
+    "piedra_lunar": {"price_gold": 2600, "sort_order": 24},
+    "sun_stone": {"price_gold": 2600, "sort_order": 25},
+    "king_s_rock": {"price_gold": 3000, "sort_order": 26},
+    "metal_coat": {"price_gold": 3200, "sort_order": 27},
+    "dragon_scale": {"price_gold": 3400, "sort_order": 28},
+    "up_grade": {"price_gold": 3600, "sort_order": 29},
+    "link_cable": {"price_gold": 1800, "sort_order": 30},
+    "deepseatooth": {"price_gold": 3000, "sort_order": 31},
+    "deepseascale": {"price_gold": 3000, "sort_order": 32},
 }
 
 
@@ -82,10 +97,9 @@ def _fetch_inventory_summary(cursor, user_id: int):
           ON ui.item_id = ic.id
          AND ui.user_id = %s
         WHERE ic.is_active = TRUE
-          AND ic.code = ANY(%s)
         ORDER BY ic.name ASC
         """,
-        (user_id, list(UTILITY_ITEMS.keys())),
+        (user_id,),
     )
     inventory = {}
     for row in cursor.fetchall():
@@ -119,18 +133,24 @@ def _fetch_utility_catalog(cursor, user_id: int):
             is_tradable
         FROM item_catalog
         WHERE is_active = TRUE
-          AND code = ANY(%s)
         ORDER BY id ASC
         """,
-        (list(UTILITY_ITEMS.keys()),),
     )
     items = []
     for row in cursor.fetchall():
         item = dict(row)
         config = UTILITY_ITEMS.get(item["code"], {})
         owned = inventory.get(item["code"], {})
-        item["price_gold"] = config.get("price_gold", 0)
-        item["pack_quantity"] = config.get("pack_quantity", 1)
+        fallback_price = 0
+        if item["item_kind"] == "captura":
+            fallback_price = 400
+        elif item["item_kind"] == "curacion":
+            fallback_price = 180
+        elif item["item_kind"] == "booster":
+            fallback_price = 3500
+        elif item["item_kind"] == "evolucion":
+            fallback_price = 2600
+        item["price_gold"] = config.get("price_gold", fallback_price)
         item["sort_order"] = config.get("sort_order", 999)
         item["owned_quantity"] = int(owned.get("quantity") or 0)
         items.append(item)
@@ -192,10 +212,6 @@ def get_shop_summary(current_user: dict = Depends(get_current_user)):
 
 @router_v2_shop.post("/utility-purchase")
 def purchase_utility_item(payload: UtilityPurchasePayload, current_user: dict = Depends(get_current_user)):
-    item_config = UTILITY_ITEMS.get(payload.item_code)
-    if not item_config:
-        fail("shop.item_not_supported", "Ese item todavia no esta disponible en el PokeMart.", 404)
-
     with db_cursor(commit=True) as (_, cursor):
         cursor.execute(
             """
@@ -204,7 +220,8 @@ def purchase_utility_item(payload: UtilityPurchasePayload, current_user: dict = 
                 ic.code,
                 ic.name,
                 ic.description,
-                ic.icon_path
+                ic.icon_path,
+                ic.item_kind
             FROM item_catalog ic
             WHERE ic.is_active = TRUE
               AND ic.code = %s
@@ -215,6 +232,20 @@ def purchase_utility_item(payload: UtilityPurchasePayload, current_user: dict = 
         item = cursor.fetchone()
         if not item:
             fail("shop.item_missing", "No se encontro el item solicitado.", 404)
+
+        item_config = UTILITY_ITEMS.get(item["code"], {})
+        fallback_price = 0
+        if item["item_kind"] == "captura":
+            fallback_price = 400
+        elif item["item_kind"] == "curacion":
+            fallback_price = 180
+        elif item["item_kind"] == "booster":
+            fallback_price = 3500
+        elif item["item_kind"] == "evolucion":
+            fallback_price = 2600
+        unit_price = int(item_config.get("price_gold", fallback_price))
+        if unit_price <= 0:
+            fail("shop.item_not_supported", "Ese item todavia no esta disponible en el PokeMart.", 404)
 
         cursor.execute(
             """
@@ -234,7 +265,7 @@ def purchase_utility_item(payload: UtilityPurchasePayload, current_user: dict = 
         if not wallet:
             fail("shop.gold_wallet_missing", "No se encontro la wallet de gold para este usuario.", 404)
 
-        total_cost = int(item_config["price_gold"]) * int(payload.quantity)
+        total_cost = unit_price * int(payload.quantity)
         if int(wallet["balance"] or 0) < total_cost:
             fail("shop.insufficient_funds", "No tienes suficiente gold para completar la compra.", 400)
 
@@ -284,12 +315,12 @@ def purchase_utility_item(payload: UtilityPurchasePayload, current_user: dict = 
                 (
                     f'{{"item_code":"{payload.item_code}",'
                     f'"quantity":{payload.quantity},'
-                    f'"pack_quantity":{item_config["pack_quantity"]}}}'
+                    f'"unit_price":{unit_price}}}'
                 ),
             ),
         )
 
-        granted_quantity = int(payload.quantity) * int(item_config["pack_quantity"])
+        granted_quantity = int(payload.quantity)
         cursor.execute(
             """
             INSERT INTO user_inventory (user_id, item_id, quantity)
@@ -314,6 +345,7 @@ def purchase_utility_item(payload: UtilityPurchasePayload, current_user: dict = 
             "quantity_purchased": int(payload.quantity),
             "granted_quantity": granted_quantity,
             "spent_gold": total_cost,
+            "unit_price": unit_price,
             "wallet_balance": new_balance,
             "inventory_quantity": int((inventory_row or {}).get("quantity") or 0),
             "wallets": wallets,
