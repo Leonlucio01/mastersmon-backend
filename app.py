@@ -1,27 +1,17 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from starlette import status
 
-from database import db_cursor
-from routes.v2.adventure import router_v2_adventure
-from routes.v2.auth import router_v2_auth
-from routes.v2.collection import router_v2_collection
-from routes.v2.gyms import router_v2_gyms
-from routes.v2.house import router_v2_house
-from routes.v2.home import router_v2_home
-from routes.v2.onboarding import router_v2_onboarding
-from routes.v2.profile import router_v2_profile
-from routes.v2.ranking import router_v2_ranking
-from routes.v2.shop import router_v2_shop
-from routes.v2.team import router_v2_team
-from routes.v2.trade import router_v2_trade
+from routes_pokemon import router
+from routes_boss_idle import router_boss_idle
+from routes_payments import router_payments
+from routes_gyms import router_gyms
+from database import get_connection, get_cursor, release_connection
 
-BACKEND_MARKER = "mastersmon-backend-v2-game-2026-04-11"
+BACKEND_MARKER = "mastersmon-backend-2026-03-23-monetization-v1"
 
 app = FastAPI(
-    title="MastersMon API V2",
-    version="2.0.0",
+    title="MastersMon API",
+    version="1.0.0"
 )
 
 ALLOWED_ORIGINS = [
@@ -44,89 +34,52 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-@app.exception_handler(Exception)
-async def unhandled_exception_handler(_, exc: Exception):
-    if hasattr(exc, "status_code") and hasattr(exc, "detail"):
-        detail = exc.detail
-        if isinstance(detail, dict) and "code" in detail and "message" in detail:
-            return JSONResponse(
-                status_code=exc.status_code,
-                content={
-                    "ok": False,
-                    "error": detail,
-                },
-            )
-
-    return JSONResponse(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={
-            "ok": False,
-            "error": {
-                "code": "INTERNAL_ERROR",
-                "message": "Ocurrió un error interno.",
-            },
-        },
-    )
-
-
-app.include_router(router_v2_auth)
-app.include_router(router_v2_onboarding)
-app.include_router(router_v2_profile)
-app.include_router(router_v2_home)
-app.include_router(router_v2_adventure)
-app.include_router(router_v2_collection)
-app.include_router(router_v2_team)
-app.include_router(router_v2_gyms)
-app.include_router(router_v2_house)
-app.include_router(router_v2_shop)
-app.include_router(router_v2_trade)
-app.include_router(router_v2_ranking)
+app.include_router(router)
+app.include_router(router_boss_idle)
+app.include_router(router_payments)
+app.include_router(router_gyms)
 
 
 @app.get("/")
 def root():
     return {
-        "ok": True,
-        "data": {
-            "status": "ok",
-            "message": "MastersMon API V2 running",
-            "version_backend": BACKEND_MARKER,
-            "modules": ["v2-auth", "v2-onboarding", "v2-profile", "v2-home", "v2-adventure", "v2-collection", "v2-team", "v2-gyms", "v2-house", "v2-trade"],
-        },
+        "status": "ok",
+        "message": "MastersMon API running",
+        "version_backend": BACKEND_MARKER,
+        "router_loaded": ["routes_pokemon", "routes_boss_idle", "routes_payments", "routes_gyms"]
     }
 
 
 @app.get("/health")
 def health():
+    conn = None
+    cur = None
+
     try:
-        with db_cursor() as (_, cursor):
-            cursor.execute(
-                """
-                SELECT
-                    current_database() AS db_name,
-                    current_schema() AS schema_name
-                """
-            )
-            result = cursor.fetchone()
+        conn = get_connection()
+        cur = get_cursor(conn)
+        cur.execute("""
+            SELECT
+                1 AS ok,
+                current_database() AS db_name,
+                current_schema() AS schema_name
+        """)
+        result = cur.fetchone()
 
         return {
-            "ok": True,
-            "data": {
-                "status": "ok",
-                "db_name": result["db_name"],
-                "schema_name": result["schema_name"],
-                "version_backend": BACKEND_MARKER,
-            },
+            "status": "ok",
+            "db": result["ok"],
+            "version_backend": BACKEND_MARKER
         }
     except Exception:
-        return JSONResponse(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={
-                "ok": False,
-                "error": {
-                    "code": "DB_UNAVAILABLE",
-                    "message": "No se pudo validar la conexión con la base de datos.",
-                },
-            },
-        )
+        return {
+            "status": "error",
+            "version_backend": BACKEND_MARKER
+        }
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            release_connection(conn)
+
+            
