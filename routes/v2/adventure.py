@@ -451,9 +451,19 @@ def create_zone_encounter(
                         {
                             "item_code": ball["item_code"],
                             "quantity": ball["quantity"],
-                            "capture_rate_pct": min(
-                                100,
-                                int(((encounter["catch_rate"] / 255.0) * BALL_BONUS.get(ball["item_code"], 1.0)) * 100),
+                            "capture_rate_pct": (
+                                100
+                                if ball["item_code"] == "master_ball"
+                                else min(
+                                    95,
+                                    max(
+                                        5,
+                                        int(
+                                            ((encounter["catch_rate"] / 255.0) * BALL_BONUS.get(ball["item_code"], 1.0))
+                                            * 100
+                                        ),
+                                    ),
+                                )
                             ),
                         }
                         for ball in balls
