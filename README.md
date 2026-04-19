@@ -1,2 +1,0 @@
-# mastersmon-backend
-backend web
