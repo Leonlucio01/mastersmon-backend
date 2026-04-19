@@ -1,10 +1,10 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from routes_pokemon import router
-from routes_boss_idle import router_boss_idle
-from routes_payments import router_payments
-from routes_gyms import router_gyms
+from routes.pokemon_routes import router as pokemon_router
+from routes.boss_idle_routes import router as boss_idle_router
+from routes.payment_routes import router as payment_router
+from routes.gym_routes import router as gym_router
 from database import get_connection, get_cursor, release_connection
 
 BACKEND_MARKER = "mastersmon-backend-2026-03-23-monetization-v1"
@@ -34,10 +34,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(router)
-app.include_router(router_boss_idle)
-app.include_router(router_payments)
-app.include_router(router_gyms)
+# Transitional mounting: the wrapper modules preserve the current runtime behavior
+# while the codebase migrates toward a modular structure.
+app.include_router(pokemon_router)
+app.include_router(boss_idle_router)
+app.include_router(payment_router)
+app.include_router(gym_router)
 
 
 @app.get("/")
@@ -46,7 +48,12 @@ def root():
         "status": "ok",
         "message": "MastersMon API running",
         "version_backend": BACKEND_MARKER,
-        "router_loaded": ["routes_pokemon", "routes_boss_idle", "routes_payments", "routes_gyms"]
+        "router_loaded": [
+            "routes.pokemon_routes",
+            "routes.boss_idle_routes",
+            "routes.payment_routes",
+            "routes.gym_routes",
+        ],
     }
 
 
@@ -58,28 +65,28 @@ def health():
     try:
         conn = get_connection()
         cur = get_cursor(conn)
-        cur.execute("""
+        cur.execute(
+            """
             SELECT
                 1 AS ok,
                 current_database() AS db_name,
                 current_schema() AS schema_name
-        """)
+            """
+        )
         result = cur.fetchone()
 
         return {
             "status": "ok",
             "db": result["ok"],
-            "version_backend": BACKEND_MARKER
+            "version_backend": BACKEND_MARKER,
         }
     except Exception:
         return {
             "status": "error",
-            "version_backend": BACKEND_MARKER
+            "version_backend": BACKEND_MARKER,
         }
     finally:
         if cur:
             cur.close()
         if conn:
             release_connection(conn)
-
-            
