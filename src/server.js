@@ -9,7 +9,6 @@ const { Pool } = pg;
 
 const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL;
-const DEMO_EMAIL = process.env.DEMO_EMAIL || "demo@mastersmon.com";
 
 if (!DATABASE_URL) {
   console.error("Missing DATABASE_URL environment variable.");
@@ -39,19 +38,38 @@ async function query(sql, params = []) {
   return result.rows;
 }
 
-async function getDemoUserId() {
+function getCurrentUserEmail() {
+  const email = process.env.CURRENT_USER_EMAIL;
+
+  if (!email) {
+    const error = new Error("Missing CURRENT_USER_EMAIL environment variable.");
+    error.status = 500;
+    throw error;
+  }
+
+  return email;
+}
+
+async function getCurrentUserId() {
+  const email = getCurrentUserEmail();
   const rows = await query(
     "SELECT id FROM game.users WHERE email = $1 LIMIT 1",
-    [DEMO_EMAIL]
+    [email]
   );
 
   if (!rows.length) {
-    const error = new Error(`Demo user not found: ${DEMO_EMAIL}`);
+    const error = new Error(`Current user not found for CURRENT_USER_EMAIL: ${email}`);
     error.status = 404;
     throw error;
   }
 
   return rows[0].id;
+}
+
+function getLimit(value, fallback, max) {
+  const parsed = Number(value || fallback);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.min(Math.floor(parsed), max);
 }
 
 function asyncRoute(handler) {
@@ -83,35 +101,35 @@ app.get("/api/health", asyncRoute(async (req, res) => {
 }));
 
 // =======================================================
-// Demo player endpoints
+// Current player endpoints
 // =======================================================
 
-app.get("/api/demo/me", asyncRoute(async (req, res) => {
+async function sendCurrentProfile(req, res) {
   const rows = await query(
     "SELECT * FROM game.v_trainer_profile WHERE email = $1 LIMIT 1",
-    [DEMO_EMAIL]
+    [getCurrentUserEmail()]
   );
   res.json(rows[0] || null);
-}));
+}
 
-app.get("/api/demo/inventory", asyncRoute(async (req, res) => {
+async function sendCurrentInventory(req, res) {
   const rows = await query(
     "SELECT * FROM game.v_player_inventory WHERE email = $1 ORDER BY category_slug, item_slug",
-    [DEMO_EMAIL]
+    [getCurrentUserEmail()]
   );
   res.json(rows);
-}));
+}
 
-app.get("/api/demo/team", asyncRoute(async (req, res) => {
+async function sendCurrentTeam(req, res) {
   const rows = await query(
     "SELECT * FROM game.v_player_team WHERE email = $1 ORDER BY slot_number",
-    [DEMO_EMAIL]
+    [getCurrentUserEmail()]
   );
   res.json(rows);
-}));
+}
 
-app.get("/api/demo/collection", asyncRoute(async (req, res) => {
-  const limit = Math.min(Number(req.query.limit || 100), 500);
+async function sendCurrentCollection(req, res) {
+  const limit = getLimit(req.query.limit, 100, 500);
 
   const rows = await query(
     `
@@ -121,25 +139,25 @@ app.get("/api/demo/collection", asyncRoute(async (req, res) => {
     ORDER BY captured_at DESC
     LIMIT $2
     `,
-    [DEMO_EMAIL, limit]
+    [getCurrentUserEmail(), limit]
   );
 
   res.json(rows);
-}));
+}
 
-app.get("/api/demo/pokedex-summary", asyncRoute(async (req, res) => {
+async function sendCurrentPokedexSummary(req, res) {
   const rows = await query(
     "SELECT * FROM game.v_player_pokedex_summary WHERE email = $1 LIMIT 1",
-    [DEMO_EMAIL]
+    [getCurrentUserEmail()]
   );
   res.json(rows[0] || null);
-}));
+}
 
-app.get("/api/demo/pokedex", asyncRoute(async (req, res) => {
+async function sendCurrentPokedex(req, res) {
   const generation = req.query.generation ? Number(req.query.generation) : null;
   const caught = req.query.caught;
 
-  const params = [DEMO_EMAIL];
+  const params = [getCurrentUserEmail()];
   let where = "email = $1";
 
   if (generation) {
@@ -163,7 +181,14 @@ app.get("/api/demo/pokedex", asyncRoute(async (req, res) => {
   );
 
   res.json(rows);
-}));
+}
+
+app.get("/api/me", asyncRoute(sendCurrentProfile));
+app.get("/api/me/inventory", asyncRoute(sendCurrentInventory));
+app.get("/api/me/team", asyncRoute(sendCurrentTeam));
+app.get("/api/me/collection", asyncRoute(sendCurrentCollection));
+app.get("/api/me/pokedex-summary", asyncRoute(sendCurrentPokedexSummary));
+app.get("/api/me/pokedex", asyncRoute(sendCurrentPokedex));
 
 // =======================================================
 // Maps / spawns
@@ -193,9 +218,9 @@ app.get("/api/maps/:slug/spawns", asyncRoute(async (req, res) => {
 // Encounter / capture
 // =======================================================
 
-app.post("/api/demo/encounters", asyncRoute(async (req, res) => {
+async function createEncounter(req, res) {
   const mapSlug = req.body?.mapSlug || req.body?.map_slug || "bosque-verde";
-  const userId = await getDemoUserId();
+  const userId = await getCurrentUserId();
 
   const rows = await query(
     "SELECT * FROM game.create_wild_encounter($1, $2)",
@@ -203,9 +228,9 @@ app.post("/api/demo/encounters", asyncRoute(async (req, res) => {
   );
 
   res.status(201).json(rows[0]);
-}));
+}
 
-app.get("/api/demo/encounters/active", asyncRoute(async (req, res) => {
+async function sendActiveEncounters(req, res) {
   const rows = await query(
     `
     SELECT *
@@ -214,13 +239,13 @@ app.get("/api/demo/encounters/active", asyncRoute(async (req, res) => {
     ORDER BY created_at DESC
     LIMIT 20
     `,
-    [DEMO_EMAIL]
+    [getCurrentUserEmail()]
   );
 
   res.json(rows);
-}));
+}
 
-app.post("/api/demo/captures", asyncRoute(async (req, res) => {
+async function captureEncounter(req, res) {
   const encounterId = req.body?.encounterId || req.body?.encounter_id;
   const ballSlug = req.body?.ballSlug || req.body?.ball_slug || "poke-ball";
 
@@ -231,7 +256,7 @@ app.post("/api/demo/captures", asyncRoute(async (req, res) => {
     });
   }
 
-  const userId = await getDemoUserId();
+  const userId = await getCurrentUserId();
 
   const rows = await query(
     "SELECT * FROM game.attempt_capture($1, $2, $3)",
@@ -239,26 +264,60 @@ app.post("/api/demo/captures", asyncRoute(async (req, res) => {
   );
 
   res.json(rows[0]);
-}));
+}
 
-// Convenience demo endpoint: captures latest active encounter.
-app.post("/api/demo/captures/latest", asyncRoute(async (req, res) => {
+async function captureLatestActiveEncounter(req, res) {
   const ballSlug = req.body?.ballSlug || req.body?.ball_slug || "poke-ball";
-
-  const rows = await query(
-    "SELECT * FROM game.demo_attempt_capture($1)",
-    [ballSlug]
+  const email = getCurrentUserEmail();
+  const activeRows = await query(
+    `
+    SELECT encounter_id
+    FROM game.v_active_encounters
+    WHERE email = $1
+    ORDER BY created_at DESC
+    LIMIT 1
+    `,
+    [email]
   );
 
-  res.json(rows[0]);
-}));
+  if (!activeRows.length) {
+    return res.status(404).json({
+      ok: false,
+      error: "No active encounter found for current user",
+    });
+  }
+
+  req.body = {
+    ...req.body,
+    encounterId: activeRows[0].encounter_id,
+    ballSlug,
+  };
+
+  return captureEncounter(req, res);
+}
+
+app.post("/api/encounters", asyncRoute(createEncounter));
+app.get("/api/encounters/active", asyncRoute(sendActiveEncounters));
+app.post("/api/captures", asyncRoute(captureEncounter));
+
+// Legacy demo endpoints. Keep temporarily for backward compatibility.
+app.get("/api/demo/me", asyncRoute(sendCurrentProfile));
+app.get("/api/demo/inventory", asyncRoute(sendCurrentInventory));
+app.get("/api/demo/team", asyncRoute(sendCurrentTeam));
+app.get("/api/demo/collection", asyncRoute(sendCurrentCollection));
+app.get("/api/demo/pokedex-summary", asyncRoute(sendCurrentPokedexSummary));
+app.get("/api/demo/pokedex", asyncRoute(sendCurrentPokedex));
+app.post("/api/demo/encounters", asyncRoute(createEncounter));
+app.get("/api/demo/encounters/active", asyncRoute(sendActiveEncounters));
+app.post("/api/demo/captures", asyncRoute(captureEncounter));
+app.post("/api/demo/captures/latest", asyncRoute(captureLatestActiveEncounter));
 
 // =======================================================
 // Server activity
 // =======================================================
 
 app.get("/api/server/recent-captures", asyncRoute(async (req, res) => {
-  const limit = Math.min(Number(req.query.limit || 20), 100);
+  const limit = getLimit(req.query.limit, 20, 100);
 
   const rows = await query(
     `
