@@ -18,11 +18,13 @@ if (!CURRENT_USER_EMAIL) {
   process.exit(1);
 }
 
+const needsSsl =
+  DATABASE_URL.includes("sslmode=require") ||
+  (!DATABASE_URL.includes("localhost") && !DATABASE_URL.includes("127.0.0.1"));
+
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: DATABASE_URL.includes("sslmode=require")
-    ? { rejectUnauthorized: false }
-    : undefined,
+  ssl: needsSsl ? { rejectUnauthorized: false } : undefined,
 });
 
 async function countRows(label, sql, params = []) {
@@ -36,11 +38,35 @@ async function validateView(viewName) {
   console.log(`OK view: ${viewName}`);
 }
 
+async function validateColumn(tableName, columnName) {
+  const { rows } = await pool.query(
+    `
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = 'game'
+      AND table_name = $1
+      AND column_name = $2
+    LIMIT 1
+    `,
+    [tableName, columnName]
+  );
+
+  if (!rows.length) {
+    throw new Error(`Missing column: game.${tableName}.${columnName}`);
+  }
+
+  console.log(`OK column: game.${tableName}.${columnName}`);
+}
+
 async function main() {
   try {
     const now = await pool.query("SELECT now() AS server_time");
     console.log(`Connected. DB time: ${now.rows[0].server_time.toISOString()}`);
     console.log(`Current user: ${CURRENT_USER_EMAIL}`);
+
+    await validateColumn("users", "email");
+    await validateColumn("users", "password_hash");
+    await validateColumn("users", "last_login_at");
 
     const user = await pool.query(
       "SELECT id, email FROM game.users WHERE email = $1 LIMIT 1",
@@ -51,7 +77,7 @@ async function main() {
       throw new Error(`Current user not found: ${CURRENT_USER_EMAIL}`);
     }
 
-    console.log(`OK user: ${user.rows[0].id}`);
+    console.log(`OK fallback user: ${user.rows[0].id}`);
 
     await validateView("game.v_trainer_profile");
     await validateView("game.v_player_inventory");
@@ -60,6 +86,7 @@ async function main() {
     await validateView("game.v_player_pokedex_summary");
 
     console.log("\nUseful counts");
+    await countRows("users", "SELECT COUNT(*) FROM game.users");
     await countRows("monster_species", "SELECT COUNT(*) FROM game.monster_species");
     await countRows("maps", "SELECT COUNT(*) FROM game.maps");
     await countRows("map_spawns", "SELECT COUNT(*) FROM game.map_spawns");

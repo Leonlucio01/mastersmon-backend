@@ -2,6 +2,14 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import pg from "pg";
+import {
+  comparePassword,
+  getCurrentUser,
+  hashPassword,
+  normalizeEmail,
+  signToken,
+} from "./auth.js";
+import { createNewPlayer } from "./playerSetup.js";
 
 dotenv.config();
 
@@ -19,7 +27,8 @@ const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: DATABASE_URL.includes("sslmode=require")
     ? { rejectUnauthorized: false }
-    : process.env.NODE_ENV === "production"
+    : process.env.NODE_ENV === "production" ||
+        (!DATABASE_URL.includes("localhost") && !DATABASE_URL.includes("127.0.0.1"))
       ? { rejectUnauthorized: false }
       : undefined,
 });
@@ -38,34 +47,6 @@ async function query(sql, params = []) {
   return result.rows;
 }
 
-function getCurrentUserEmail() {
-  const email = process.env.CURRENT_USER_EMAIL;
-
-  if (!email) {
-    const error = new Error("Missing CURRENT_USER_EMAIL environment variable.");
-    error.status = 500;
-    throw error;
-  }
-
-  return email;
-}
-
-async function getCurrentUserId() {
-  const email = getCurrentUserEmail();
-  const rows = await query(
-    "SELECT id FROM game.users WHERE email = $1 LIMIT 1",
-    [email]
-  );
-
-  if (!rows.length) {
-    const error = new Error(`Current user not found for CURRENT_USER_EMAIL: ${email}`);
-    error.status = 404;
-    throw error;
-  }
-
-  return rows[0].id;
-}
-
 function getLimit(value, fallback, max) {
   const parsed = Number(value || fallback);
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
@@ -79,6 +60,60 @@ function asyncRoute(handler) {
     } catch (error) {
       next(error);
     }
+  };
+}
+
+async function authRequired(req, res, next) {
+  try {
+    req.user = await getCurrentUser(req, query);
+    next();
+  } catch (error) {
+    next(error);
+  }
+}
+
+function publicUser(user) {
+  return {
+    id: user.id,
+    email: user.email,
+  };
+}
+
+async function getProfileByUserId(userId) {
+  const rows = await query(
+    "SELECT * FROM game.v_trainer_profile WHERE user_id = $1 LIMIT 1",
+    [userId]
+  );
+  return rows[0] || null;
+}
+
+function validateAuthPayload({ email, password, trainerName }, { requireTrainerName = false } = {}) {
+  const normalizedEmail = normalizeEmail(email);
+
+  if (!normalizedEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+    const error = new Error("Valid email is required.");
+    error.status = 400;
+    throw error;
+  }
+
+  if (!password || String(password).length < 6) {
+    const error = new Error("Password must be at least 6 characters.");
+    error.status = 400;
+    throw error;
+  }
+
+  const normalizedTrainerName = String(trainerName || "").trim();
+
+  if (requireTrainerName && normalizedTrainerName.length < 2) {
+    const error = new Error("Trainer name must be at least 2 characters.");
+    error.status = 400;
+    throw error;
+  }
+
+  return {
+    email: normalizedEmail,
+    password: String(password),
+    trainerName: normalizedTrainerName,
   };
 }
 
@@ -101,29 +136,136 @@ app.get("/api/health", asyncRoute(async (req, res) => {
 }));
 
 // =======================================================
+// Auth
+// =======================================================
+
+app.post("/api/auth/register", asyncRoute(async (req, res) => {
+  const { email, password, trainerName } = validateAuthPayload(req.body || {}, {
+    requireTrainerName: true,
+  });
+
+  const existingRows = await query(
+    "SELECT id FROM game.users WHERE email = $1 LIMIT 1",
+    [email]
+  );
+
+  if (existingRows.length) {
+    return res.status(409).json({
+      ok: false,
+      error: "Email is already registered.",
+    });
+  }
+
+  const passwordHash = await hashPassword(password);
+
+  try {
+    const { user } = await createNewPlayer(pool, {
+      email,
+      passwordHash,
+      trainerName,
+    });
+    const profile = await getProfileByUserId(user.id);
+    const token = signToken(user);
+
+    res.status(201).json({
+      ok: true,
+      token,
+      user: publicUser(user),
+      profile,
+    });
+  } catch (error) {
+    if (error.code === "23505") {
+      error.status = 409;
+      error.message = "Email or trainer name is already registered.";
+    }
+    throw error;
+  }
+}));
+
+app.post("/api/auth/login", asyncRoute(async (req, res) => {
+  const { email, password } = validateAuthPayload(req.body || {});
+
+  const rows = await query(
+    "SELECT id, email, password_hash FROM game.users WHERE email = $1 AND is_active = true LIMIT 1",
+    [email]
+  );
+
+  if (!rows.length || !rows[0].password_hash) {
+    return res.status(401).json({
+      ok: false,
+      error: "Invalid email or password.",
+    });
+  }
+
+  const valid = await comparePassword(password, rows[0].password_hash);
+  if (!valid) {
+    return res.status(401).json({
+      ok: false,
+      error: "Invalid email or password.",
+    });
+  }
+
+  const user = {
+    id: rows[0].id,
+    email: rows[0].email,
+  };
+
+  await query(
+    "UPDATE game.users SET last_login_at = now(), updated_at = now() WHERE id = $1",
+    [user.id]
+  );
+
+  const profile = await getProfileByUserId(user.id);
+  const token = signToken(user);
+
+  res.json({
+    ok: true,
+    token,
+    user: publicUser(user),
+    profile,
+  });
+}));
+
+app.get("/api/auth/me", authRequired, asyncRoute(async (req, res) => {
+  const profile = await getProfileByUserId(req.user.id);
+
+  res.json({
+    ok: true,
+    user: publicUser(req.user),
+    profile,
+  });
+}));
+
+app.post("/api/auth/logout", (req, res) => {
+  res.json({
+    ok: true,
+  });
+});
+
+// =======================================================
 // Current player endpoints
 // =======================================================
 
 async function sendCurrentProfile(req, res) {
   const rows = await query(
-    "SELECT * FROM game.v_trainer_profile WHERE email = $1 LIMIT 1",
-    [getCurrentUserEmail()]
+    "SELECT * FROM game.v_trainer_profile WHERE user_id = $1 LIMIT 1",
+    [req.user.id]
   );
   res.json(rows[0] || null);
 }
 
 async function sendCurrentInventory(req, res) {
   const rows = await query(
-    "SELECT * FROM game.v_player_inventory WHERE email = $1 ORDER BY category_slug, item_slug",
-    [getCurrentUserEmail()]
+    "SELECT * FROM game.v_player_inventory WHERE user_id = $1 ORDER BY category_slug, item_slug",
+    [req.user.id]
   );
   res.json(rows);
 }
 
 async function sendCurrentTeam(req, res) {
   const rows = await query(
-    "SELECT * FROM game.v_player_team WHERE email = $1 ORDER BY slot_number",
-    [getCurrentUserEmail()]
+    "SELECT * FROM game.v_player_team WHERE user_id = $1 ORDER BY slot_number",
+    [req.user.id]
   );
   res.json(rows);
 }
@@ -135,11 +277,11 @@ async function sendCurrentCollection(req, res) {
     `
     SELECT *
     FROM game.v_player_collection
-    WHERE email = $1
+    WHERE user_id = $1
     ORDER BY captured_at DESC
     LIMIT $2
     `,
-    [getCurrentUserEmail(), limit]
+    [req.user.id, limit]
   );
 
   res.json(rows);
@@ -147,8 +289,8 @@ async function sendCurrentCollection(req, res) {
 
 async function sendCurrentPokedexSummary(req, res) {
   const rows = await query(
-    "SELECT * FROM game.v_player_pokedex_summary WHERE email = $1 LIMIT 1",
-    [getCurrentUserEmail()]
+    "SELECT * FROM game.v_player_pokedex_summary WHERE user_id = $1 LIMIT 1",
+    [req.user.id]
   );
   res.json(rows[0] || null);
 }
@@ -157,8 +299,8 @@ async function sendCurrentPokedex(req, res) {
   const generation = req.query.generation ? Number(req.query.generation) : null;
   const caught = req.query.caught;
 
-  const params = [getCurrentUserEmail()];
-  let where = "email = $1";
+  const params = [req.user.id];
+  let where = "user_id = $1";
 
   if (generation) {
     params.push(generation);
@@ -183,12 +325,12 @@ async function sendCurrentPokedex(req, res) {
   res.json(rows);
 }
 
-app.get("/api/me", asyncRoute(sendCurrentProfile));
-app.get("/api/me/inventory", asyncRoute(sendCurrentInventory));
-app.get("/api/me/team", asyncRoute(sendCurrentTeam));
-app.get("/api/me/collection", asyncRoute(sendCurrentCollection));
-app.get("/api/me/pokedex-summary", asyncRoute(sendCurrentPokedexSummary));
-app.get("/api/me/pokedex", asyncRoute(sendCurrentPokedex));
+app.get("/api/me", authRequired, asyncRoute(sendCurrentProfile));
+app.get("/api/me/inventory", authRequired, asyncRoute(sendCurrentInventory));
+app.get("/api/me/team", authRequired, asyncRoute(sendCurrentTeam));
+app.get("/api/me/collection", authRequired, asyncRoute(sendCurrentCollection));
+app.get("/api/me/pokedex-summary", authRequired, asyncRoute(sendCurrentPokedexSummary));
+app.get("/api/me/pokedex", authRequired, asyncRoute(sendCurrentPokedex));
 
 // =======================================================
 // Maps / spawns
@@ -220,11 +362,10 @@ app.get("/api/maps/:slug/spawns", asyncRoute(async (req, res) => {
 
 async function createEncounter(req, res) {
   const mapSlug = req.body?.mapSlug || req.body?.map_slug || "bosque-verde";
-  const userId = await getCurrentUserId();
 
   const rows = await query(
     "SELECT * FROM game.create_wild_encounter($1, $2)",
-    [userId, mapSlug]
+    [req.user.id, mapSlug]
   );
 
   res.status(201).json(rows[0]);
@@ -235,11 +376,11 @@ async function sendActiveEncounters(req, res) {
     `
     SELECT *
     FROM game.v_active_encounters
-    WHERE email = $1
+    WHERE user_id = $1
     ORDER BY created_at DESC
     LIMIT 20
     `,
-    [getCurrentUserEmail()]
+    [req.user.id]
   );
 
   res.json(rows);
@@ -256,11 +397,9 @@ async function captureEncounter(req, res) {
     });
   }
 
-  const userId = await getCurrentUserId();
-
   const rows = await query(
     "SELECT * FROM game.attempt_capture($1, $2, $3)",
-    [userId, encounterId, ballSlug]
+    [req.user.id, encounterId, ballSlug]
   );
 
   res.json(rows[0]);
@@ -268,16 +407,15 @@ async function captureEncounter(req, res) {
 
 async function captureLatestActiveEncounter(req, res) {
   const ballSlug = req.body?.ballSlug || req.body?.ball_slug || "poke-ball";
-  const email = getCurrentUserEmail();
   const activeRows = await query(
     `
     SELECT encounter_id
     FROM game.v_active_encounters
-    WHERE email = $1
+    WHERE user_id = $1
     ORDER BY created_at DESC
     LIMIT 1
     `,
-    [email]
+    [req.user.id]
   );
 
   if (!activeRows.length) {
@@ -296,21 +434,21 @@ async function captureLatestActiveEncounter(req, res) {
   return captureEncounter(req, res);
 }
 
-app.post("/api/encounters", asyncRoute(createEncounter));
-app.get("/api/encounters/active", asyncRoute(sendActiveEncounters));
-app.post("/api/captures", asyncRoute(captureEncounter));
+app.post("/api/encounters", authRequired, asyncRoute(createEncounter));
+app.get("/api/encounters/active", authRequired, asyncRoute(sendActiveEncounters));
+app.post("/api/captures", authRequired, asyncRoute(captureEncounter));
 
 // Legacy demo endpoints. Keep temporarily for backward compatibility.
-app.get("/api/demo/me", asyncRoute(sendCurrentProfile));
-app.get("/api/demo/inventory", asyncRoute(sendCurrentInventory));
-app.get("/api/demo/team", asyncRoute(sendCurrentTeam));
-app.get("/api/demo/collection", asyncRoute(sendCurrentCollection));
-app.get("/api/demo/pokedex-summary", asyncRoute(sendCurrentPokedexSummary));
-app.get("/api/demo/pokedex", asyncRoute(sendCurrentPokedex));
-app.post("/api/demo/encounters", asyncRoute(createEncounter));
-app.get("/api/demo/encounters/active", asyncRoute(sendActiveEncounters));
-app.post("/api/demo/captures", asyncRoute(captureEncounter));
-app.post("/api/demo/captures/latest", asyncRoute(captureLatestActiveEncounter));
+app.get("/api/demo/me", authRequired, asyncRoute(sendCurrentProfile));
+app.get("/api/demo/inventory", authRequired, asyncRoute(sendCurrentInventory));
+app.get("/api/demo/team", authRequired, asyncRoute(sendCurrentTeam));
+app.get("/api/demo/collection", authRequired, asyncRoute(sendCurrentCollection));
+app.get("/api/demo/pokedex-summary", authRequired, asyncRoute(sendCurrentPokedexSummary));
+app.get("/api/demo/pokedex", authRequired, asyncRoute(sendCurrentPokedex));
+app.post("/api/demo/encounters", authRequired, asyncRoute(createEncounter));
+app.get("/api/demo/encounters/active", authRequired, asyncRoute(sendActiveEncounters));
+app.post("/api/demo/captures", authRequired, asyncRoute(captureEncounter));
+app.post("/api/demo/captures/latest", authRequired, asyncRoute(captureLatestActiveEncounter));
 
 // =======================================================
 // Server activity
