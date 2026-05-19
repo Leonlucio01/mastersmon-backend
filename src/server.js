@@ -53,6 +53,13 @@ function getLimit(value, fallback, max) {
   return Math.min(Math.floor(parsed), max);
 }
 
+function createHttpError(status, code, message) {
+  const error = new Error(message);
+  error.status = status;
+  error.code = code;
+  return error;
+}
+
 function asyncRoute(handler) {
   return async (req, res, next) => {
     try {
@@ -553,6 +560,204 @@ app.post("/api/me/team/auto", authRequired, asyncRoute(autoBuildTeam));
 app.get("/api/me/collection", authRequired, asyncRoute(sendCurrentCollection));
 app.get("/api/me/pokedex-summary", authRequired, asyncRoute(sendCurrentPokedexSummary));
 app.get("/api/me/pokedex", authRequired, asyncRoute(sendCurrentPokedex));
+
+// =======================================================
+// Shop
+// =======================================================
+
+function normalizeShopQuantity(value) {
+  const quantity = Number(value);
+
+  if (!Number.isInteger(quantity) || quantity < 1 || quantity > 99) {
+    throw createHttpError(400, "INVALID_QUANTITY", "quantity must be an integer between 1 and 99.");
+  }
+
+  return quantity;
+}
+
+function isShopItemPurchasable(item) {
+  return Number(item?.cost_gold || 0) > 0 || Number(item?.cost_diamonds || 0) > 0;
+}
+
+async function getShopItems(req, res) {
+  const rows = await query(
+    `
+    SELECT
+      i.id AS item_id,
+      i.slug,
+      i.name,
+      COALESCE(i.display_name, i.name) AS display_name,
+      c.slug AS category_slug,
+      c.name AS category_name,
+      i.icon_path,
+      i.cost_gold,
+      COALESCE(i.cost_diamonds, 0) AS cost_diamonds,
+      i.is_premium,
+      i.is_custom,
+      i.is_tradeable,
+      i.capture_bonus,
+      i.heal_amount,
+      (COALESCE(i.cost_gold, 0) > 0 OR COALESCE(i.cost_diamonds, 0) > 0) AS is_purchasable
+    FROM game.items i
+    LEFT JOIN game.item_categories c ON c.id = i.category_id
+    ORDER BY
+      (COALESCE(i.cost_gold, 0) > 0 OR COALESCE(i.cost_diamonds, 0) > 0) DESC,
+      i.is_premium,
+      c.slug,
+      i.cost_gold,
+      i.cost_diamonds,
+      i.slug
+    `
+  );
+
+  res.json(rows);
+}
+
+async function buyShopItem(req, res) {
+  const itemSlug = String(req.body?.itemSlug || req.body?.item_slug || "").trim();
+  const quantity = normalizeShopQuantity(req.body?.quantity ?? 1);
+
+  if (!itemSlug) {
+    throw createHttpError(400, "ITEM_NOT_FOUND", "itemSlug is required.");
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const itemResult = await client.query(
+      `
+      SELECT
+        i.id AS item_id,
+        i.slug,
+        i.name,
+        COALESCE(i.display_name, i.name) AS display_name,
+        c.slug AS category_slug,
+        c.name AS category_name,
+        i.icon_path,
+        i.cost_gold,
+        COALESCE(i.cost_diamonds, 0) AS cost_diamonds,
+        i.is_premium,
+        i.is_custom,
+        i.is_tradeable,
+        i.capture_bonus,
+        i.heal_amount
+      FROM game.items i
+      LEFT JOIN game.item_categories c ON c.id = i.category_id
+      WHERE i.slug = $1
+      LIMIT 1
+      `,
+      [itemSlug]
+    );
+
+    if (!itemResult.rows.length) {
+      throw createHttpError(404, "ITEM_NOT_FOUND", "Item was not found.");
+    }
+
+    const item = itemResult.rows[0];
+    if (!isShopItemPurchasable(item)) {
+      throw createHttpError(400, "ITEM_NOT_PURCHASABLE", "Item is not purchasable.");
+    }
+
+    const walletResult = await client.query(
+      `
+      SELECT user_id, gold, diamonds, boss_tickets, season_exp
+      FROM game.trainer_wallets
+      WHERE user_id = $1
+      FOR UPDATE
+      `,
+      [req.user.id]
+    );
+
+    if (!walletResult.rows.length) {
+      throw createHttpError(404, "SHOP_BUY_FAILED", "Wallet was not found.");
+    }
+
+    const wallet = walletResult.rows[0];
+    const totalGold = Number(item.cost_gold || 0) * quantity;
+    const totalDiamonds = Number(item.cost_diamonds || 0) * quantity;
+
+    if (Number(wallet.gold) < totalGold) {
+      throw createHttpError(402, "INSUFFICIENT_GOLD", "Not enough gold.");
+    }
+
+    if (Number(wallet.diamonds) < totalDiamonds) {
+      throw createHttpError(402, "INSUFFICIENT_DIAMONDS", "Not enough diamonds.");
+    }
+
+    const updatedWallet = await client.query(
+      `
+      UPDATE game.trainer_wallets
+      SET
+        gold = gold - $2,
+        diamonds = diamonds - $3,
+        updated_at = now()
+      WHERE user_id = $1
+      RETURNING user_id, gold, diamonds, boss_tickets, season_exp, updated_at
+      `,
+      [req.user.id, totalGold, totalDiamonds]
+    );
+
+    const inventoryResult = await client.query(
+      `
+      INSERT INTO game.player_inventory (user_id, item_id, quantity)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (user_id, item_id)
+      DO UPDATE SET
+        quantity = game.player_inventory.quantity + EXCLUDED.quantity,
+        updated_at = now()
+      RETURNING user_id, item_id, quantity, updated_at
+      `,
+      [req.user.id, item.item_id, quantity]
+    );
+
+    if (totalGold > 0) {
+      await client.query(
+        `
+        INSERT INTO game.wallet_transactions (user_id, currency, amount, reason, reference_type, reference_id)
+        VALUES ($1, 'gold', $2, 'shop_purchase', 'item', $3)
+        `,
+        [req.user.id, -totalGold, item.item_id]
+      );
+    }
+
+    if (totalDiamonds > 0) {
+      await client.query(
+        `
+        INSERT INTO game.wallet_transactions (user_id, currency, amount, reason, reference_type, reference_id)
+        VALUES ($1, 'diamonds', $2, 'shop_purchase', 'item', $3)
+        `,
+        [req.user.id, -totalDiamonds, item.item_id]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    res.json({
+      ok: true,
+      item: {
+        ...item,
+        is_purchasable: true,
+      },
+      quantity,
+      wallet: updatedWallet.rows[0],
+      inventoryItem: inventoryResult.rows[0],
+    });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (!error.code || error.code === "23514" || error.code === "23503") {
+      error.status = error.status || 500;
+      error.code = "SHOP_BUY_FAILED";
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+app.get("/api/shop/items", authRequired, asyncRoute(getShopItems));
+app.post("/api/shop/buy", authRequired, asyncRoute(buyShopItem));
 
 // =======================================================
 // Maps / spawns
