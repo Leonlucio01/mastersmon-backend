@@ -93,12 +93,14 @@ function validateAuthPayload({ email, password, trainerName }, { requireTrainerN
   if (!normalizedEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
     const error = new Error("Valid email is required.");
     error.status = 400;
+    error.code = "EMAIL_INVALID";
     throw error;
   }
 
   if (!password || String(password).length < 6) {
     const error = new Error("Password must be at least 6 characters.");
     error.status = 400;
+    error.code = "PASSWORD_TOO_SHORT";
     throw error;
   }
 
@@ -107,6 +109,7 @@ function validateAuthPayload({ email, password, trainerName }, { requireTrainerN
   if (requireTrainerName && normalizedTrainerName.length < 2) {
     const error = new Error("Trainer name must be at least 2 characters.");
     error.status = 400;
+    error.code = "TRAINER_NAME_REQUIRED";
     throw error;
   }
 
@@ -152,6 +155,7 @@ app.post("/api/auth/register", asyncRoute(async (req, res) => {
   if (existingRows.length) {
     return res.status(409).json({
       ok: false,
+      code: "EMAIL_USED",
       error: "Email is already registered.",
     });
   }
@@ -176,7 +180,13 @@ app.post("/api/auth/register", asyncRoute(async (req, res) => {
   } catch (error) {
     if (error.code === "23505") {
       error.status = 409;
-      error.message = "Email or trainer name is already registered.";
+      if (String(error.constraint || "").includes("trainer_profiles_trainer_name")) {
+        error.code = "TRAINER_NAME_USED";
+        error.message = "Trainer name is already registered.";
+      } else {
+        error.code = "EMAIL_USED";
+        error.message = "Email is already registered.";
+      }
     }
     throw error;
   }
@@ -193,6 +203,7 @@ app.post("/api/auth/login", asyncRoute(async (req, res) => {
   if (!rows.length || !rows[0].password_hash) {
     return res.status(401).json({
       ok: false,
+      code: "INVALID_CREDENTIALS",
       error: "Invalid email or password.",
     });
   }
@@ -201,6 +212,7 @@ app.post("/api/auth/login", asyncRoute(async (req, res) => {
   if (!valid) {
     return res.status(401).json({
       ok: false,
+      code: "INVALID_CREDENTIALS",
       error: "Invalid email or password.",
     });
   }
@@ -393,6 +405,7 @@ async function captureEncounter(req, res) {
   if (!encounterId) {
     return res.status(400).json({
       ok: false,
+      code: "ENCOUNTER_ID_REQUIRED",
       error: "encounterId is required",
     });
   }
@@ -482,6 +495,7 @@ app.use((error, req, res, next) => {
 
   res.status(error.status || 500).json({
     ok: false,
+    code: error.code || "INTERNAL_ERROR",
     error: error.message || "Internal server error",
   });
 });

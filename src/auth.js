@@ -50,9 +50,10 @@ export async function getUserFromToken(req, query) {
   let payload;
   try {
     payload = jwt.verify(match[1], secret);
-  } catch {
-    const error = new Error("Invalid or expired token.");
+  } catch (jwtError) {
+    const error = new Error(jwtError?.name === "TokenExpiredError" ? "Token expired." : "Invalid token.");
     error.status = 401;
+    error.code = jwtError?.name === "TokenExpiredError" ? "TOKEN_EXPIRED" : "TOKEN_INVALID";
     throw error;
   }
 
@@ -64,6 +65,7 @@ export async function getUserFromToken(req, query) {
   if (!rows.length) {
     const error = new Error("Authenticated user not found.");
     error.status = 401;
+    error.code = "USER_NOT_FOUND";
     throw error;
   }
 
@@ -81,6 +83,7 @@ export async function getCurrentUser(req, query) {
   if (!fallbackEmail) {
     const error = new Error("Authentication required.");
     error.status = 401;
+    error.code = "AUTH_REQUIRED";
     throw error;
   }
 
@@ -93,6 +96,7 @@ export async function getCurrentUser(req, query) {
   if (!rows.length) {
     const error = new Error("Fallback current user not found.");
     error.status = 401;
+    error.code = "FALLBACK_USER_NOT_FOUND";
     throw error;
   }
 
