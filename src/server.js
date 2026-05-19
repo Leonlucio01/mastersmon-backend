@@ -275,11 +275,218 @@ async function sendCurrentInventory(req, res) {
 }
 
 async function sendCurrentTeam(req, res) {
+  await ensureTeamSlots(req.user.id);
   const rows = await query(
     "SELECT * FROM game.v_player_team WHERE user_id = $1 ORDER BY slot_number",
     [req.user.id]
   );
   res.json(rows);
+}
+
+function parseTeamSlot(value) {
+  const slotNumber = Number(value);
+
+  if (!Number.isInteger(slotNumber) || slotNumber < 1 || slotNumber > 6) {
+    const error = new Error("slotNumber must be between 1 and 6.");
+    error.status = 400;
+    error.code = "INVALID_SLOT";
+    throw error;
+  }
+
+  return slotNumber;
+}
+
+async function ensureTeamSlots(userId, client = pool) {
+  for (let slotNumber = 1; slotNumber <= 6; slotNumber += 1) {
+    await client.query(
+      `
+      INSERT INTO game.player_team_slots (user_id, slot_number)
+      VALUES ($1, $2)
+      ON CONFLICT (user_id, slot_number) DO NOTHING
+      `,
+      [userId, slotNumber]
+    );
+  }
+}
+
+async function getCurrentTeamRows(userId, client = pool) {
+  const result = await client.query(
+    "SELECT * FROM game.v_player_team WHERE user_id = $1 ORDER BY slot_number",
+    [userId]
+  );
+  return result.rows;
+}
+
+async function assertOwnedPlayerMonster(client, userId, playerMonsterId) {
+  if (!playerMonsterId || typeof playerMonsterId !== "string") {
+    const error = new Error("playerMonsterId is required.");
+    error.status = 400;
+    error.code = "MONSTER_NOT_FOUND";
+    throw error;
+  }
+
+  const result = await client.query(
+    `
+    SELECT id, user_id
+    FROM game.player_monsters
+    WHERE id = $1
+    LIMIT 1
+    `,
+    [playerMonsterId]
+  );
+
+  if (!result.rows.length) {
+    const error = new Error("Monster was not found.");
+    error.status = 404;
+    error.code = "MONSTER_NOT_FOUND";
+    throw error;
+  }
+
+  if (String(result.rows[0].user_id) !== String(userId)) {
+    const error = new Error("Monster does not belong to the current user.");
+    error.status = 403;
+    error.code = "MONSTER_NOT_OWNED";
+    throw error;
+  }
+}
+
+async function updateTeamSlot(req, res) {
+  const slotNumber = parseTeamSlot(req.body?.slotNumber ?? req.body?.slot_number);
+  const playerMonsterId = req.body?.playerMonsterId || req.body?.player_monster_id;
+  const client = await pool.connect();
+
+  try {
+    await assertOwnedPlayerMonster(client, req.user.id, playerMonsterId);
+
+    await client.query("BEGIN");
+    await ensureTeamSlots(req.user.id, client);
+    await client.query(
+      `
+      UPDATE game.player_team_slots
+      SET player_monster_id = NULL, updated_at = now()
+      WHERE user_id = $1
+        AND player_monster_id = $2
+        AND slot_number <> $3
+      `,
+      [req.user.id, playerMonsterId, slotNumber]
+    );
+    await client.query(
+      `
+      INSERT INTO game.player_team_slots (user_id, slot_number, player_monster_id)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (user_id, slot_number)
+      DO UPDATE SET
+        player_monster_id = EXCLUDED.player_monster_id,
+        updated_at = now()
+      `,
+      [req.user.id, slotNumber, playerMonsterId]
+    );
+    await client.query("COMMIT");
+
+    res.json(await getCurrentTeamRows(req.user.id));
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (!error.code || error.code === "23505") {
+      error.status = error.status || 500;
+      error.code = error.code === "23505" ? "TEAM_UPDATE_FAILED" : (error.code || "TEAM_UPDATE_FAILED");
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function clearTeamSlot(req, res) {
+  const slotNumber = parseTeamSlot(req.params.slotNumber);
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+    await ensureTeamSlots(req.user.id, client);
+    await client.query(
+      `
+      UPDATE game.player_team_slots
+      SET player_monster_id = NULL, updated_at = now()
+      WHERE user_id = $1
+        AND slot_number = $2
+      `,
+      [req.user.id, slotNumber]
+    );
+    await client.query("COMMIT");
+
+    res.json(await getCurrentTeamRows(req.user.id));
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    error.status = error.status || 500;
+    error.code = error.code || "TEAM_UPDATE_FAILED";
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function autoBuildTeam(req, res) {
+  const client = await pool.connect();
+
+  try {
+    const best = await client.query(
+      `
+      SELECT pm.id
+      FROM game.player_monsters pm
+      JOIN game.monster_species ms ON ms.id = pm.species_id
+      WHERE pm.user_id = $1
+      ORDER BY
+        pm.level DESC,
+        CASE LOWER(COALESCE(ms.rarity, 'common'))
+          WHEN 'mythic' THEN 6
+          WHEN 'legendary' THEN 5
+          WHEN 'legend' THEN 5
+          WHEN 'epic' THEN 4
+          WHEN 'rare' THEN 3
+          WHEN 'uncommon' THEN 2
+          ELSE 1
+        END DESC,
+        pm.captured_at ASC,
+        pm.id ASC
+      LIMIT 6
+      `,
+      [req.user.id]
+    );
+
+    await client.query("BEGIN");
+    await ensureTeamSlots(req.user.id, client);
+    await client.query(
+      `
+      UPDATE game.player_team_slots
+      SET player_monster_id = NULL, updated_at = now()
+      WHERE user_id = $1
+      `,
+      [req.user.id]
+    );
+
+    for (let index = 0; index < best.rows.length; index += 1) {
+      await client.query(
+        `
+        UPDATE game.player_team_slots
+        SET player_monster_id = $3, updated_at = now()
+        WHERE user_id = $1
+          AND slot_number = $2
+        `,
+        [req.user.id, index + 1, best.rows[index].id]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    res.json(await getCurrentTeamRows(req.user.id));
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    error.status = error.status || 500;
+    error.code = error.code || "TEAM_UPDATE_FAILED";
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 async function sendCurrentCollection(req, res) {
@@ -340,6 +547,9 @@ async function sendCurrentPokedex(req, res) {
 app.get("/api/me", authRequired, asyncRoute(sendCurrentProfile));
 app.get("/api/me/inventory", authRequired, asyncRoute(sendCurrentInventory));
 app.get("/api/me/team", authRequired, asyncRoute(sendCurrentTeam));
+app.post("/api/me/team/slots", authRequired, asyncRoute(updateTeamSlot));
+app.delete("/api/me/team/slots/:slotNumber", authRequired, asyncRoute(clearTeamSlot));
+app.post("/api/me/team/auto", authRequired, asyncRoute(autoBuildTeam));
 app.get("/api/me/collection", authRequired, asyncRoute(sendCurrentCollection));
 app.get("/api/me/pokedex-summary", authRequired, asyncRoute(sendCurrentPokedexSummary));
 app.get("/api/me/pokedex", authRequired, asyncRoute(sendCurrentPokedex));
