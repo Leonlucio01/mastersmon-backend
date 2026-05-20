@@ -575,6 +575,29 @@ function normalizeShopQuantity(value) {
   return quantity;
 }
 
+const USABLE_ITEM_SLUGS = new Set([
+  "potion",
+  "super-potion",
+  "hyper-potion",
+  "revive",
+  "rare-candy",
+]);
+
+function calculateMonsterMaxHp(monster) {
+  return 20 + Number(monster.level || 1) * 3 + Number(monster.iv_hp || 0);
+}
+
+function defaultHealAmount(item) {
+  const fallback = {
+    "potion": 20,
+    "super-potion": 60,
+    "hyper-potion": 120,
+    "revive": 0,
+  };
+
+  return Number(item.heal_amount || fallback[item.slug] || 0);
+}
+
 function isShopItemPurchasable(item) {
   return Number(item?.cost_gold || 0) > 0 || Number(item?.cost_diamonds || 0) > 0;
 }
@@ -758,6 +781,232 @@ async function buyShopItem(req, res) {
 
 app.get("/api/shop/items", authRequired, asyncRoute(getShopItems));
 app.post("/api/shop/buy", authRequired, asyncRoute(buyShopItem));
+
+// =======================================================
+// Item usage
+// =======================================================
+
+async function getMonsterSnapshot(userId, playerMonsterId, client = pool) {
+  const result = await client.query(
+    `
+    SELECT
+      c.*,
+      (20 + c.level * 3 + COALESCE(c.iv_hp, 0)) AS max_hp
+    FROM game.v_player_collection c
+    WHERE c.user_id = $1
+      AND c.player_monster_id = $2
+    LIMIT 1
+    `,
+    [userId, playerMonsterId]
+  );
+
+  return result.rows[0] || null;
+}
+
+async function getCurrentInventoryRows(userId, client = pool) {
+  const result = await client.query(
+    "SELECT * FROM game.v_player_inventory WHERE user_id = $1 ORDER BY category_slug, item_slug",
+    [userId]
+  );
+  return result.rows;
+}
+
+async function getMonsterDetail(req, res) {
+  const playerMonsterId = req.params.playerMonsterId;
+
+  if (!playerMonsterId) {
+    throw createHttpError(400, "MONSTER_NOT_FOUND", "playerMonsterId is required.");
+  }
+
+  const monster = await getMonsterSnapshot(req.user.id, playerMonsterId);
+  if (!monster) {
+    throw createHttpError(404, "MONSTER_NOT_FOUND", "Monster was not found.");
+  }
+
+  res.json(monster);
+}
+
+async function useInventoryItem(req, res) {
+  const itemSlug = String(req.body?.itemSlug || req.body?.item_slug || "").trim();
+  const playerMonsterId = String(req.body?.playerMonsterId || req.body?.player_monster_id || "").trim();
+  const quantity = normalizeShopQuantity(req.body?.quantity ?? 1);
+
+  if (!itemSlug) {
+    throw createHttpError(400, "ITEM_NOT_FOUND", "itemSlug is required.");
+  }
+
+  if (!playerMonsterId) {
+    throw createHttpError(400, "MONSTER_NOT_FOUND", "playerMonsterId is required.");
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const itemResult = await client.query(
+      `
+      SELECT
+        i.id AS item_id,
+        i.slug,
+        i.name,
+        COALESCE(i.display_name, i.name) AS display_name,
+        c.slug AS category_slug,
+        c.name AS category_name,
+        i.icon_path,
+        i.heal_amount,
+        i.capture_bonus
+      FROM game.items i
+      LEFT JOIN game.item_categories c ON c.id = i.category_id
+      WHERE i.slug = $1
+      LIMIT 1
+      `,
+      [itemSlug]
+    );
+
+    if (!itemResult.rows.length) {
+      throw createHttpError(404, "ITEM_NOT_FOUND", "Item was not found.");
+    }
+
+    const item = itemResult.rows[0];
+    if (!USABLE_ITEM_SLUGS.has(item.slug)) {
+      throw createHttpError(400, "ITEM_NOT_USABLE", "Item is not usable yet.");
+    }
+
+    const inventoryResult = await client.query(
+      `
+      SELECT user_id, item_id, quantity
+      FROM game.player_inventory
+      WHERE user_id = $1
+        AND item_id = $2
+      FOR UPDATE
+      `,
+      [req.user.id, item.item_id]
+    );
+
+    if (!inventoryResult.rows.length || Number(inventoryResult.rows[0].quantity) < quantity) {
+      throw createHttpError(400, "INSUFFICIENT_ITEM", "Not enough items.");
+    }
+
+    const monsterResult = await client.query(
+      `
+      SELECT *
+      FROM game.player_monsters
+      WHERE id = $1
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [playerMonsterId]
+    );
+
+    if (!monsterResult.rows.length) {
+      throw createHttpError(404, "MONSTER_NOT_FOUND", "Monster was not found.");
+    }
+
+    const monster = monsterResult.rows[0];
+    if (String(monster.user_id) !== String(req.user.id)) {
+      throw createHttpError(403, "MONSTER_NOT_OWNED", "Monster does not belong to the current user.");
+    }
+
+    const maxHp = calculateMonsterMaxHp(monster);
+    const currentHp = monster.current_hp === null || monster.current_hp === undefined
+      ? maxHp
+      : Number(monster.current_hp);
+    let nextLevel = Number(monster.level || 1);
+    let nextHp = currentHp;
+    let resultCode = "ITEM_USED";
+    let message = "Item used.";
+
+    if (["potion", "super-potion", "hyper-potion"].includes(item.slug)) {
+      if (currentHp >= maxHp) {
+        throw createHttpError(400, "MONSTER_ALREADY_FULL_HP", "Monster is already at full HP.");
+      }
+
+      const healAmount = defaultHealAmount(item) * quantity;
+      nextHp = Math.min(maxHp, currentHp + healAmount);
+      resultCode = "MONSTER_HEALED";
+      message = `${item.display_name} restored ${nextHp - currentHp} HP.`;
+    } else if (item.slug === "revive") {
+      if (currentHp > 0) {
+        throw createHttpError(400, "MONSTER_NOT_FAINTED", "Monster is not fainted.");
+      }
+
+      nextHp = Math.max(1, Math.floor(maxHp / 2));
+      resultCode = "MONSTER_REVIVED";
+      message = "Monster was revived.";
+    } else if (item.slug === "rare-candy") {
+      if (nextLevel >= 100 || nextLevel + quantity > 100) {
+        throw createHttpError(400, "MAX_LEVEL_REACHED", "Monster has reached the maximum level.");
+      }
+
+      const wasFullHp = currentHp >= maxHp;
+      nextLevel += quantity;
+      const nextMaxHp = calculateMonsterMaxHp({
+        ...monster,
+        level: nextLevel,
+      });
+      nextHp = wasFullHp ? nextMaxHp : currentHp;
+      resultCode = "LEVEL_INCREASED";
+      message = "Monster level increased.";
+    }
+
+    await client.query(
+      `
+      UPDATE game.player_monsters
+      SET
+        level = $2,
+        current_hp = $3,
+        updated_at = now()
+      WHERE id = $1
+      `,
+      [monster.id, nextLevel, nextHp]
+    );
+
+    await client.query(
+      `
+      UPDATE game.player_inventory
+      SET quantity = quantity - $3,
+          updated_at = now()
+      WHERE user_id = $1
+        AND item_id = $2
+      `,
+      [req.user.id, item.item_id, quantity]
+    );
+
+    await client.query("COMMIT");
+
+    const [inventory, updatedMonster, team] = await Promise.all([
+      getCurrentInventoryRows(req.user.id),
+      getMonsterSnapshot(req.user.id, monster.id),
+      getCurrentTeamRows(req.user.id),
+    ]);
+
+    res.json({
+      ok: true,
+      result: {
+        code: resultCode,
+        message,
+      },
+      item,
+      quantity,
+      monster: updatedMonster,
+      inventory,
+      team,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (!error.code || error.code === "23514" || error.code === "23503") {
+      error.status = error.status || 500;
+      error.code = "ITEM_USE_FAILED";
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+app.get("/api/me/monsters/:playerMonsterId", authRequired, asyncRoute(getMonsterDetail));
+app.post("/api/items/use", authRequired, asyncRoute(useInventoryItem));
 
 // =======================================================
 // Maps / spawns

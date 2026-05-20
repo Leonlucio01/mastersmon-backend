@@ -62,9 +62,13 @@ POST /api/auth/logout
 GET  /api/me
 GET  /api/me/inventory
 GET  /api/me/team
+GET  /api/me/monsters/:playerMonsterId
 GET  /api/me/collection
 GET  /api/me/pokedex-summary
 GET  /api/me/pokedex
+GET  /api/shop/items
+POST /api/shop/buy
+POST /api/items/use
 GET  /api/maps
 GET  /api/maps/:slug/spawns
 POST /api/encounters
@@ -115,6 +119,34 @@ Authorization: Bearer TOKEN
 
 `GET /api/auth/me` devuelve `{ ok, user, profile }`. `POST /api/auth/logout` devuelve `{ ok: true }`; el cierre real de sesion se hace eliminando el token en el frontend.
 
+### Items
+
+`POST /api/items/use`
+
+Usa el usuario resuelto por JWT o, temporalmente, `CURRENT_USER_EMAIL` cuando no hay token.
+
+```json
+{
+  "itemSlug": "potion",
+  "playerMonsterId": "UUID_DEL_PLAYER_MONSTER",
+  "quantity": 1
+}
+```
+
+Ejemplo Rare Candy:
+
+```json
+{
+  "itemSlug": "rare-candy",
+  "playerMonsterId": "UUID_DEL_PLAYER_MONSTER",
+  "quantity": 1
+}
+```
+
+Items soportados en esta fase: `potion`, `super-potion`, `hyper-potion`, `revive` y `rare-candy`. Las piedras evolutivas quedan para una fase posterior.
+
+Errores esperados: `ITEM_NOT_FOUND`, `ITEM_NOT_USABLE`, `INVALID_QUANTITY`, `INSUFFICIENT_ITEM`, `MONSTER_NOT_FOUND`, `MONSTER_NOT_OWNED`, `MONSTER_ALREADY_FULL_HP`, `MONSTER_NOT_FAINTED`, `MAX_LEVEL_REACHED` y `ITEM_USE_FAILED`.
+
 ## Prueba rapida
 
 Crear encuentro:
@@ -141,6 +173,8 @@ La migracion segura de auth esta en:
 
 ```txt
 database/migrations/20260518_auth_users.sql
+database/migrations/20260519_rare_candy_item.sql
 ```
 
 Agrega `password_hash` y `last_login_at` con `ADD COLUMN IF NOT EXISTS`, sin borrar datos ni cambiar IDs existentes.
+La migracion de `rare-candy` agrega el item y su categoria de forma idempotente si faltan en la base.
