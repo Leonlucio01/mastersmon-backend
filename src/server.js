@@ -1009,6 +1009,397 @@ app.get("/api/me/monsters/:playerMonsterId", authRequired, asyncRoute(getMonster
 app.post("/api/items/use", authRequired, asyncRoute(useInventoryItem));
 
 // =======================================================
+// Evolutions
+// =======================================================
+
+function isLevelEvolutionTrigger(triggerType) {
+  const trigger = String(triggerType || "").toLowerCase();
+  return trigger === "level" || trigger === "level-up" || trigger === "min_level";
+}
+
+function isItemEvolutionTrigger(triggerType) {
+  const trigger = String(triggerType || "").toLowerCase();
+  return trigger === "item" || trigger === "use-item" || trigger === "stone" || trigger === "evolution-stone";
+}
+
+function evolutionReason(code, rule) {
+  if (code === "LEVEL_TOO_LOW") return `Requiere nivel ${rule.required_level}.`;
+  if (code === "REQUIRED_ITEM_MISSING") return `Necesitas ${rule.required_item_name || rule.required_item_slug}.`;
+  if (code === "UNSUPPORTED_EVOLUTION") return "Esta evolucion requiere una condicion aun no disponible.";
+  if (code === "INVALID_EVOLUTION_RULE") return "La regla de evolucion no es valida.";
+  return null;
+}
+
+function evaluateEvolutionRule(rule, monster) {
+  if (isLevelEvolutionTrigger(rule.trigger)) {
+    if (Number(rule.required_friendship || 0) > 0 || rule.required_trade || !rule.required_level) {
+      return { canEvolve: false, code: "UNSUPPORTED_EVOLUTION" };
+    }
+
+    if (Number(monster.level || 1) < Number(rule.required_level)) {
+      return { canEvolve: false, code: "LEVEL_TOO_LOW" };
+    }
+
+    return { canEvolve: true, code: null };
+  }
+
+  if (isItemEvolutionTrigger(rule.trigger)) {
+    if (!rule.required_item_slug) {
+      return { canEvolve: false, code: "INVALID_EVOLUTION_RULE" };
+    }
+
+    if (Number(rule.owned_item_quantity || 0) < 1) {
+      return { canEvolve: false, code: "REQUIRED_ITEM_MISSING" };
+    }
+
+    return { canEvolve: true, code: null };
+  }
+
+  return { canEvolve: false, code: "UNSUPPORTED_EVOLUTION" };
+}
+
+function formatEvolutionOption(row, monster) {
+  const rule = {
+    rule_id: row.rule_id,
+    to_species_id: row.to_species_id,
+    to_pokemon_name: row.to_pokemon_name,
+    to_dex_number: row.to_dex_number,
+    to_sprite_path: row.to_sprite_path,
+    to_animated_path: row.to_animated_path,
+    to_shiny_sprite_path: row.to_shiny_sprite_path,
+    to_animated_shiny_path: row.to_animated_shiny_path,
+    trigger: row.trigger,
+    required_level: row.required_level,
+    required_item_slug: row.required_item_slug,
+    required_item_name: row.required_item_name,
+    required_item_icon_path: row.required_item_icon_path,
+    owned_item_quantity: Number(row.owned_item_quantity || 0),
+    required_friendship: Number(row.required_friendship || 0),
+    required_trade: !!row.required_trade,
+    required_condition: row.required_condition,
+  };
+  const availability = evaluateEvolutionRule(rule, monster);
+
+  return {
+    ...rule,
+    can_evolve: availability.canEvolve,
+    reason_code: availability.code,
+    reason: evolutionReason(availability.code, rule),
+  };
+}
+
+async function getEvolutionRows(userId, speciesId, client = pool) {
+  const result = await client.query(
+    `
+    SELECT
+      er.id AS rule_id,
+      er.from_species_id,
+      er.to_species_id,
+      er.trigger_type AS trigger,
+      er.required_level,
+      er.required_item_slug,
+      er.required_friendship,
+      er.required_trade,
+      er.required_time,
+      er.required_condition,
+      ts.dex_number AS to_dex_number,
+      ts.name AS to_pokemon_name,
+      ts.sprite_path AS to_sprite_path,
+      ts.animated_path AS to_animated_path,
+      ts.shiny_sprite_path AS to_shiny_sprite_path,
+      ts.animated_shiny_path AS to_animated_shiny_path,
+      i.id AS required_item_id,
+      COALESCE(i.display_name, i.name) AS required_item_name,
+      i.icon_path AS required_item_icon_path,
+      COALESCE(pi.quantity, 0) AS owned_item_quantity
+    FROM game.evolution_rules er
+    JOIN game.monster_species ts ON ts.id = er.to_species_id
+    LEFT JOIN game.items i ON i.slug = er.required_item_slug
+    LEFT JOIN game.player_inventory pi ON pi.user_id = $1 AND pi.item_id = i.id
+    WHERE er.from_species_id = $2
+    ORDER BY
+      CASE WHEN er.trigger_type IN ('use-item', 'item', 'stone', 'evolution-stone') THEN 0 ELSE 1 END,
+      er.required_level NULLS LAST,
+      ts.dex_number
+    `,
+    [userId, speciesId]
+  );
+
+  return result.rows;
+}
+
+async function getMonsterEvolutions(req, res) {
+  const playerMonsterId = req.params.playerMonsterId;
+  const monster = await getMonsterSnapshot(req.user.id, playerMonsterId);
+
+  if (!monster) {
+    throw createHttpError(404, "MONSTER_NOT_FOUND", "Monster was not found.");
+  }
+
+  const rows = await getEvolutionRows(req.user.id, monster.species_id);
+
+  res.json({
+    ok: true,
+    monster: {
+      player_monster_id: monster.player_monster_id,
+      species_id: monster.species_id,
+      pokemon_name: monster.pokemon_name,
+      level: monster.level,
+      is_shiny: monster.is_shiny,
+      selected_sprite_path: monster.selected_sprite_path,
+    },
+    evolutions: rows.map((row) => formatEvolutionOption(row, monster)),
+  });
+}
+
+function throwEvolutionAvailability(errorCode, rule) {
+  if (errorCode === "LEVEL_TOO_LOW") {
+    throw createHttpError(400, "LEVEL_TOO_LOW", evolutionReason(errorCode, rule));
+  }
+
+  if (errorCode === "REQUIRED_ITEM_MISSING") {
+    throw createHttpError(400, "INSUFFICIENT_ITEM", evolutionReason(errorCode, rule));
+  }
+
+  if (errorCode === "INVALID_EVOLUTION_RULE") {
+    throw createHttpError(400, "INVALID_EVOLUTION_RULE", evolutionReason(errorCode, rule));
+  }
+
+  throw createHttpError(400, "EVOLUTION_NOT_AVAILABLE", evolutionReason(errorCode, rule));
+}
+
+async function evolveMonster(req, res) {
+  const playerMonsterId = String(req.body?.playerMonsterId || req.body?.player_monster_id || "").trim();
+  const ruleId = String(req.body?.ruleId || req.body?.rule_id || "").trim();
+  const toSpeciesId = req.body?.toSpeciesId || req.body?.to_species_id || null;
+  const itemSlug = req.body?.itemSlug || req.body?.item_slug || null;
+
+  if (!playerMonsterId) {
+    throw createHttpError(400, "MONSTER_NOT_FOUND", "playerMonsterId is required.");
+  }
+
+  if (!ruleId && !toSpeciesId) {
+    throw createHttpError(400, "EVOLUTION_NOT_FOUND", "ruleId or toSpeciesId is required.");
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const monsterResult = await client.query(
+      `
+      SELECT pm.*, ms.name AS pokemon_name, ms.dex_number
+      FROM game.player_monsters pm
+      JOIN game.monster_species ms ON ms.id = pm.species_id
+      WHERE pm.id = $1
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [playerMonsterId]
+    );
+
+    if (!monsterResult.rows.length) {
+      throw createHttpError(404, "MONSTER_NOT_FOUND", "Monster was not found.");
+    }
+
+    const monster = monsterResult.rows[0];
+    if (String(monster.user_id) !== String(req.user.id)) {
+      throw createHttpError(403, "MONSTER_NOT_OWNED", "Monster does not belong to the current user.");
+    }
+
+    const ruleParams = [monster.species_id, req.user.id];
+    let ruleWhere = "er.from_species_id = $1";
+
+    if (ruleId) {
+      ruleParams.push(ruleId);
+      ruleWhere += ` AND er.id = $${ruleParams.length}`;
+    } else {
+      ruleParams.push(Number(toSpeciesId));
+      ruleWhere += ` AND er.to_species_id = $${ruleParams.length}`;
+      if (itemSlug) {
+        ruleParams.push(String(itemSlug));
+        ruleWhere += ` AND er.required_item_slug = $${ruleParams.length}`;
+      }
+    }
+
+    const ruleResult = await client.query(
+      `
+      SELECT
+        er.id AS rule_id,
+        er.from_species_id,
+        er.to_species_id,
+        er.trigger_type AS trigger,
+        er.required_level,
+        er.required_item_slug,
+        er.required_friendship,
+        er.required_trade,
+        er.required_time,
+        er.required_condition,
+        fs.name AS from_pokemon_name,
+        ts.name AS to_pokemon_name,
+        ts.dex_number AS to_dex_number,
+        ts.sprite_path AS to_sprite_path,
+        ts.animated_path AS to_animated_path,
+        ts.shiny_sprite_path AS to_shiny_sprite_path,
+        ts.animated_shiny_path AS to_animated_shiny_path,
+        i.id AS required_item_id,
+        COALESCE(i.display_name, i.name) AS required_item_name,
+        i.icon_path AS required_item_icon_path,
+        COALESCE(pi.quantity, 0) AS owned_item_quantity
+      FROM game.evolution_rules er
+      JOIN game.monster_species fs ON fs.id = er.from_species_id
+      JOIN game.monster_species ts ON ts.id = er.to_species_id
+      LEFT JOIN game.items i ON i.slug = er.required_item_slug
+      LEFT JOIN game.player_inventory pi ON pi.user_id = $2 AND pi.item_id = i.id
+      WHERE ${ruleWhere}
+      LIMIT 1
+      `,
+      ruleParams
+    );
+
+    if (!ruleResult.rows.length) {
+      const existingRules = await client.query(
+        "SELECT 1 FROM game.evolution_rules WHERE from_species_id = $1 LIMIT 1",
+        [monster.species_id]
+      );
+      if (!existingRules.rows.length) {
+        throw createHttpError(400, "ALREADY_FINAL_EVOLUTION", "This monster has no available evolution.");
+      }
+      throw createHttpError(404, "EVOLUTION_NOT_FOUND", "Evolution rule was not found.");
+    }
+
+    let rule = ruleResult.rows[0];
+
+    if (isItemEvolutionTrigger(rule.trigger)) {
+      if (!rule.required_item_id) {
+        throw createHttpError(400, "INVALID_EVOLUTION_RULE", "Evolution item was not found.");
+      }
+
+      const inventoryResult = await client.query(
+        `
+        SELECT user_id, item_id, quantity
+        FROM game.player_inventory
+        WHERE user_id = $1
+          AND item_id = $2
+        FOR UPDATE
+        `,
+        [req.user.id, rule.required_item_id]
+      );
+
+      const lockedQuantity = Number(inventoryResult.rows[0]?.quantity || 0);
+      rule = {
+        ...rule,
+        owned_item_quantity: lockedQuantity,
+      };
+
+      if (lockedQuantity < 1) {
+        throw createHttpError(400, "INSUFFICIENT_ITEM", evolutionReason("REQUIRED_ITEM_MISSING", rule));
+      }
+    }
+
+    const availability = evaluateEvolutionRule(rule, monster);
+    if (!availability.canEvolve) {
+      throwEvolutionAvailability(availability.code, rule);
+    }
+
+    if (isItemEvolutionTrigger(rule.trigger)) {
+      await client.query(
+        `
+        UPDATE game.player_inventory
+        SET quantity = quantity - 1,
+            updated_at = now()
+        WHERE user_id = $1
+          AND item_id = $2
+        `,
+        [req.user.id, rule.required_item_id]
+      );
+    }
+
+    await client.query(
+      `
+      UPDATE game.player_monsters
+      SET species_id = $2,
+          updated_at = now()
+      WHERE id = $1
+      `,
+      [monster.id, rule.to_species_id]
+    );
+
+    await client.query(
+      `
+      INSERT INTO game.player_pokedex (
+        user_id,
+        species_id,
+        seen,
+        caught,
+        shiny_seen,
+        shiny_caught,
+        total_seen,
+        total_caught,
+        total_shiny_caught,
+        first_seen_at,
+        first_caught_at,
+        updated_at
+      )
+      VALUES ($1, $2, true, true, $3, $3, 1, 1, $4, now(), now(), now())
+      ON CONFLICT (user_id, species_id)
+      DO UPDATE SET
+        seen = true,
+        caught = true,
+        shiny_seen = game.player_pokedex.shiny_seen OR EXCLUDED.shiny_seen,
+        shiny_caught = game.player_pokedex.shiny_caught OR EXCLUDED.shiny_caught,
+        total_seen = game.player_pokedex.total_seen + 1,
+        total_caught = game.player_pokedex.total_caught + 1,
+        total_shiny_caught = game.player_pokedex.total_shiny_caught + EXCLUDED.total_shiny_caught,
+        first_seen_at = COALESCE(game.player_pokedex.first_seen_at, EXCLUDED.first_seen_at),
+        first_caught_at = COALESCE(game.player_pokedex.first_caught_at, EXCLUDED.first_caught_at),
+        updated_at = now()
+      `,
+      [req.user.id, rule.to_species_id, !!monster.is_shiny, monster.is_shiny ? 1 : 0]
+    );
+
+    await client.query("COMMIT");
+
+    const [updatedMonster, inventory, team, pokedexSummary] = await Promise.all([
+      getMonsterSnapshot(req.user.id, monster.id),
+      getCurrentInventoryRows(req.user.id),
+      getCurrentTeamRows(req.user.id),
+      query("SELECT * FROM game.v_player_pokedex_summary WHERE user_id = $1 LIMIT 1", [req.user.id]),
+    ]);
+
+    res.json({
+      ok: true,
+      evolution: {
+        rule_id: rule.rule_id,
+        from_species_id: rule.from_species_id,
+        from_pokemon_name: rule.from_pokemon_name,
+        to_species_id: rule.to_species_id,
+        to_pokemon_name: rule.to_pokemon_name,
+        trigger: rule.trigger,
+        consumed_item_slug: isItemEvolutionTrigger(rule.trigger) ? rule.required_item_slug : null,
+      },
+      monster: updatedMonster,
+      inventory,
+      team,
+      pokedexSummary: pokedexSummary[0] || null,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (!error.code || error.code === "23514" || error.code === "23503") {
+      error.status = error.status || 500;
+      error.code = "EVOLUTION_FAILED";
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+app.get("/api/me/monsters/:playerMonsterId/evolutions", authRequired, asyncRoute(getMonsterEvolutions));
+app.post("/api/evolutions/evolve", authRequired, asyncRoute(evolveMonster));
+
+// =======================================================
 // Maps / spawns
 // =======================================================
 

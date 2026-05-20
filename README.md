@@ -63,12 +63,14 @@ GET  /api/me
 GET  /api/me/inventory
 GET  /api/me/team
 GET  /api/me/monsters/:playerMonsterId
+GET  /api/me/monsters/:playerMonsterId/evolutions
 GET  /api/me/collection
 GET  /api/me/pokedex-summary
 GET  /api/me/pokedex
 GET  /api/shop/items
 POST /api/shop/buy
 POST /api/items/use
+POST /api/evolutions/evolve
 GET  /api/maps
 GET  /api/maps/:slug/spawns
 POST /api/encounters
@@ -146,6 +148,38 @@ Ejemplo Rare Candy:
 Items soportados en esta fase: `potion`, `super-potion`, `hyper-potion`, `revive` y `rare-candy`. Las piedras evolutivas quedan para una fase posterior.
 
 Errores esperados: `ITEM_NOT_FOUND`, `ITEM_NOT_USABLE`, `INVALID_QUANTITY`, `INSUFFICIENT_ITEM`, `MONSTER_NOT_FOUND`, `MONSTER_NOT_OWNED`, `MONSTER_ALREADY_FULL_HP`, `MONSTER_NOT_FAINTED`, `MAX_LEVEL_REACHED` y `ITEM_USE_FAILED`.
+
+### Evoluciones
+
+`GET /api/me/monsters/:playerMonsterId/evolutions`
+
+Devuelve las reglas de evolucion disponibles para una criatura del usuario actual, incluyendo requisito de nivel o item, cantidad poseida y si puede evolucionar.
+
+`POST /api/evolutions/evolve`
+
+Evolucion por nivel:
+
+```json
+{
+  "playerMonsterId": "UUID_DEL_PLAYER_MONSTER",
+  "ruleId": "UUID_DE_LA_REGLA"
+}
+```
+
+Evolucion por piedra:
+
+```json
+{
+  "playerMonsterId": "UUID_DEL_PLAYER_MONSTER",
+  "ruleId": "UUID_DE_LA_REGLA"
+}
+```
+
+El backend valida la regla contra `game.evolution_rules`. Si la regla usa `use-item`, descuenta una unidad del item requerido en la misma transaccion. La evolucion actualiza `game.player_monsters.species_id` sin crear un monstruo nuevo, por lo que el slot de equipo se mantiene.
+
+Tambien actualiza `game.player_pokedex` para la especie destino con `seen=true` y `caught=true`, sin borrar la especie anterior.
+
+Errores esperados: `MONSTER_NOT_FOUND`, `MONSTER_NOT_OWNED`, `EVOLUTION_NOT_FOUND`, `EVOLUTION_NOT_AVAILABLE`, `LEVEL_TOO_LOW`, `REQUIRED_ITEM_MISSING`, `INSUFFICIENT_ITEM`, `ALREADY_FINAL_EVOLUTION`, `INVALID_EVOLUTION_RULE` y `EVOLUTION_FAILED`.
 
 ## Prueba rapida
 
