@@ -218,6 +218,44 @@ Eventos de progreso integrados:
 
 Errores esperados: `QUEST_NOT_FOUND`, `QUEST_NOT_COMPLETED`, `QUEST_ALREADY_CLAIMED`, `QUEST_REWARD_FAILED` y `QUEST_PROGRESS_FAILED`.
 
+### Batallas PvE con skills
+
+`GET /api/me/monsters/:playerMonsterId/skills`
+
+Devuelve hasta 4 skills disponibles para una criatura del usuario actual.
+
+`GET /api/gyms`
+
+Lista gimnasios reales desde `game.gyms`, con region, tipo, medalla, poder recomendado y tamano de equipo si existe.
+
+`POST /api/battles/start`
+
+```json
+{
+  "battleType": "gym",
+  "targetSlug": "kanto-boulder-badge"
+}
+```
+
+Usa el equipo activo real del jugador. Si un gimnasio aun no tiene filas en `game.gym_trainer_team`, el backend genera un equipo PvE basico segun el tipo del gimnasio para mantener la fase jugable.
+
+`GET /api/battles/:battleId`
+
+Devuelve estado de batalla, equipos, HP, criatura activa, skills disponibles, log, ganador y recompensas.
+
+`POST /api/battles/:battleId/turn`
+
+```json
+{
+  "action": "skill",
+  "skillSlug": "thunder-shock"
+}
+```
+
+El frontend no calcula dano. El backend valida la skill del Pokemon activo, calcula precision, dano, STAB, efectividad simple, critico, respuesta enemiga y guarda `battle_state` mas filas en `game.battle_turns`.
+
+Errores esperados: `BATTLE_NOT_FOUND`, `BATTLE_NOT_OWNED`, `BATTLE_ALREADY_FINISHED`, `TEAM_EMPTY`, `GYM_NOT_FOUND`, `NPC_NOT_FOUND`, `INVALID_BATTLE_TYPE`, `INVALID_ACTION`, `SKILL_NOT_FOUND`, `SKILL_NOT_AVAILABLE`, `ACTIVE_MONSTER_FAINTED`, `BATTLE_TURN_FAILED` y `BATTLE_REWARD_FAILED`.
+
 ## Prueba rapida
 
 Crear encuentro:
@@ -246,8 +284,10 @@ La migracion segura de auth esta en:
 database/migrations/20260518_auth_users.sql
 database/migrations/20260519_rare_candy_item.sql
 database/migrations/20260520_real_quests.sql
+database/migrations/20260521_pve_battles_skills.sql
 ```
 
 Agrega `password_hash` y `last_login_at` con `ADD COLUMN IF NOT EXISTS`, sin borrar datos ni cambiar IDs existentes.
 La migracion de `rare-candy` agrega el item y su categoria de forma idempotente si faltan en la base.
 La migracion de misiones agrega columnas compatibles a `game.quests` y `game.player_quests`, y siembra las misiones base con `ON CONFLICT`.
+La migracion de batallas crea `game.skills`, `game.monster_species_skills`, asigna skills basicas por tipo y agrega columnas JSON/resultado a `battle_sessions` y `battle_turns`.

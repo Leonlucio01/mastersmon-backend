@@ -715,6 +715,10 @@ async function incrementQuestProgress(userId, eventType, payload = {}, client = 
     await updateQuestProgressByAmount(userId, "use_item", payload.quantity || 1, client, payload.itemSlug || null);
   } else if (eventType === "evolve") {
     await updateQuestProgressByAmount(userId, "evolve", 1, client);
+  } else if (eventType === "battle_win") {
+    await updateQuestProgressByAmount(userId, "battle_win", 1, client);
+  } else if (eventType === "gym_win") {
+    await updateQuestProgressByAmount(userId, "gym_win", 1, client);
   } else if (eventType === "team_update") {
     await updateQuestProgressMax(userId, "team_size", payload.teamSize || 0, client);
   } else if (eventType === "pokedex_species") {
@@ -986,6 +990,824 @@ async function claimQuestReward(req, res) {
 
 app.get("/api/me/quests", authRequired, asyncRoute(sendCurrentQuests));
 app.post("/api/me/quests/:questId/claim", authRequired, asyncRoute(claimQuestReward));
+
+// =======================================================
+// PvE Battles / skills
+// =======================================================
+
+const GYM_ALIASES = {
+  brock: "kanto-boulder-badge",
+  misty: "kanto-cascade-badge",
+  surge: "kanto-thunder-badge",
+  "lt-surge": "kanto-thunder-badge",
+  erika: "kanto-rainbow-badge",
+};
+
+function battleMaxHp(monster) {
+  return 20 + Number(monster.level || 1) * 3 + Number(monster.iv_hp || 0);
+}
+
+function hpPercent(monster) {
+  const maxHp = Number(monster?.max_hp || 1);
+  return Math.max(0, Math.min(100, Math.round((Number(monster?.current_hp || 0) / maxHp) * 100)));
+}
+
+function typeEffectiveness(attackType, defender) {
+  const atk = String(attackType || "").toLowerCase();
+  const defenderTypes = [defender.primary_type, defender.secondary_type].filter(Boolean).map((t) => String(t).toLowerCase());
+
+  if (atk === "normal" && defenderTypes.includes("ghost")) return 0;
+
+  const strong = {
+    fire: ["grass", "bug", "ice"],
+    water: ["fire", "rock", "ground"],
+    grass: ["water", "rock", "ground"],
+    electric: ["water", "flying"],
+    rock: ["fire", "flying", "bug", "ice"],
+    ground: ["electric", "fire", "poison", "rock"],
+    psychic: ["poison", "fighting"],
+    ice: ["dragon", "flying", "grass", "ground"],
+    bug: ["grass", "psychic", "dark"],
+    ghost: ["ghost", "psychic"],
+    dark: ["psychic", "ghost"],
+    fighting: ["normal", "rock", "ice", "dark"],
+  };
+  const resist = {
+    fire: ["fire", "water", "rock", "dragon"],
+    water: ["water", "grass", "dragon"],
+    grass: ["fire", "grass", "poison", "flying", "bug", "dragon"],
+    electric: ["electric", "grass", "dragon", "ground"],
+    rock: ["fighting", "ground", "steel"],
+    ghost: ["dark"],
+  };
+
+  let multiplier = 1;
+  for (const type of defenderTypes) {
+    if (strong[atk]?.includes(type)) multiplier *= 2;
+    if (resist[atk]?.includes(type)) multiplier *= 0.5;
+  }
+  return multiplier;
+}
+
+function calculateBattleDamage(attacker, defender, skill) {
+  const level = Number(attacker.level || 1);
+  const attackStat = 10 + level * 2 + Number(attacker.iv_attack || 0);
+  const defenseStat = 8 + Number(defender.level || 1) + Number(defender.iv_defense || 0);
+  const basePower = Number(skill.power || 40);
+  const baseDamage = Math.floor(((((level * 0.4 + 2) * basePower * attackStat) / Math.max(1, defenseStat)) / 8) + 2);
+  const randomFactor = 0.85 + Math.random() * 0.15;
+  const stab = skill.type_slug && [attacker.primary_type, attacker.secondary_type].includes(skill.type_slug) ? 1.2 : 1;
+  const typeMultiplier = typeEffectiveness(skill.type_slug, defender);
+  const isCritical = Math.random() < 0.05;
+  const criticalMultiplier = isCritical ? 1.5 : 1;
+  const damage = typeMultiplier === 0 ? 0 : Math.max(1, Math.floor(baseDamage * randomFactor * stab * typeMultiplier * criticalMultiplier));
+
+  return {
+    damage,
+    isCritical,
+    typeMultiplier,
+    randomFactor,
+    stab,
+  };
+}
+
+async function getSkillsForSpecies(speciesId, level, client = pool) {
+  const result = await client.query(
+    `
+    SELECT
+      s.id AS skill_id,
+      s.slug,
+      s.name,
+      s.description,
+      s.type_slug,
+      s.power,
+      s.accuracy,
+      s.energy_cost,
+      s.cooldown_turns,
+      s.skill_kind
+    FROM game.monster_species_skills mss
+    JOIN game.skills s ON s.id = mss.skill_id
+    WHERE mss.species_id = $1
+      AND mss.unlock_level <= $2
+      AND s.is_active = true
+    ORDER BY mss.slot_order, s.power DESC, s.slug
+    LIMIT 4
+    `,
+    [speciesId, Number(level || 1)]
+  );
+
+  if (result.rows.length) return result.rows;
+
+  const fallback = await client.query(
+    `
+    SELECT
+      id AS skill_id,
+      slug,
+      name,
+      description,
+      type_slug,
+      power,
+      accuracy,
+      energy_cost,
+      cooldown_turns,
+      skill_kind
+    FROM game.skills
+    WHERE slug = 'tackle'
+    LIMIT 1
+    `
+  );
+  return fallback.rows;
+}
+
+async function getPlayerMonsterWithSpecies(userId, playerMonsterId, client = pool) {
+  const result = await client.query(
+    `
+    SELECT
+      pm.id AS player_monster_id,
+      pm.user_id,
+      pm.species_id,
+      pm.nickname,
+      pm.level,
+      pm.exp,
+      pm.current_hp,
+      pm.iv_hp,
+      pm.iv_attack,
+      pm.iv_defense,
+      pm.is_shiny,
+      ms.dex_number,
+      ms.name AS pokemon_name,
+      ms.slug AS pokemon_slug,
+      ms.sprite_path,
+      ms.shiny_sprite_path,
+      ms.animated_path,
+      ms.animated_shiny_path,
+      CASE WHEN pm.is_shiny THEN COALESCE(ms.animated_shiny_path, ms.shiny_sprite_path, ms.animated_path, ms.sprite_path)
+        ELSE COALESCE(ms.animated_path, ms.sprite_path) END AS selected_sprite_path,
+      pt.slug AS primary_type,
+      st.slug AS secondary_type
+    FROM game.player_monsters pm
+    JOIN game.monster_species ms ON ms.id = pm.species_id
+    LEFT JOIN game.monster_types pt ON pt.id = ms.primary_type_id
+    LEFT JOIN game.monster_types st ON st.id = ms.secondary_type_id
+    WHERE pm.id = $1
+      AND pm.user_id = $2
+    LIMIT 1
+    `,
+    [playerMonsterId, userId]
+  );
+  return result.rows[0] || null;
+}
+
+async function getMonsterBattleSkills(req, res) {
+  const playerMonsterId = String(req.params.playerMonsterId || "").trim();
+  const monster = await getPlayerMonsterWithSpecies(req.user.id, playerMonsterId);
+
+  if (!monster) {
+    throw createHttpError(404, "MONSTER_NOT_FOUND", "Monster was not found.");
+  }
+
+  const skills = await getSkillsForSpecies(monster.species_id, monster.level);
+  res.json({
+    ok: true,
+    monster,
+    skills,
+  });
+}
+
+function asBattleMonster(row, side, index, skills) {
+  const maxHp = battleMaxHp(row);
+  const currentHp = row.current_hp === null || row.current_hp === undefined
+    ? maxHp
+    : Math.max(0, Math.min(maxHp, Number(row.current_hp)));
+
+  return {
+    side,
+    index,
+    player_monster_id: row.player_monster_id || null,
+    species_id: row.species_id,
+    dex_number: row.dex_number,
+    pokemon_name: row.nickname || row.pokemon_name,
+    species_name: row.pokemon_name,
+    level: Number(row.level || 1),
+    current_hp: currentHp,
+    max_hp: maxHp,
+    iv_hp: Number(row.iv_hp || 0),
+    iv_attack: Number(row.iv_attack || 0),
+    iv_defense: Number(row.iv_defense || 0),
+    is_shiny: !!row.is_shiny,
+    primary_type: row.primary_type,
+    secondary_type: row.secondary_type,
+    selected_sprite_path: row.selected_sprite_path,
+    skills,
+  };
+}
+
+async function getPlayerBattleTeam(userId, client = pool) {
+  await ensureTeamSlots(userId, client);
+  const result = await client.query(
+    `
+    SELECT
+      pts.slot_number,
+      pm.id AS player_monster_id,
+      pm.species_id,
+      pm.nickname,
+      pm.level,
+      pm.current_hp,
+      pm.iv_hp,
+      pm.iv_attack,
+      pm.iv_defense,
+      pm.is_shiny,
+      ms.dex_number,
+      ms.name AS pokemon_name,
+      CASE WHEN pm.is_shiny THEN COALESCE(ms.animated_shiny_path, ms.shiny_sprite_path, ms.animated_path, ms.sprite_path)
+        ELSE COALESCE(ms.animated_path, ms.sprite_path) END AS selected_sprite_path,
+      pt.slug AS primary_type,
+      st.slug AS secondary_type
+    FROM game.player_team_slots pts
+    JOIN game.player_monsters pm ON pm.id = pts.player_monster_id
+    JOIN game.monster_species ms ON ms.id = pm.species_id
+    LEFT JOIN game.monster_types pt ON pt.id = ms.primary_type_id
+    LEFT JOIN game.monster_types st ON st.id = ms.secondary_type_id
+    WHERE pts.user_id = $1
+    ORDER BY pts.slot_number
+    `,
+    [userId]
+  );
+
+  const team = [];
+  for (let index = 0; index < result.rows.length; index += 1) {
+    const row = result.rows[index];
+    const skills = await getSkillsForSpecies(row.species_id, row.level, client);
+    team.push(asBattleMonster(row, "player", index, skills));
+  }
+  return team;
+}
+
+async function getGyms(req, res) {
+  const rows = await query(
+    `
+    SELECT
+      g.id,
+      g.slug,
+      g.name,
+      g.gym_order,
+      g.badge_name,
+      g.badge_icon_path,
+      g.recommended_power,
+      g.required_trainer_level,
+      r.slug AS region_slug,
+      r.name AS region_name,
+      mt.slug AS type_slug,
+      mt.name AS type_name,
+      nt.slug AS leader_slug,
+      nt.name AS leader_name,
+      nt.avatar_path AS leader_avatar_path,
+      COUNT(gtt.id)::int AS team_size
+    FROM game.gyms g
+    LEFT JOIN game.regions r ON r.id = g.region_id
+    LEFT JOIN game.monster_types mt ON mt.id = g.type_id
+    LEFT JOIN game.npc_trainers nt ON nt.id = g.leader_id
+    LEFT JOIN game.gym_trainer_team gtt ON gtt.gym_id = g.id
+    GROUP BY g.id, r.generation_id, r.slug, r.name, mt.slug, mt.name, nt.slug, nt.name, nt.avatar_path
+    ORDER BY COALESCE(r.generation_id, 1), g.gym_order, g.name
+    `
+  );
+  res.json(rows);
+}
+
+async function findGymForBattle(targetSlug, client = pool) {
+  const slug = GYM_ALIASES[String(targetSlug || "").toLowerCase()] || String(targetSlug || "").toLowerCase();
+  const result = await client.query(
+    `
+    SELECT
+      g.*,
+      mt.slug AS type_slug,
+      mt.name AS type_name,
+      nt.id AS leader_id,
+      nt.slug AS leader_slug,
+      nt.name AS leader_name
+    FROM game.gyms g
+    LEFT JOIN game.monster_types mt ON mt.id = g.type_id
+    LEFT JOIN game.npc_trainers nt ON nt.id = g.leader_id
+    WHERE g.slug = $1
+    LIMIT 1
+    `,
+    [slug]
+  );
+  return result.rows[0] || null;
+}
+
+async function getGymEnemyRows(gym, client = pool) {
+  const teamResult = await client.query(
+    `
+    SELECT
+      gtt.species_id,
+      gtt.level,
+      ms.dex_number,
+      ms.name AS pokemon_name,
+      COALESCE(ms.animated_path, ms.sprite_path) AS selected_sprite_path,
+      pt.slug AS primary_type,
+      st.slug AS secondary_type
+    FROM game.gym_trainer_team gtt
+    JOIN game.monster_species ms ON ms.id = gtt.species_id
+    LEFT JOIN game.monster_types pt ON pt.id = ms.primary_type_id
+    LEFT JOIN game.monster_types st ON st.id = ms.secondary_type_id
+    WHERE gtt.gym_id = $1
+    ORDER BY gtt.slot_number
+    `,
+    [gym.id]
+  );
+
+  if (teamResult.rows.length) return teamResult.rows;
+
+  const level = Math.max(3, Number(gym.required_trainer_level || 2) * 3 + Number(gym.gym_order || 1) * 2);
+  const fallback = await client.query(
+    `
+    SELECT
+      ms.id AS species_id,
+      ($2::int + ROW_NUMBER() OVER (ORDER BY ms.dex_number)::int - 1) AS level,
+      ms.dex_number,
+      ms.name AS pokemon_name,
+      COALESCE(ms.animated_path, ms.sprite_path) AS selected_sprite_path,
+      pt.slug AS primary_type,
+      st.slug AS secondary_type
+    FROM game.monster_species ms
+    LEFT JOIN game.monster_types pt ON pt.id = ms.primary_type_id
+    LEFT JOIN game.monster_types st ON st.id = ms.secondary_type_id
+    WHERE ms.is_active = true
+      AND ($1::smallint IS NULL OR ms.primary_type_id = $1 OR ms.secondary_type_id = $1)
+    ORDER BY ms.dex_number
+    LIMIT 3
+    `,
+    [gym.type_id, level]
+  );
+
+  if (fallback.rows.length) return fallback.rows;
+
+  const anySpecies = await client.query(
+    `
+    SELECT
+      ms.id AS species_id,
+      $1::int AS level,
+      ms.dex_number,
+      ms.name AS pokemon_name,
+      COALESCE(ms.animated_path, ms.sprite_path) AS selected_sprite_path,
+      pt.slug AS primary_type,
+      st.slug AS secondary_type
+    FROM game.monster_species ms
+    LEFT JOIN game.monster_types pt ON pt.id = ms.primary_type_id
+    LEFT JOIN game.monster_types st ON st.id = ms.secondary_type_id
+    WHERE ms.is_active = true
+    ORDER BY ms.dex_number
+    LIMIT 3
+    `,
+    [level]
+  );
+  return anySpecies.rows;
+}
+
+async function buildGymEnemyTeam(gym, client = pool) {
+  const rows = await getGymEnemyRows(gym, client);
+  const team = [];
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = {
+      ...rows[index],
+      player_monster_id: null,
+      current_hp: null,
+      iv_hp: Number(gym.gym_order || 1) * 2,
+      iv_attack: Number(gym.gym_order || 1) * 2,
+      iv_defense: Number(gym.gym_order || 1) * 2,
+      is_shiny: false,
+    };
+    const skills = await getSkillsForSpecies(row.species_id, row.level, client);
+    team.push(asBattleMonster(row, "enemy", index, skills));
+  }
+  return team;
+}
+
+function firstAliveIndex(team) {
+  return team.findIndex((monster) => Number(monster.current_hp || 0) > 0);
+}
+
+function publicBattleState(session, state) {
+  const activePlayer = state.playerTeam[state.activePlayerIndex] || null;
+  const activeEnemy = state.enemyTeam[state.activeEnemyIndex] || null;
+
+  return {
+    ok: true,
+    battle_id: session.id || session.battle_id,
+    battle_type: session.battle_type || state.battleType,
+    target_slug: session.target_slug || state.targetSlug,
+    status: session.status,
+    winner: session.winner || state.winner || null,
+    rewards: session.rewards || state.rewards || null,
+    turn: state.turn,
+    player_team: state.playerTeam,
+    enemy_team: state.enemyTeam,
+    active_player_index: state.activePlayerIndex,
+    active_enemy_index: state.activeEnemyIndex,
+    active_player_monster: activePlayer ? { ...activePlayer, hp_percent: hpPercent(activePlayer) } : null,
+    active_enemy_monster: activeEnemy ? { ...activeEnemy, hp_percent: hpPercent(activeEnemy) } : null,
+    available_skills: activePlayer?.skills || [],
+    log: state.log || [],
+  };
+}
+
+async function startBattle(req, res) {
+  const battleType = String(req.body?.battleType || req.body?.battle_type || "").trim().toLowerCase();
+  const targetSlug = String(req.body?.targetSlug || req.body?.target_slug || "").trim().toLowerCase();
+
+  if (!["gym", "arena"].includes(battleType)) {
+    throw createHttpError(400, "INVALID_BATTLE_TYPE", "Invalid battle type.");
+  }
+
+  if (!targetSlug) {
+    throw createHttpError(400, battleType === "gym" ? "GYM_NOT_FOUND" : "NPC_NOT_FOUND", "targetSlug is required.");
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+    const playerTeam = await getPlayerBattleTeam(req.user.id, client);
+    if (!playerTeam.length || firstAliveIndex(playerTeam) < 0) {
+      throw createHttpError(400, "TEAM_EMPTY", "You need at least one available monster in your team.");
+    }
+
+    const gym = await findGymForBattle(targetSlug, client);
+    if (!gym) {
+      throw createHttpError(404, battleType === "gym" ? "GYM_NOT_FOUND" : "NPC_NOT_FOUND", "Gym was not found.");
+    }
+
+    const enemyTeam = await buildGymEnemyTeam(gym, client);
+    const state = {
+      battleType,
+      targetSlug: gym.slug,
+      gym: {
+        id: gym.id,
+        slug: gym.slug,
+        name: gym.name,
+        badge_name: gym.badge_name,
+        type_slug: gym.type_slug,
+      },
+      playerTeam,
+      enemyTeam,
+      activePlayerIndex: firstAliveIndex(playerTeam),
+      activeEnemyIndex: firstAliveIndex(enemyTeam),
+      turn: 1,
+      winner: null,
+      rewards: null,
+      log: [`Batalla iniciada contra ${gym.leader_name || gym.name}.`],
+    };
+
+    const inserted = await client.query(
+      `
+      INSERT INTO game.battle_sessions (user_id, battle_type, gym_id, npc_trainer_id, status, target_slug, battle_state)
+      VALUES ($1, $2, $3, $4, 'active', $5, $6::jsonb)
+      RETURNING *
+      `,
+      [req.user.id, battleType, gym.id, gym.leader_id || null, gym.slug, JSON.stringify(state)]
+    );
+
+    await client.query("COMMIT");
+    res.status(201).json(publicBattleState(inserted.rows[0], state));
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function loadBattleSessionForUser(client, userId, battleId) {
+  const result = await client.query(
+    `
+    SELECT *
+    FROM game.battle_sessions
+    WHERE id = $1
+    LIMIT 1
+    FOR UPDATE
+    `,
+    [battleId]
+  );
+
+  if (!result.rows.length) {
+    throw createHttpError(404, "BATTLE_NOT_FOUND", "Battle was not found.");
+  }
+
+  const session = result.rows[0];
+  if (String(session.user_id) !== String(userId)) {
+    throw createHttpError(403, "BATTLE_NOT_OWNED", "Battle does not belong to the current user.");
+  }
+
+  return session;
+}
+
+async function getBattle(req, res) {
+  const rows = await query("SELECT * FROM game.battle_sessions WHERE id = $1 LIMIT 1", [req.params.battleId]);
+  if (!rows.length) {
+    throw createHttpError(404, "BATTLE_NOT_FOUND", "Battle was not found.");
+  }
+  if (String(rows[0].user_id) !== String(req.user.id)) {
+    throw createHttpError(403, "BATTLE_NOT_OWNED", "Battle does not belong to the current user.");
+  }
+  res.json(publicBattleState(rows[0], rows[0].battle_state || {}));
+}
+
+function findSkill(monster, { skillSlug, skillId }) {
+  return (monster.skills || []).find((skill) => {
+    if (skillId && String(skill.skill_id) === String(skillId)) return true;
+    if (skillSlug && skill.slug === skillSlug) return true;
+    return false;
+  }) || null;
+}
+
+function applySkillTurn(actor, target, skill, actorSide) {
+  const accuracy = Number(skill.accuracy || 100);
+  const hit = accuracy >= 100 || Math.random() * 100 <= accuracy;
+  if (!hit) {
+    return {
+      actorSide,
+      actor,
+      target,
+      skill,
+      damage: 0,
+      isCritical: false,
+      typeMultiplier: 1,
+      logText: `${actor.pokemon_name} falló ${skill.name}.`,
+      hit: false,
+    };
+  }
+
+  const damageResult = calculateBattleDamage(actor, target, skill);
+  const nextHp = Math.max(0, Number(target.current_hp || 0) - damageResult.damage);
+  target.current_hp = nextHp;
+
+  const extra = damageResult.typeMultiplier > 1 ? " Es supereficaz." : damageResult.typeMultiplier > 0 && damageResult.typeMultiplier < 1 ? " No fue muy eficaz." : damageResult.typeMultiplier === 0 ? " No tuvo efecto." : "";
+  const crit = damageResult.isCritical ? " Golpe crítico." : "";
+
+  return {
+    actorSide,
+    actor,
+    target,
+    skill,
+    damage: damageResult.damage,
+    isCritical: damageResult.isCritical,
+    typeMultiplier: damageResult.typeMultiplier,
+    logText: `${actor.pokemon_name} usó ${skill.name} e hizo ${damageResult.damage} de daño.${extra}${crit}`,
+    hit: true,
+  };
+}
+
+function chooseEnemySkill(enemy, target) {
+  const skills = enemy.skills || [];
+  if (!skills.length) return null;
+  return [...skills].sort((a, b) => {
+    const aScore = Number(a.power || 0) * typeEffectiveness(a.type_slug, target);
+    const bScore = Number(b.power || 0) * typeEffectiveness(b.type_slug, target);
+    return bScore - aScore;
+  })[0];
+}
+
+function finishBattleState(state, winner) {
+  state.winner = winner;
+  state.rewards = winner === "player"
+    ? {
+        gold: Math.max(500, Number(state.gym?.gym_order || 1) * 1000 || 1500),
+        diamonds: 0,
+      }
+    : null;
+  state.log.push(winner === "player" ? "Victoria. Recompensas listas." : "Derrota. Tu equipo cayó en combate.");
+}
+
+async function persistBattleTurn(client, battleId, turnNumber, result) {
+  await client.query(
+    `
+    INSERT INTO game.battle_turns (
+      battle_id,
+      turn_number,
+      actor_monster_id,
+      target_monster_id,
+      action_type,
+      damage,
+      log_text,
+      actor_side,
+      actor_monster_name,
+      target_monster_name,
+      skill_id,
+      skill_slug,
+      skill_name,
+      is_critical,
+      type_multiplier,
+      result
+    )
+    VALUES ($1, $2, $3, $4, 'skill', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb)
+    ON CONFLICT (battle_id, turn_number)
+    DO UPDATE SET
+      damage = EXCLUDED.damage,
+      log_text = EXCLUDED.log_text,
+      actor_side = EXCLUDED.actor_side,
+      actor_monster_name = EXCLUDED.actor_monster_name,
+      target_monster_name = EXCLUDED.target_monster_name,
+      skill_id = EXCLUDED.skill_id,
+      skill_slug = EXCLUDED.skill_slug,
+      skill_name = EXCLUDED.skill_name,
+      is_critical = EXCLUDED.is_critical,
+      type_multiplier = EXCLUDED.type_multiplier,
+      result = EXCLUDED.result
+    `,
+    [
+      battleId,
+      turnNumber,
+      result.actorSide === "player" ? result.actor.player_monster_id : null,
+      result.actorSide === "enemy" ? result.target.player_monster_id : null,
+      result.damage,
+      result.logText,
+      result.actorSide,
+      result.actor.pokemon_name,
+      result.target.pokemon_name,
+      result.skill.skill_id,
+      result.skill.slug,
+      result.skill.name,
+      !!result.isCritical,
+      result.typeMultiplier,
+      JSON.stringify({
+        hit: result.hit,
+        damage: result.damage,
+        isCritical: result.isCritical,
+        typeMultiplier: result.typeMultiplier,
+      }),
+    ]
+  );
+}
+
+async function rewardBattleWin(client, userId, session, state) {
+  const rewards = state.rewards || {};
+  const gold = Number(rewards.gold || 0);
+  const diamonds = Number(rewards.diamonds || 0);
+
+  if (gold > 0 || diamonds > 0) {
+    await client.query(
+      `
+      UPDATE game.trainer_wallets
+      SET gold = gold + $2,
+          diamonds = diamonds + $3,
+          updated_at = now()
+      WHERE user_id = $1
+      `,
+      [userId, gold, diamonds]
+    );
+
+    if (gold > 0) {
+      await client.query(
+        `
+        INSERT INTO game.wallet_transactions (user_id, currency, amount, reason, reference_type, reference_id)
+        VALUES ($1, 'gold', $2, 'battle_reward', 'battle', $3)
+        `,
+        [userId, gold, session.id]
+      );
+    }
+
+    if (diamonds > 0) {
+      await client.query(
+        `
+        INSERT INTO game.wallet_transactions (user_id, currency, amount, reason, reference_type, reference_id)
+        VALUES ($1, 'diamonds', $2, 'battle_reward', 'battle', $3)
+        `,
+        [userId, diamonds, session.id]
+      );
+    }
+  }
+
+  await incrementQuestProgress(userId, "battle_win", { battleType: session.battle_type }, client);
+  if (session.battle_type === "gym") {
+    await incrementQuestProgress(userId, "gym_win", { targetSlug: session.target_slug }, client);
+  }
+}
+
+async function submitBattleTurn(req, res) {
+  const battleId = String(req.params.battleId || "").trim();
+  const action = String(req.body?.action || "").trim().toLowerCase();
+  const skillSlug = req.body?.skillSlug || req.body?.skill_slug || null;
+  const skillId = req.body?.skillId || req.body?.skill_id || null;
+
+  if (action !== "skill") {
+    throw createHttpError(400, "INVALID_ACTION", "Only skill actions are supported.");
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+    const session = await loadBattleSessionForUser(client, req.user.id, battleId);
+
+    if (session.status !== "active") {
+      throw createHttpError(400, "BATTLE_ALREADY_FINISHED", "Battle is already finished.");
+    }
+
+    const state = session.battle_state || {};
+    const player = state.playerTeam?.[state.activePlayerIndex];
+    const enemy = state.enemyTeam?.[state.activeEnemyIndex];
+
+    if (!player || Number(player.current_hp || 0) <= 0) {
+      throw createHttpError(400, "ACTIVE_MONSTER_FAINTED", "Active monster is fainted.");
+    }
+
+    if (!enemy || Number(enemy.current_hp || 0) <= 0) {
+      throw createHttpError(400, "BATTLE_TURN_FAILED", "Active enemy is not available.");
+    }
+
+    const skill = findSkill(player, { skillSlug, skillId });
+    if (!skill) {
+      throw createHttpError(404, skillSlug || skillId ? "SKILL_NOT_AVAILABLE" : "SKILL_NOT_FOUND", "Skill is not available.");
+    }
+
+    const turnLog = [];
+    const playerTurn = applySkillTurn(player, enemy, skill, "player");
+    turnLog.push(playerTurn.logText);
+    await persistBattleTurn(client, session.id, Number(state.turn || 1) * 2 - 1, playerTurn);
+
+    if (Number(enemy.current_hp || 0) <= 0) {
+      turnLog.push(`${enemy.pokemon_name} cayó.`);
+      state.activeEnemyIndex = firstAliveIndex(state.enemyTeam);
+      if (state.activeEnemyIndex < 0) {
+        finishBattleState(state, "player");
+      } else {
+        turnLog.push(`${state.enemyTeam[state.activeEnemyIndex].pokemon_name} entra al combate.`);
+      }
+    }
+
+    if (!state.winner) {
+      const activeEnemy = state.enemyTeam[state.activeEnemyIndex];
+      const activePlayer = state.playerTeam[state.activePlayerIndex];
+      const enemySkill = chooseEnemySkill(activeEnemy, activePlayer);
+      if (!enemySkill) {
+        throw createHttpError(500, "BATTLE_TURN_FAILED", "Enemy has no available skills.");
+      }
+
+      const enemyTurn = applySkillTurn(activeEnemy, activePlayer, enemySkill, "enemy");
+      turnLog.push(enemyTurn.logText);
+      await persistBattleTurn(client, session.id, Number(state.turn || 1) * 2, enemyTurn);
+
+      if (Number(activePlayer.current_hp || 0) <= 0) {
+        turnLog.push(`${activePlayer.pokemon_name} cayó.`);
+        state.activePlayerIndex = firstAliveIndex(state.playerTeam);
+        if (state.activePlayerIndex < 0) {
+          finishBattleState(state, "enemy");
+        } else {
+          turnLog.push(`${state.playerTeam[state.activePlayerIndex].pokemon_name} entra al combate.`);
+        }
+      }
+    }
+
+    state.log = [...(state.log || []), ...turnLog].slice(-40);
+    state.turn = Number(state.turn || 1) + 1;
+
+    const finalStatus = state.winner === "player" ? "victory" : state.winner === "enemy" ? "defeat" : "active";
+    if (state.winner === "player") {
+      await rewardBattleWin(client, req.user.id, session, state);
+    }
+
+    const updated = await client.query(
+      `
+      UPDATE game.battle_sessions
+      SET battle_state = $2::jsonb,
+          status = $3,
+          winner = $4,
+          rewards = $5::jsonb,
+          finished_at = CASE WHEN $3 <> 'active' THEN COALESCE(finished_at, now()) ELSE finished_at END,
+          completed_at = CASE WHEN $3 <> 'active' THEN COALESCE(completed_at, now()) ELSE completed_at END
+      WHERE id = $1
+      RETURNING *
+      `,
+      [
+        session.id,
+        JSON.stringify(state),
+        finalStatus,
+        state.winner,
+        state.rewards ? JSON.stringify(state.rewards) : null,
+      ]
+    );
+
+    await client.query("COMMIT");
+    res.json(publicBattleState(updated.rows[0], state));
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (!error.code || error.code === "23514" || error.code === "23503") {
+      error.status = error.status || 500;
+      error.code = "BATTLE_TURN_FAILED";
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+app.get("/api/me/monsters/:playerMonsterId/skills", authRequired, asyncRoute(getMonsterBattleSkills));
+app.get("/api/gyms", authRequired, asyncRoute(getGyms));
+app.post("/api/battles/start", authRequired, asyncRoute(startBattle));
+app.get("/api/battles/:battleId", authRequired, asyncRoute(getBattle));
+app.post("/api/battles/:battleId/turn", authRequired, asyncRoute(submitBattleTurn));
 
 // =======================================================
 // Shop
