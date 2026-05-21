@@ -175,6 +175,7 @@ app.post("/api/auth/register", asyncRoute(async (req, res) => {
       passwordHash,
       trainerName,
     });
+    await ensurePlayerQuests(user.id);
     const profile = await getProfileByUserId(user.id);
     const token = signToken(user);
 
@@ -388,6 +389,8 @@ async function updateTeamSlot(req, res) {
       `,
       [req.user.id, slotNumber, playerMonsterId]
     );
+    const teamSize = await getTeamSize(req.user.id, client);
+    await incrementQuestProgress(req.user.id, "team_update", { teamSize }, client);
     await client.query("COMMIT");
 
     res.json(await getCurrentTeamRows(req.user.id));
@@ -419,6 +422,8 @@ async function clearTeamSlot(req, res) {
       `,
       [req.user.id, slotNumber]
     );
+    const teamSize = await getTeamSize(req.user.id, client);
+    await incrementQuestProgress(req.user.id, "team_update", { teamSize }, client);
     await client.query("COMMIT");
 
     res.json(await getCurrentTeamRows(req.user.id));
@@ -483,6 +488,8 @@ async function autoBuildTeam(req, res) {
       );
     }
 
+    const teamSize = await getTeamSize(req.user.id, client);
+    await incrementQuestProgress(req.user.id, "team_update", { teamSize }, client);
     await client.query("COMMIT");
 
     res.json(await getCurrentTeamRows(req.user.id));
@@ -560,6 +567,425 @@ app.post("/api/me/team/auto", authRequired, asyncRoute(autoBuildTeam));
 app.get("/api/me/collection", authRequired, asyncRoute(sendCurrentCollection));
 app.get("/api/me/pokedex-summary", authRequired, asyncRoute(sendCurrentPokedexSummary));
 app.get("/api/me/pokedex", authRequired, asyncRoute(sendCurrentPokedex));
+
+// =======================================================
+// Quests
+// =======================================================
+
+async function ensurePlayerQuests(userId, client = pool) {
+  await client.query(
+    `
+    INSERT INTO game.player_quests (user_id, quest_id, progress, completed, claimed, status)
+    SELECT $1, q.id, 0, false, false, 'active'
+    FROM game.quests q
+    WHERE q.is_active = true
+    ON CONFLICT (user_id, quest_id) DO NOTHING
+    `,
+    [userId]
+  );
+}
+
+async function getTeamSize(userId, client = pool) {
+  const result = await client.query(
+    `
+    SELECT COUNT(*)::int AS count
+    FROM game.player_team_slots
+    WHERE user_id = $1
+      AND player_monster_id IS NOT NULL
+    `,
+    [userId]
+  );
+  return Number(result.rows[0]?.count || 0);
+}
+
+async function getCaughtSpeciesCount(userId, client = pool) {
+  const result = await client.query(
+    `
+    SELECT COUNT(*)::int AS count
+    FROM game.player_pokedex
+    WHERE user_id = $1
+      AND caught = true
+    `,
+    [userId]
+  );
+  return Number(result.rows[0]?.count || 0);
+}
+
+async function completeEligibleQuests(userId, client = pool) {
+  await client.query(
+    `
+    UPDATE game.player_quests pq
+    SET
+      completed = true,
+      status = 'completed',
+      completed_at = COALESCE(pq.completed_at, now()),
+      updated_at = now()
+    FROM game.quests q
+    WHERE q.id = pq.quest_id
+      AND pq.user_id = $1
+      AND pq.claimed = false
+      AND COALESCE(pq.status, 'active') = 'active'
+      AND pq.progress >= q.target_value
+    `,
+    [userId]
+  );
+}
+
+async function updateQuestProgressByAmount(userId, targetType, amount, client = pool, targetItemSlug = null) {
+  const delta = Math.max(0, Number(amount || 0));
+  if (!delta) return;
+
+  await client.query(
+    `
+    UPDATE game.player_quests pq
+    SET
+      progress = LEAST(q.target_value, pq.progress + $3),
+      updated_at = now()
+    FROM game.quests q
+    WHERE q.id = pq.quest_id
+      AND pq.user_id = $1
+      AND q.is_active = true
+      AND q.target_type = $2
+      AND pq.claimed = false
+      AND COALESCE(pq.status, 'active') = 'active'
+      AND ($4::text IS NULL OR q.target_item_slug IS NULL OR q.target_item_slug = $4)
+    `,
+    [userId, targetType, delta, targetItemSlug]
+  );
+}
+
+async function updateQuestProgressMax(userId, targetType, value, client = pool) {
+  const progress = Math.max(0, Number(value || 0));
+
+  await client.query(
+    `
+    UPDATE game.player_quests pq
+    SET
+      progress = LEAST(q.target_value, GREATEST(pq.progress, $3)),
+      updated_at = now()
+    FROM game.quests q
+    WHERE q.id = pq.quest_id
+      AND pq.user_id = $1
+      AND q.is_active = true
+      AND q.target_type = $2
+      AND pq.claimed = false
+      AND COALESCE(pq.status, 'active') = 'active'
+    `,
+    [userId, targetType, progress]
+  );
+}
+
+async function incrementQuestProgress(userId, eventType, payload = {}, client = pool) {
+  await ensurePlayerQuests(userId, client);
+
+  if (eventType === "capture") {
+    await updateQuestProgressByAmount(userId, "capture", 1, client);
+
+    const typeSlugs = [
+      payload.primaryTypeSlug,
+      payload.secondaryTypeSlug,
+    ].filter(Boolean);
+
+    if (typeSlugs.length) {
+      await client.query(
+        `
+        UPDATE game.player_quests pq
+        SET
+          progress = LEAST(q.target_value, pq.progress + 1),
+          updated_at = now()
+        FROM game.quests q
+        WHERE q.id = pq.quest_id
+          AND pq.user_id = $1
+          AND q.is_active = true
+          AND q.target_type = 'capture_type'
+          AND q.target_type_slug = ANY($2::text[])
+          AND pq.claimed = false
+          AND COALESCE(pq.status, 'active') = 'active'
+        `,
+        [userId, typeSlugs]
+      );
+    }
+
+    if (payload.isShiny) {
+      await updateQuestProgressByAmount(userId, "capture_shiny", 1, client);
+    }
+  } else if (eventType === "buy_item") {
+    await updateQuestProgressByAmount(userId, "buy_item", payload.quantity || 1, client, payload.itemSlug || null);
+  } else if (eventType === "use_item") {
+    await updateQuestProgressByAmount(userId, "use_item", payload.quantity || 1, client, payload.itemSlug || null);
+  } else if (eventType === "evolve") {
+    await updateQuestProgressByAmount(userId, "evolve", 1, client);
+  } else if (eventType === "team_update") {
+    await updateQuestProgressMax(userId, "team_size", payload.teamSize || 0, client);
+  } else if (eventType === "pokedex_species") {
+    await updateQuestProgressMax(userId, "pokedex_species", payload.caughtSpeciesCount || 0, client);
+  }
+
+  await completeEligibleQuests(userId, client);
+}
+
+async function syncComputedQuestProgress(userId, client = pool) {
+  await ensurePlayerQuests(userId, client);
+
+  const captureCountResult = await client.query(
+    "SELECT COUNT(*)::int AS count FROM game.capture_logs WHERE user_id = $1",
+    [userId]
+  );
+  await updateQuestProgressMax(userId, "capture", captureCountResult.rows[0]?.count || 0, client);
+
+  const shinyCountResult = await client.query(
+    "SELECT COUNT(*)::int AS count FROM game.capture_logs WHERE user_id = $1 AND is_shiny = true",
+    [userId]
+  );
+  await updateQuestProgressMax(userId, "capture_shiny", shinyCountResult.rows[0]?.count || 0, client);
+
+  await updateQuestProgressMax(userId, "team_size", await getTeamSize(userId, client), client);
+  await updateQuestProgressMax(userId, "pokedex_species", await getCaughtSpeciesCount(userId, client), client);
+  await completeEligibleQuests(userId, client);
+}
+
+function questStatus(row) {
+  if (row.claimed || row.status === "claimed") return "claimed";
+  if (row.completed || row.status === "completed") return "completed";
+  return "active";
+}
+
+function formatQuest(row) {
+  const targetCount = Number(row.target_count || 0);
+  const progress = Math.min(Number(row.progress || 0), targetCount || Number(row.progress || 0));
+  const status = questStatus(row);
+
+  return {
+    quest_id: row.quest_id,
+    slug: row.slug,
+    title: row.title,
+    description: row.description,
+    quest_type: row.target_type,
+    category: row.quest_category,
+    target_type_slug: row.target_type_slug,
+    target_item_slug: row.target_item_slug,
+    progress,
+    target_count: targetCount,
+    status,
+    completed_at: row.completed_at,
+    claimed_at: row.claimed_at,
+    rewards: {
+      gold: Number(row.reward_gold || 0),
+      diamonds: Number(row.reward_diamonds || 0),
+      itemSlug: row.reward_item_slug,
+      itemName: row.reward_item_name,
+      itemQuantity: Number(row.reward_item_quantity || 0),
+    },
+    percent: targetCount > 0 ? Math.min(100, Math.round((progress / targetCount) * 100)) : 0,
+    can_claim: status === "completed",
+  };
+}
+
+async function getQuestRows(userId, client = pool) {
+  const result = await client.query(
+    `
+    SELECT
+      q.id AS quest_id,
+      q.slug,
+      q.name AS title,
+      q.description,
+      q.quest_type AS quest_category,
+      q.target_type,
+      q.target_value AS target_count,
+      q.target_type_slug,
+      q.target_item_slug,
+      q.reward_gold,
+      q.reward_diamonds,
+      q.reward_item_quantity,
+      ri.slug AS reward_item_slug,
+      COALESCE(ri.display_name, ri.name) AS reward_item_name,
+      pq.progress,
+      pq.completed,
+      pq.claimed,
+      pq.status,
+      pq.completed_at,
+      pq.claimed_at
+    FROM game.player_quests pq
+    JOIN game.quests q ON q.id = pq.quest_id
+    LEFT JOIN game.items ri ON ri.id = q.reward_item_id
+    WHERE pq.user_id = $1
+      AND q.is_active = true
+    ORDER BY
+      CASE
+        WHEN pq.claimed OR pq.status = 'claimed' THEN 3
+        WHEN pq.completed OR pq.status = 'completed' THEN 1
+        ELSE 2
+      END,
+      CASE WHEN q.target_value > 0 THEN pq.progress::numeric / q.target_value ELSE 0 END DESC,
+      q.sort_order,
+      q.created_at
+    `,
+    [userId]
+  );
+  return result.rows;
+}
+
+async function sendCurrentQuests(req, res) {
+  await syncComputedQuestProgress(req.user.id);
+  const rows = await getQuestRows(req.user.id);
+  res.json(rows.map(formatQuest));
+}
+
+async function claimQuestReward(req, res) {
+  const questId = String(req.params.questId || "").trim();
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+    await ensurePlayerQuests(req.user.id, client);
+
+    const questResult = await client.query(
+      `
+      SELECT
+        q.id AS quest_id,
+        q.slug,
+        q.name AS title,
+        q.description,
+        q.quest_type AS quest_category,
+        q.target_type,
+        q.target_value AS target_count,
+        q.target_type_slug,
+        q.target_item_slug,
+        q.reward_gold,
+        q.reward_diamonds,
+        q.reward_item_quantity,
+        ri.id AS reward_item_id,
+        ri.slug AS reward_item_slug,
+        COALESCE(ri.display_name, ri.name) AS reward_item_name,
+        pq.progress,
+        pq.completed,
+        pq.claimed,
+        pq.status,
+        pq.completed_at,
+        pq.claimed_at
+      FROM game.player_quests pq
+      JOIN game.quests q ON q.id = pq.quest_id
+      LEFT JOIN game.items ri ON ri.id = q.reward_item_id
+      WHERE pq.user_id = $1
+        AND (q.id::text = $2 OR q.slug = $2)
+      LIMIT 1
+      FOR UPDATE OF pq
+      `,
+      [req.user.id, questId]
+    );
+
+    if (!questResult.rows.length) {
+      throw createHttpError(404, "QUEST_NOT_FOUND", "Quest was not found.");
+    }
+
+    const quest = questResult.rows[0];
+    const status = questStatus(quest);
+
+    if (status === "claimed") {
+      throw createHttpError(400, "QUEST_ALREADY_CLAIMED", "Quest reward was already claimed.");
+    }
+
+    if (status !== "completed" && Number(quest.progress || 0) < Number(quest.target_count || 0)) {
+      throw createHttpError(400, "QUEST_NOT_COMPLETED", "Quest is not completed yet.");
+    }
+
+    let wallet = null;
+    if (Number(quest.reward_gold || 0) > 0 || Number(quest.reward_diamonds || 0) > 0) {
+      const walletResult = await client.query(
+        `
+        UPDATE game.trainer_wallets
+        SET
+          gold = gold + $2,
+          diamonds = diamonds + $3,
+          updated_at = now()
+        WHERE user_id = $1
+        RETURNING user_id, gold, diamonds, boss_tickets, season_exp, updated_at
+        `,
+        [req.user.id, Number(quest.reward_gold || 0), Number(quest.reward_diamonds || 0)]
+      );
+      wallet = walletResult.rows[0] || null;
+
+      if (Number(quest.reward_gold || 0) > 0) {
+        await client.query(
+          `
+          INSERT INTO game.wallet_transactions (user_id, currency, amount, reason, reference_type, reference_id)
+          VALUES ($1, 'gold', $2, 'quest_reward', 'quest', $3)
+          `,
+          [req.user.id, Number(quest.reward_gold || 0), quest.quest_id]
+        );
+      }
+
+      if (Number(quest.reward_diamonds || 0) > 0) {
+        await client.query(
+          `
+          INSERT INTO game.wallet_transactions (user_id, currency, amount, reason, reference_type, reference_id)
+          VALUES ($1, 'diamonds', $2, 'quest_reward', 'quest', $3)
+          `,
+          [req.user.id, Number(quest.reward_diamonds || 0), quest.quest_id]
+        );
+      }
+    }
+
+    if (quest.reward_item_id && Number(quest.reward_item_quantity || 0) > 0) {
+      await client.query(
+        `
+        INSERT INTO game.player_inventory (user_id, item_id, quantity)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (user_id, item_id)
+        DO UPDATE SET
+          quantity = game.player_inventory.quantity + EXCLUDED.quantity,
+          updated_at = now()
+        `,
+        [req.user.id, quest.reward_item_id, Number(quest.reward_item_quantity)]
+      );
+    }
+
+    await client.query(
+      `
+      UPDATE game.player_quests
+      SET
+        claimed = true,
+        status = 'claimed',
+        claimed_at = now(),
+        completed = true,
+        completed_at = COALESCE(completed_at, now()),
+        updated_at = now()
+      WHERE user_id = $1
+        AND quest_id = $2
+      `,
+      [req.user.id, quest.quest_id]
+    );
+
+    await client.query("COMMIT");
+
+    const [questRows, inventoryRows, walletRows] = await Promise.all([
+      getQuestRows(req.user.id),
+      getCurrentInventoryRows(req.user.id),
+      wallet ? Promise.resolve([wallet]) : query("SELECT * FROM game.trainer_wallets WHERE user_id = $1 LIMIT 1", [req.user.id]),
+    ]);
+    const claimedQuest = questRows.find((row) => String(row.quest_id) === String(quest.quest_id));
+
+    res.json({
+      ok: true,
+      quest: claimedQuest ? formatQuest(claimedQuest) : null,
+      rewards: formatQuest(quest).rewards,
+      wallet: walletRows[0] || null,
+      inventory: inventoryRows,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (!error.code || error.code === "23514" || error.code === "23503") {
+      error.status = error.status || 500;
+      error.code = "QUEST_REWARD_FAILED";
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+app.get("/api/me/quests", authRequired, asyncRoute(sendCurrentQuests));
+app.post("/api/me/quests/:questId/claim", authRequired, asyncRoute(claimQuestReward));
 
 // =======================================================
 // Shop
@@ -755,6 +1181,7 @@ async function buyShopItem(req, res) {
       );
     }
 
+    await incrementQuestProgress(req.user.id, "buy_item", { itemSlug: item.slug, quantity }, client);
     await client.query("COMMIT");
 
     res.json({
@@ -973,6 +1400,7 @@ async function useInventoryItem(req, res) {
       [req.user.id, item.item_id, quantity]
     );
 
+    await incrementQuestProgress(req.user.id, "use_item", { itemSlug: item.slug, quantity }, client);
     await client.query("COMMIT");
 
     const [inventory, updatedMonster, team] = await Promise.all([
@@ -1359,6 +1787,19 @@ async function evolveMonster(req, res) {
       [req.user.id, rule.to_species_id, !!monster.is_shiny, monster.is_shiny ? 1 : 0]
     );
 
+    await incrementQuestProgress(
+      req.user.id,
+      "evolve",
+      {
+        fromSpeciesId: rule.from_species_id,
+        toSpeciesId: rule.to_species_id,
+        trigger: rule.trigger,
+        itemSlug: rule.required_item_slug,
+      },
+      client
+    );
+    const caughtSpeciesCount = await getCaughtSpeciesCount(req.user.id, client);
+    await incrementQuestProgress(req.user.id, "pokedex_species", { caughtSpeciesCount }, client);
     await client.query("COMMIT");
 
     const [updatedMonster, inventory, team, pokedexSummary] = await Promise.all([
@@ -1453,6 +1894,44 @@ async function sendActiveEncounters(req, res) {
   res.json(rows);
 }
 
+async function syncCaptureQuestProgress(userId, captureResult) {
+  if (!captureResult?.success) return;
+
+  const speciesRows = await query(
+    `
+    SELECT
+      cl.species_id,
+      COALESCE(cl.is_shiny, $3::boolean) AS is_shiny,
+      pt.slug AS primary_type,
+      st.slug AS secondary_type
+    FROM game.capture_logs cl
+    JOIN game.monster_species ms ON ms.id = cl.species_id
+    LEFT JOIN game.monster_types pt ON pt.id = ms.primary_type_id
+    LEFT JOIN game.monster_types st ON st.id = ms.secondary_type_id
+    WHERE cl.user_id = $1
+      AND ($2::uuid IS NULL OR cl.player_monster_id = $2::uuid)
+    ORDER BY cl.created_at DESC
+    LIMIT 1
+    `,
+    [
+      userId,
+      captureResult.player_monster_id || captureResult.playerMonsterId || null,
+      !!captureResult.is_shiny,
+    ]
+  );
+
+  const capture = speciesRows[0] || {};
+  await incrementQuestProgress(userId, "capture", {
+    speciesId: capture.species_id || captureResult.species_id,
+    primaryTypeSlug: capture.primary_type || captureResult.primary_type,
+    secondaryTypeSlug: capture.secondary_type || captureResult.secondary_type,
+    isShiny: capture.is_shiny || captureResult.is_shiny,
+  });
+
+  const caughtSpeciesCount = await getCaughtSpeciesCount(userId);
+  await incrementQuestProgress(userId, "pokedex_species", { caughtSpeciesCount });
+}
+
 async function captureEncounter(req, res) {
   const encounterId = req.body?.encounterId || req.body?.encounter_id;
   const ballSlug = req.body?.ballSlug || req.body?.ball_slug || "poke-ball";
@@ -1470,7 +1949,15 @@ async function captureEncounter(req, res) {
     [req.user.id, encounterId, ballSlug]
   );
 
-  res.json(rows[0]);
+  const result = rows[0];
+
+  try {
+    await syncCaptureQuestProgress(req.user.id, result);
+  } catch (error) {
+    console.warn("Quest progress failed after capture:", error.code || error.message);
+  }
+
+  res.json(result);
 }
 
 async function captureLatestActiveEncounter(req, res) {

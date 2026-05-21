@@ -145,7 +145,7 @@ Ejemplo Rare Candy:
 }
 ```
 
-Items soportados en esta fase: `potion`, `super-potion`, `hyper-potion`, `revive` y `rare-candy`. Las piedras evolutivas quedan para una fase posterior.
+Items soportados en esta fase: `potion`, `super-potion`, `hyper-potion`, `revive` y `rare-candy`. Las piedras evolutivas se usan desde los endpoints de evoluciones.
 
 Errores esperados: `ITEM_NOT_FOUND`, `ITEM_NOT_USABLE`, `INVALID_QUANTITY`, `INSUFFICIENT_ITEM`, `MONSTER_NOT_FOUND`, `MONSTER_NOT_OWNED`, `MONSTER_ALREADY_FULL_HP`, `MONSTER_NOT_FAINTED`, `MAX_LEVEL_REACHED` y `ITEM_USE_FAILED`.
 
@@ -181,6 +181,43 @@ Tambien actualiza `game.player_pokedex` para la especie destino con `seen=true` 
 
 Errores esperados: `MONSTER_NOT_FOUND`, `MONSTER_NOT_OWNED`, `EVOLUTION_NOT_FOUND`, `EVOLUTION_NOT_AVAILABLE`, `LEVEL_TOO_LOW`, `REQUIRED_ITEM_MISSING`, `INSUFFICIENT_ITEM`, `ALREADY_FINAL_EVOLUTION`, `INVALID_EVOLUTION_RULE` y `EVOLUTION_FAILED`.
 
+### Misiones
+
+`GET /api/me/quests`
+
+Inicializa las misiones activas faltantes para el usuario actual, sincroniza progreso computable y devuelve:
+
+```json
+[
+  {
+    "quest_id": "UUID",
+    "slug": "capture_3",
+    "title": "Captura 3 criaturas",
+    "quest_type": "capture",
+    "progress": 1,
+    "target_count": 3,
+    "status": "active",
+    "can_claim": false,
+    "rewards": { "gold": 1000, "diamonds": 0, "itemSlug": "poke-ball", "itemQuantity": 5 }
+  }
+]
+```
+
+`POST /api/me/quests/:questId/claim`
+
+Reclama una mision completada. La entrega de oro, diamantes e items es transaccional y no se entrega automaticamente al completar la mision.
+
+Eventos de progreso integrados:
+
+- `capture`: avanza capturas generales, por tipo y shiny si aplica.
+- `buy_item`: avanza compras de tienda.
+- `use_item`: avanza uso de items desde Mochila.
+- `evolve`: avanza evoluciones.
+- `team_update`: sincroniza el tamano del equipo activo.
+- `pokedex_species`: sincroniza especies capturadas en Pokedex.
+
+Errores esperados: `QUEST_NOT_FOUND`, `QUEST_NOT_COMPLETED`, `QUEST_ALREADY_CLAIMED`, `QUEST_REWARD_FAILED` y `QUEST_PROGRESS_FAILED`.
+
 ## Prueba rapida
 
 Crear encuentro:
@@ -208,7 +245,9 @@ La migracion segura de auth esta en:
 ```txt
 database/migrations/20260518_auth_users.sql
 database/migrations/20260519_rare_candy_item.sql
+database/migrations/20260520_real_quests.sql
 ```
 
 Agrega `password_hash` y `last_login_at` con `ADD COLUMN IF NOT EXISTS`, sin borrar datos ni cambiar IDs existentes.
 La migracion de `rare-candy` agrega el item y su categoria de forma idempotente si faltan en la base.
+La migracion de misiones agrega columnas compatibles a `game.quests` y `game.player_quests`, y siembra las misiones base con `ON CONFLICT`.
