@@ -213,6 +213,9 @@ Eventos de progreso integrados:
 - `buy_item`: avanza compras de tienda.
 - `use_item`: avanza uso de items desde Mochila.
 - `evolve`: avanza evoluciones.
+- `battle_win`: avanza victorias PvE.
+- `gym_win`: avanza victorias de gimnasio.
+- `badge_earned`: avanza medallas ganadas.
 - `team_update`: sincroniza el tamano del equipo activo.
 - `pokedex_species`: sincroniza especies capturadas en Pokedex.
 
@@ -226,7 +229,15 @@ Devuelve hasta 4 skills disponibles para una criatura del usuario actual.
 
 `GET /api/gyms`
 
-Lista gimnasios reales desde `game.gyms`, con region, tipo, medalla, poder recomendado y tamano de equipo si existe.
+Lista gimnasios reales desde `game.gyms`, con region, tipo, medalla, poder recomendado, recompensa y estado del jugador:
+
+- `is_unlocked`
+- `is_completed`
+- `wins`
+- `completed_at`
+- `reward_gold`
+- `reward_items`
+- `required_previous_gym`
 
 `POST /api/battles/start`
 
@@ -237,11 +248,11 @@ Lista gimnasios reales desde `game.gyms`, con region, tipo, medalla, poder recom
 }
 ```
 
-Usa el equipo activo real del jugador. Si un gimnasio aun no tiene filas en `game.gym_trainer_team`, el backend genera un equipo PvE basico segun el tipo del gimnasio para mantener la fase jugable.
+Usa el equipo activo real del jugador. Si un gimnasio esta bloqueado responde `GYM_LOCKED`. Si un gimnasio aun no tiene filas en `game.gym_trainer_team`, el backend genera un equipo PvE basico segun el tipo del gimnasio para mantener la fase jugable.
 
 `GET /api/battles/:battleId`
 
-Devuelve estado de batalla, equipos, HP, criatura activa, skills disponibles, log, ganador y recompensas.
+Devuelve estado de batalla, equipos, HP, criatura activa, skills disponibles, items disponibles en batalla, log, ganador y recompensas.
 
 `POST /api/battles/:battleId/turn`
 
@@ -254,7 +265,46 @@ Devuelve estado de batalla, equipos, HP, criatura activa, skills disponibles, lo
 
 El frontend no calcula dano. El backend valida la skill del Pokemon activo, calcula precision, dano, STAB, efectividad simple, critico, respuesta enemiga y guarda `battle_state` mas filas en `game.battle_turns`.
 
-Errores esperados: `BATTLE_NOT_FOUND`, `BATTLE_NOT_OWNED`, `BATTLE_ALREADY_FINISHED`, `TEAM_EMPTY`, `GYM_NOT_FOUND`, `NPC_NOT_FOUND`, `INVALID_BATTLE_TYPE`, `INVALID_ACTION`, `SKILL_NOT_FOUND`, `SKILL_NOT_AVAILABLE`, `ACTIVE_MONSTER_FAINTED`, `BATTLE_TURN_FAILED` y `BATTLE_REWARD_FAILED`.
+Tambien soporta cambiar criatura. Cambiar consume turno y el enemigo responde:
+
+```json
+{
+  "action": "switch",
+  "targetPlayerMonsterId": "uuid"
+}
+```
+
+Y usar items permitidos durante batalla. El item se descuenta del inventario real y el HP modificado vive en `battle_state`:
+
+```json
+{
+  "action": "use_item",
+  "itemSlug": "potion",
+  "targetPlayerMonsterId": "uuid"
+}
+```
+
+Items permitidos en batalla: `potion`, `super-potion`, `hyper-potion` y `revive`.
+
+Al ganar una batalla de tipo `gym`, la victoria guarda progreso en `game.player_gym_progress`, entrega medalla en `game.player_achievements`, entrega recompensa, registra `wallet_transactions` e incrementa misiones `battle_win`, `gym_win` y `badge_earned` cuando aplica. La recompensa completa se entrega solo en la primera victoria de cada gimnasio; repetirlo entrega una recompensa reducida.
+
+Errores esperados: `BATTLE_NOT_FOUND`, `BATTLE_NOT_OWNED`, `BATTLE_ALREADY_FINISHED`, `TEAM_EMPTY`, `GYM_NOT_FOUND`, `GYM_LOCKED`, `NPC_NOT_FOUND`, `INVALID_BATTLE_TYPE`, `INVALID_ACTION`, `SKILL_NOT_FOUND`, `SKILL_NOT_AVAILABLE`, `ACTIVE_MONSTER_FAINTED`, `MONSTER_NOT_IN_BATTLE`, `MONSTER_FAINTED`, `MONSTER_ALREADY_ACTIVE`, `ITEM_NOT_ALLOWED_IN_BATTLE`, `ITEM_NOT_FOUND`, `INSUFFICIENT_ITEM`, `MONSTER_ALREADY_FULL_HP`, `MONSTER_NOT_FAINTED`, `SWITCH_FAILED`, `ITEM_USE_FAILED`, `BATTLE_TURN_FAILED`, `GYM_PROGRESS_FAILED`, `BADGE_GRANT_FAILED` y `BATTLE_REWARD_FAILED`.
+
+### Progreso de gimnasios y medallas
+
+`GET /api/me/gym-progress`
+
+Devuelve:
+
+- `total_gyms`
+- `completed_gyms`
+- `badges`
+- `gyms`
+- `next_gym`
+
+`GET /api/me/badges`
+
+Devuelve las medallas de gimnasio desbloqueadas desde `game.player_achievements`.
 
 ## Prueba rapida
 
@@ -285,9 +335,13 @@ database/migrations/20260518_auth_users.sql
 database/migrations/20260519_rare_candy_item.sql
 database/migrations/20260520_real_quests.sql
 database/migrations/20260521_pve_battles_skills.sql
+database/migrations/20260521_gym_progress_badges.sql
+database/migrations/20260522_battle_switch_items.sql
 ```
 
 Agrega `password_hash` y `last_login_at` con `ADD COLUMN IF NOT EXISTS`, sin borrar datos ni cambiar IDs existentes.
 La migracion de `rare-candy` agrega el item y su categoria de forma idempotente si faltan en la base.
 La migracion de misiones agrega columnas compatibles a `game.quests` y `game.player_quests`, y siembra las misiones base con `ON CONFLICT`.
 La migracion de batallas crea `game.skills`, `game.monster_species_skills`, asigna skills basicas por tipo y agrega columnas JSON/resultado a `battle_sessions` y `battle_turns`.
+La migracion de progreso de gimnasios crea `game.player_gym_progress`, siembra achievements de medallas y agrega misiones de batalla/gimnasio de forma idempotente.
+La migracion de acciones de batalla agrega columnas opcionales `item_slug` e `item_name` a `game.battle_turns` para registrar items usados durante combate.

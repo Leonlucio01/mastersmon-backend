@@ -719,6 +719,8 @@ async function incrementQuestProgress(userId, eventType, payload = {}, client = 
     await updateQuestProgressByAmount(userId, "battle_win", 1, client);
   } else if (eventType === "gym_win") {
     await updateQuestProgressByAmount(userId, "gym_win", 1, client);
+  } else if (eventType === "badge_earned") {
+    await updateQuestProgressByAmount(userId, "badge_earned", 1, client);
   } else if (eventType === "team_update") {
     await updateQuestProgressMax(userId, "team_size", payload.teamSize || 0, client);
   } else if (eventType === "pokedex_species") {
@@ -1243,36 +1245,223 @@ async function getPlayerBattleTeam(userId, client = pool) {
   return team;
 }
 
+function gymBadgeSlug(gym) {
+  return `badge_${String(gym.slug || "").replace(/-/g, "_")}`;
+}
+
+function gymRewardFor(gym, firstClear = true) {
+  if (!firstClear) {
+    return {
+      gold: 500,
+      diamonds: 0,
+      items: [],
+      first_clear: false,
+    };
+  }
+
+  const order = Number(gym.gym_order || 1);
+  const rewardsByOrder = {
+    1: { gold: 2500, items: [{ slug: "great-ball", quantity: 5 }] },
+    2: { gold: 3500, items: [{ slug: "rare-candy", quantity: 1 }] },
+    3: { gold: 5000, items: [{ slug: "thunder-stone", quantity: 1 }] },
+  };
+  const configured = rewardsByOrder[order] || {
+    gold: Math.max(2500, order * 1500),
+    items: order % 2 === 0 ? [{ slug: "great-ball", quantity: 3 }] : [],
+  };
+
+  return {
+    gold: configured.gold,
+    diamonds: 0,
+    items: configured.items,
+    first_clear: true,
+  };
+}
+
+const rewardItemCache = new Map();
+
+async function decorateRewardItems(reward, client = pool) {
+  const items = reward.items || [];
+  if (!items.length) return { ...reward, items: [] };
+
+  const slugs = items.map((item) => item.slug);
+  const missingSlugs = slugs.filter((slug) => slug && !rewardItemCache.has(slug));
+  if (missingSlugs.length) {
+    const result = await client.query(
+      `
+      SELECT slug, display_name, name, icon_path
+      FROM game.items
+      WHERE slug = ANY($1::text[])
+      `,
+      [missingSlugs]
+    );
+    result.rows.forEach((row) => rewardItemCache.set(row.slug, row));
+  }
+
+  return {
+    ...reward,
+    items: items.map((item) => {
+      const row = rewardItemCache.get(item.slug) || {};
+      return {
+        slug: item.slug,
+        quantity: Number(item.quantity || 0),
+        display_name: row.display_name || row.name || item.slug,
+        icon_path: row.icon_path || null,
+      };
+    }),
+  };
+}
+
+async function getGymRowsForUser(userId, client = pool) {
+  const result = await client.query(
+    `
+    WITH ordered_gyms AS (
+      SELECT
+        g.id,
+        g.slug,
+        g.name,
+        g.gym_order,
+        g.badge_name,
+        g.badge_icon_path,
+        g.recommended_power,
+        g.required_trainer_level,
+        g.region_id,
+        r.slug AS region_slug,
+        r.name AS region_name,
+        r.generation_id,
+        mt.slug AS type_slug,
+        mt.name AS type_name,
+        nt.slug AS leader_slug,
+        nt.name AS leader_name,
+        nt.avatar_path AS leader_avatar_path,
+        COUNT(gtt.id)::int AS team_size,
+        ROW_NUMBER() OVER (
+          PARTITION BY g.region_id
+          ORDER BY g.gym_order, g.name, g.id
+        ) AS region_order,
+        LAG(g.id) OVER (
+          PARTITION BY g.region_id
+          ORDER BY g.gym_order, g.name, g.id
+        ) AS previous_gym_id
+      FROM game.gyms g
+      LEFT JOIN game.regions r ON r.id = g.region_id
+      LEFT JOIN game.monster_types mt ON mt.id = g.type_id
+      LEFT JOIN game.npc_trainers nt ON nt.id = g.leader_id
+      LEFT JOIN game.gym_trainer_team gtt ON gtt.gym_id = g.id
+      GROUP BY g.id, r.slug, r.name, r.generation_id, mt.slug, mt.name, nt.slug, nt.name, nt.avatar_path
+    )
+    SELECT
+      og.*,
+      pgp.status AS progress_status,
+      pgp.wins,
+      pgp.best_turns,
+      pgp.completed_at,
+      prev.status AS previous_status,
+      prev.completed_at AS previous_completed_at
+    FROM ordered_gyms og
+    LEFT JOIN game.player_gym_progress pgp
+      ON pgp.user_id = $1
+     AND pgp.gym_id = og.id
+    LEFT JOIN game.player_gym_progress prev
+      ON prev.user_id = $1
+     AND prev.gym_id = og.previous_gym_id
+    ORDER BY COALESCE(og.generation_id, 1), og.gym_order, og.name
+    `,
+    [userId]
+  );
+
+  const rows = [];
+  for (const row of result.rows) {
+    const isCompleted = row.progress_status === "completed";
+    const isUnlocked = Number(row.region_order || 1) === 1 || row.previous_status === "completed";
+    const reward = await decorateRewardItems(gymRewardFor(row, true), client);
+    rows.push({
+      ...row,
+      gym_id: row.id,
+      status: isCompleted ? "completed" : isUnlocked ? "available" : "locked",
+      is_unlocked: isUnlocked,
+      is_completed: isCompleted,
+      wins: Number(row.wins || 0),
+      reward_gold: reward.gold,
+      reward_items: reward.items,
+      repeat_reward_gold: 500,
+      required_previous_gym: row.previous_gym_id,
+    });
+  }
+  return rows;
+}
+
+async function getGymProgressState(userId, gymId, client = pool) {
+  const rows = await getGymRowsForUser(userId, client);
+  return rows.find((row) => String(row.id) === String(gymId)) || null;
+}
+
 async function getGyms(req, res) {
-  const rows = await query(
+  const rows = await getGymRowsForUser(req.user.id);
+  res.json(rows);
+}
+
+async function getGymProgress(req, res) {
+  const gyms = await getGymRowsForUser(req.user.id);
+  const completed = gyms.filter((gym) => gym.is_completed);
+  const nextGym = gyms.find((gym) => gym.is_unlocked && !gym.is_completed) || null;
+  const badges = await getPlayerBadgesRows(req.user.id);
+
+  res.json({
+    ok: true,
+    total_gyms: gyms.length,
+    completed_gyms: completed.length,
+    badges,
+    gyms,
+    next_gym: nextGym,
+  });
+}
+
+async function getPlayerBadgesRows(userId, client = pool) {
+  const result = await client.query(
     `
     SELECT
-      g.id,
-      g.slug,
-      g.name,
-      g.gym_order,
+      a.slug,
+      a.name,
+      a.description,
+      pa.unlocked_at AS earned_at,
+      g.slug AS gym_slug,
+      g.badge_icon_path AS icon_path,
       g.badge_name,
-      g.badge_icon_path,
-      g.recommended_power,
-      g.required_trainer_level,
       r.slug AS region_slug,
       r.name AS region_name,
-      mt.slug AS type_slug,
-      mt.name AS type_name,
-      nt.slug AS leader_slug,
-      nt.name AS leader_name,
-      nt.avatar_path AS leader_avatar_path,
-      COUNT(gtt.id)::int AS team_size
-    FROM game.gyms g
+      g.gym_order
+    FROM game.player_achievements pa
+    JOIN game.achievements a ON a.id = pa.achievement_id
+    LEFT JOIN game.gyms g ON a.slug = ('badge_' || replace(g.slug, '-', '_'))
     LEFT JOIN game.regions r ON r.id = g.region_id
-    LEFT JOIN game.monster_types mt ON mt.id = g.type_id
-    LEFT JOIN game.npc_trainers nt ON nt.id = g.leader_id
-    LEFT JOIN game.gym_trainer_team gtt ON gtt.gym_id = g.id
-    GROUP BY g.id, r.generation_id, r.slug, r.name, mt.slug, mt.name, nt.slug, nt.name, nt.avatar_path
-    ORDER BY COALESCE(r.generation_id, 1), g.gym_order, g.name
-    `
+    WHERE pa.user_id = $1
+      AND pa.unlocked = true
+      AND a.target_type = 'gym_badge'
+    ORDER BY COALESCE(r.generation_id, 1), g.gym_order, a.name
+    `,
+    [userId]
   );
-  res.json(rows);
+
+  return result.rows.map((row) => ({
+    slug: row.slug,
+    name: row.badge_name || row.name,
+    description: row.description,
+    icon_path: row.icon_path || null,
+    earned_at: row.earned_at,
+    gym_slug: row.gym_slug,
+    region_slug: row.region_slug,
+    region_name: row.region_name,
+    gym_order: row.gym_order,
+  }));
+}
+
+async function getPlayerBadges(req, res) {
+  const badges = await getPlayerBadgesRows(req.user.id);
+  res.json({
+    ok: true,
+    badges,
+  });
 }
 
 async function findGymForBattle(targetSlug, client = pool) {
@@ -1389,9 +1578,58 @@ function firstAliveIndex(team) {
   return team.findIndex((monster) => Number(monster.current_hp || 0) > 0);
 }
 
-function publicBattleState(session, state) {
+const BATTLE_ITEM_DEFAULTS = {
+  "potion": { heal: 20, label: "Potion" },
+  "super-potion": { heal: 60, label: "Super Potion" },
+  "hyper-potion": { heal: 120, label: "Hyper Potion" },
+  "revive": { heal: 0, label: "Revive" },
+};
+
+function battleMonsterHp(monster) {
+  return {
+    hp: Math.max(0, Number(monster?.current_hp || 0)),
+    max: Math.max(1, Number(monster?.max_hp || 1)),
+  };
+}
+
+async function getBattleItems(userId, client = pool) {
+  const slugs = Object.keys(BATTLE_ITEM_DEFAULTS);
+  const result = await client.query(
+    `
+    SELECT
+      i.id AS item_id,
+      i.slug,
+      i.name,
+      i.display_name,
+      i.icon_path,
+      i.heal_amount,
+      COALESCE(pi.quantity, 0)::int AS quantity
+    FROM game.items i
+    LEFT JOIN game.player_inventory pi
+      ON pi.item_id = i.id
+     AND pi.user_id = $1
+    WHERE i.slug = ANY($2::text[])
+    ORDER BY array_position($2::text[], i.slug)
+    `,
+    [userId, slugs]
+  );
+
+  return result.rows.map((row) => ({
+    item_id: row.item_id,
+    slug: row.slug,
+    item_slug: row.slug,
+    name: row.name,
+    display_name: row.display_name || row.name || BATTLE_ITEM_DEFAULTS[row.slug]?.label || row.slug,
+    icon_path: row.icon_path,
+    heal_amount: Number(row.heal_amount || BATTLE_ITEM_DEFAULTS[row.slug]?.heal || 0),
+    quantity: Number(row.quantity || 0),
+  }));
+}
+
+async function publicBattleState(session, state, userId = null, client = pool) {
   const activePlayer = state.playerTeam[state.activePlayerIndex] || null;
   const activeEnemy = state.enemyTeam[state.activeEnemyIndex] || null;
+  const battleItems = userId ? await getBattleItems(userId, client) : [];
 
   return {
     ok: true,
@@ -1409,6 +1647,7 @@ function publicBattleState(session, state) {
     active_player_monster: activePlayer ? { ...activePlayer, hp_percent: hpPercent(activePlayer) } : null,
     active_enemy_monster: activeEnemy ? { ...activeEnemy, hp_percent: hpPercent(activeEnemy) } : null,
     available_skills: activePlayer?.skills || [],
+    battle_items: battleItems,
     log: state.log || [],
   };
 }
@@ -1439,6 +1678,13 @@ async function startBattle(req, res) {
       throw createHttpError(404, battleType === "gym" ? "GYM_NOT_FOUND" : "NPC_NOT_FOUND", "Gym was not found.");
     }
 
+    if (battleType === "gym") {
+      const gymState = await getGymProgressState(req.user.id, gym.id, client);
+      if (!gymState?.is_unlocked) {
+        throw createHttpError(403, "GYM_LOCKED", "Complete the previous gym first.");
+      }
+    }
+
     const enemyTeam = await buildGymEnemyTeam(gym, client);
     const state = {
       battleType,
@@ -1447,7 +1693,9 @@ async function startBattle(req, res) {
         id: gym.id,
         slug: gym.slug,
         name: gym.name,
+        gym_order: gym.gym_order,
         badge_name: gym.badge_name,
+        badge_icon_path: gym.badge_icon_path,
         type_slug: gym.type_slug,
       },
       playerTeam,
@@ -1470,7 +1718,7 @@ async function startBattle(req, res) {
     );
 
     await client.query("COMMIT");
-    res.status(201).json(publicBattleState(inserted.rows[0], state));
+    res.status(201).json(await publicBattleState(inserted.rows[0], state, req.user.id, client));
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {});
     throw error;
@@ -1511,7 +1759,7 @@ async function getBattle(req, res) {
   if (String(rows[0].user_id) !== String(req.user.id)) {
     throw createHttpError(403, "BATTLE_NOT_OWNED", "Battle does not belong to the current user.");
   }
-  res.json(publicBattleState(rows[0], rows[0].battle_state || {}));
+  res.json(await publicBattleState(rows[0], rows[0].battle_state || {}, req.user.id));
 }
 
 function findSkill(monster, { skillSlug, skillId }) {
@@ -1571,16 +1819,12 @@ function chooseEnemySkill(enemy, target) {
 
 function finishBattleState(state, winner) {
   state.winner = winner;
-  state.rewards = winner === "player"
-    ? {
-        gold: Math.max(500, Number(state.gym?.gym_order || 1) * 1000 || 1500),
-        diamonds: 0,
-      }
-    : null;
+  state.rewards = null;
   state.log.push(winner === "player" ? "Victoria. Recompensas listas." : "Derrota. Tu equipo cayó en combate.");
 }
 
 async function persistBattleTurn(client, battleId, turnNumber, result) {
+  const actionType = result.actionType || "skill";
   await client.query(
     `
     INSERT INTO game.battle_turns (
@@ -1599,11 +1843,14 @@ async function persistBattleTurn(client, battleId, turnNumber, result) {
       skill_name,
       is_critical,
       type_multiplier,
+      item_slug,
+      item_name,
       result
     )
-    VALUES ($1, $2, $3, $4, 'skill', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18::jsonb)
     ON CONFLICT (battle_id, turn_number)
     DO UPDATE SET
+      action_type = EXCLUDED.action_type,
       damage = EXCLUDED.damage,
       log_text = EXCLUDED.log_text,
       actor_side = EXCLUDED.actor_side,
@@ -1614,6 +1861,8 @@ async function persistBattleTurn(client, battleId, turnNumber, result) {
       skill_name = EXCLUDED.skill_name,
       is_critical = EXCLUDED.is_critical,
       type_multiplier = EXCLUDED.type_multiplier,
+      item_slug = EXCLUDED.item_slug,
+      item_name = EXCLUDED.item_name,
       result = EXCLUDED.result
     `,
     [
@@ -1621,71 +1870,479 @@ async function persistBattleTurn(client, battleId, turnNumber, result) {
       turnNumber,
       result.actorSide === "player" ? result.actor.player_monster_id : null,
       result.actorSide === "enemy" ? result.target.player_monster_id : null,
-      result.damage,
+      actionType,
+      Number(result.damage || 0),
       result.logText,
       result.actorSide,
-      result.actor.pokemon_name,
-      result.target.pokemon_name,
-      result.skill.skill_id,
-      result.skill.slug,
-      result.skill.name,
+      result.actor?.pokemon_name || null,
+      result.target?.pokemon_name || null,
+      result.skill?.skill_id || null,
+      result.skill?.slug || null,
+      result.skill?.name || null,
       !!result.isCritical,
-      result.typeMultiplier,
+      Number(result.typeMultiplier || 1),
+      result.item?.slug || null,
+      result.item?.display_name || result.item?.name || null,
       JSON.stringify({
+        ...(result.result || {}),
+        action: actionType,
         hit: result.hit,
-        damage: result.damage,
-        isCritical: result.isCritical,
-        typeMultiplier: result.typeMultiplier,
+        damage: Number(result.damage || 0),
+        isCritical: !!result.isCritical,
+        typeMultiplier: Number(result.typeMultiplier || 1),
       }),
     ]
   );
 }
 
-async function rewardBattleWin(client, userId, session, state) {
-  const rewards = state.rewards || {};
-  const gold = Number(rewards.gold || 0);
-  const diamonds = Number(rewards.diamonds || 0);
+async function grantRewardItems(client, userId, items = []) {
+  if (!items.length) return [];
 
-  if (gold > 0 || diamonds > 0) {
-    await client.query(
+  const granted = [];
+  for (const rewardItem of items) {
+    const quantity = Math.max(0, Math.floor(Number(rewardItem.quantity || 0)));
+    if (!rewardItem.slug || quantity <= 0) continue;
+
+    const itemResult = await client.query(
       `
-      UPDATE game.trainer_wallets
-      SET gold = gold + $2,
-          diamonds = diamonds + $3,
-          updated_at = now()
-      WHERE user_id = $1
+      SELECT id, slug, display_name, name, icon_path
+      FROM game.items
+      WHERE slug = $1
+      LIMIT 1
       `,
-      [userId, gold, diamonds]
+      [rewardItem.slug]
     );
 
-    if (gold > 0) {
-      await client.query(
-        `
-        INSERT INTO game.wallet_transactions (user_id, currency, amount, reason, reference_type, reference_id)
-        VALUES ($1, 'gold', $2, 'battle_reward', 'battle', $3)
-        `,
-        [userId, gold, session.id]
-      );
+    if (!itemResult.rows.length) {
+      console.warn(`Gym reward item not found: ${rewardItem.slug}`);
+      continue;
     }
 
-    if (diamonds > 0) {
-      await client.query(
-        `
-        INSERT INTO game.wallet_transactions (user_id, currency, amount, reason, reference_type, reference_id)
-        VALUES ($1, 'diamonds', $2, 'battle_reward', 'battle', $3)
-        `,
-        [userId, diamonds, session.id]
-      );
-    }
+    const item = itemResult.rows[0];
+    await client.query(
+      `
+      INSERT INTO game.player_inventory (user_id, item_id, quantity, updated_at)
+      VALUES ($1, $2, $3, now())
+      ON CONFLICT (user_id, item_id)
+      DO UPDATE SET
+        quantity = game.player_inventory.quantity + EXCLUDED.quantity,
+        updated_at = now()
+      `,
+      [userId, item.id, quantity]
+    );
+
+    granted.push({
+      slug: item.slug,
+      quantity,
+      display_name: item.display_name || item.name || item.slug,
+      icon_path: item.icon_path || null,
+    });
   }
 
-  await incrementQuestProgress(userId, "battle_win", { battleType: session.battle_type }, client);
-  if (session.battle_type === "gym") {
-    await incrementQuestProgress(userId, "gym_win", { targetSlug: session.target_slug }, client);
+  return granted;
+}
+
+async function grantGymBadge(client, userId, gym) {
+  const slug = gymBadgeSlug(gym);
+  const achievementResult = await client.query(
+    `
+    INSERT INTO game.achievements (slug, name, description, target_type, target_value, reward_title)
+    VALUES ($1, $2, $3, 'gym_badge', 1, $2)
+    ON CONFLICT (slug) DO UPDATE
+    SET
+      name = EXCLUDED.name,
+      description = EXCLUDED.description,
+      target_type = EXCLUDED.target_type,
+      target_value = EXCLUDED.target_value,
+      reward_title = EXCLUDED.reward_title
+    RETURNING *
+    `,
+    [
+      slug,
+      gym.badge_name || `${gym.name} Badge`,
+      `Medalla obtenida al derrotar ${gym.name}.`,
+    ]
+  );
+
+  const achievement = achievementResult.rows[0];
+  const grantResult = await client.query(
+    `
+    INSERT INTO game.player_achievements (user_id, achievement_id, progress, unlocked, claimed, unlocked_at)
+    VALUES ($1, $2, 1, true, true, now())
+    ON CONFLICT (user_id, achievement_id)
+    DO UPDATE SET
+      progress = GREATEST(game.player_achievements.progress, 1),
+      unlocked = true,
+      claimed = true,
+      unlocked_at = COALESCE(game.player_achievements.unlocked_at, now())
+    RETURNING unlocked_at
+    `,
+    [userId, achievement.id]
+  );
+
+  return {
+    slug: achievement.slug,
+    name: achievement.name,
+    description: achievement.description,
+    icon_path: gym.badge_icon_path || null,
+    earned_at: grantResult.rows[0]?.unlocked_at || new Date().toISOString(),
+    gym_slug: gym.slug,
+  };
+}
+
+async function updateGymProgressOnWin(client, userId, session, state) {
+  const gymResult = await client.query(
+    `
+    SELECT
+      g.*,
+      r.slug AS region_slug,
+      r.name AS region_name,
+      r.generation_id,
+      mt.slug AS type_slug,
+      mt.name AS type_name
+    FROM game.gyms g
+    LEFT JOIN game.regions r ON r.id = g.region_id
+    LEFT JOIN game.monster_types mt ON mt.id = g.type_id
+    WHERE g.id = $1
+       OR g.slug = $2
+    LIMIT 1
+    `,
+    [session.gym_id || null, session.target_slug || state.targetSlug || null]
+  );
+
+  if (!gymResult.rows.length) {
+    throw createHttpError(404, "GYM_NOT_FOUND", "Gym was not found.");
+  }
+
+  const gym = gymResult.rows[0];
+  await client.query(
+    `
+    INSERT INTO game.player_gym_progress (user_id, gym_id, status, wins, created_at, updated_at)
+    VALUES ($1, $2, 'available', 0, now(), now())
+    ON CONFLICT (user_id, gym_id) DO NOTHING
+    `,
+    [userId, gym.id]
+  );
+
+  const progressResult = await client.query(
+    `
+    SELECT *
+    FROM game.player_gym_progress
+    WHERE user_id = $1
+      AND gym_id = $2
+    FOR UPDATE
+    `,
+    [userId, gym.id]
+  );
+
+  const progress = progressResult.rows[0];
+  const firstClear = progress.status !== "completed";
+  const turnsTaken = Math.max(1, Number(state.turn || 1) - 1);
+  const rewards = await decorateRewardItems(gymRewardFor(gym, firstClear), client);
+  const grantedItems = await grantRewardItems(client, userId, rewards.items);
+  rewards.items = grantedItems;
+
+  await client.query(
+    `
+    UPDATE game.player_gym_progress
+    SET
+      status = 'completed',
+      wins = wins + 1,
+      best_turns = CASE
+        WHEN best_turns IS NULL THEN $3
+        ELSE LEAST(best_turns, $3)
+      END,
+      last_battle_session_id = $4,
+      completed_at = COALESCE(completed_at, now()),
+      updated_at = now()
+    WHERE user_id = $1
+      AND gym_id = $2
+    `,
+    [userId, gym.id, turnsTaken, session.id]
+  );
+
+  let badge = null;
+  if (firstClear) {
+    try {
+      badge = await grantGymBadge(client, userId, gym);
+    } catch (error) {
+      throw createHttpError(500, "BADGE_GRANT_FAILED", "Could not grant gym badge.");
+    }
+    await incrementQuestProgress(userId, "badge_earned", { gymSlug: gym.slug }, client);
+  }
+
+  return {
+    gym,
+    firstClear,
+    rewards: {
+      ...rewards,
+      badge,
+      gym_slug: gym.slug,
+      gym_name: gym.name,
+    },
+  };
+}
+
+async function rewardBattleWin(client, userId, session, state) {
+  try {
+    let rewards = state.rewards || null;
+    if (session.battle_type === "gym") {
+      const gymReward = await updateGymProgressOnWin(client, userId, session, state);
+      rewards = gymReward.rewards;
+    } else {
+      rewards = {
+        gold: 1000,
+        diamonds: 0,
+        items: [],
+        first_clear: true,
+      };
+    }
+
+    const gold = Number(rewards.gold || 0);
+    const diamonds = Number(rewards.diamonds || 0);
+
+    if (gold > 0 || diamonds > 0) {
+      await client.query(
+        `
+        UPDATE game.trainer_wallets
+        SET gold = gold + $2,
+            diamonds = diamonds + $3,
+            updated_at = now()
+        WHERE user_id = $1
+        `,
+        [userId, gold, diamonds]
+      );
+
+      if (gold > 0) {
+        await client.query(
+          `
+          INSERT INTO game.wallet_transactions (user_id, currency, amount, reason, reference_type, reference_id)
+          VALUES ($1, 'gold', $2, $3, 'battle', $4)
+          `,
+          [userId, gold, session.battle_type === "gym" ? "gym_reward" : "battle_reward", session.id]
+        );
+      }
+
+      if (diamonds > 0) {
+        await client.query(
+          `
+          INSERT INTO game.wallet_transactions (user_id, currency, amount, reason, reference_type, reference_id)
+          VALUES ($1, 'diamonds', $2, $3, 'battle', $4)
+          `,
+          [userId, diamonds, session.battle_type === "gym" ? "gym_reward" : "battle_reward", session.id]
+        );
+      }
+    }
+
+    state.rewards = rewards;
+    await incrementQuestProgress(userId, "battle_win", { battleType: session.battle_type }, client);
+    if (session.battle_type === "gym") {
+      await incrementQuestProgress(userId, "gym_win", { targetSlug: session.target_slug }, client);
+    }
+  } catch (error) {
+    if (error.status) throw error;
+    throw createHttpError(500, session.battle_type === "gym" ? "GYM_PROGRESS_FAILED" : "BATTLE_REWARD_FAILED", "Could not deliver battle rewards.");
   }
 }
 
-async function submitBattleTurn(req, res) {
+function findBattleMonsterIndex(state, playerMonsterId) {
+  return (state.playerTeam || []).findIndex((monster) => String(monster.player_monster_id) === String(playerMonsterId));
+}
+
+function applyFaintingAndVictory(state, turnLog) {
+  const enemy = state.enemyTeam?.[state.activeEnemyIndex];
+  if (enemy && Number(enemy.current_hp || 0) <= 0) {
+    turnLog.push(`${enemy.pokemon_name} cayÃ³.`);
+    state.activeEnemyIndex = firstAliveIndex(state.enemyTeam || []);
+    if (state.activeEnemyIndex < 0) {
+      finishBattleState(state, "player");
+    } else {
+      turnLog.push(`${state.enemyTeam[state.activeEnemyIndex].pokemon_name} entra al combate.`);
+    }
+  }
+}
+
+function applyPlayerFaintingAndDefeat(state, turnLog) {
+  const player = state.playerTeam?.[state.activePlayerIndex];
+  if (player && Number(player.current_hp || 0) <= 0) {
+    turnLog.push(`${player.pokemon_name} cayÃ³.`);
+    state.activePlayerIndex = firstAliveIndex(state.playerTeam || []);
+    if (state.activePlayerIndex < 0) {
+      finishBattleState(state, "enemy");
+    } else {
+      turnLog.push(`${state.playerTeam[state.activePlayerIndex].pokemon_name} entra al combate.`);
+    }
+  }
+}
+
+async function applyEnemyResponse(client, session, state, turnLog, turnNumber) {
+  if (state.winner) return;
+
+  const activeEnemy = state.enemyTeam?.[state.activeEnemyIndex];
+  const activePlayer = state.playerTeam?.[state.activePlayerIndex];
+  if (!activeEnemy || Number(activeEnemy.current_hp || 0) <= 0 || !activePlayer || Number(activePlayer.current_hp || 0) <= 0) return;
+
+  const enemySkill = chooseEnemySkill(activeEnemy, activePlayer);
+  if (!enemySkill) {
+    throw createHttpError(500, "BATTLE_TURN_FAILED", "Enemy has no available skills.");
+  }
+
+  const enemyTurn = applySkillTurn(activeEnemy, activePlayer, enemySkill, "enemy");
+  turnLog.push(enemyTurn.logText);
+  await persistBattleTurn(client, session.id, turnNumber, enemyTurn);
+  applyPlayerFaintingAndDefeat(state, turnLog);
+}
+
+function switchBattleMonster(state, targetPlayerMonsterId) {
+  const current = state.playerTeam?.[state.activePlayerIndex];
+  const targetIndex = findBattleMonsterIndex(state, targetPlayerMonsterId);
+  if (targetIndex < 0) {
+    throw createHttpError(400, "MONSTER_NOT_IN_BATTLE", "Monster is not in this battle.");
+  }
+  const target = state.playerTeam[targetIndex];
+  if (Number(target.current_hp || 0) <= 0) {
+    throw createHttpError(400, "MONSTER_FAINTED", "Monster is fainted.");
+  }
+  if (targetIndex === state.activePlayerIndex) {
+    throw createHttpError(400, "MONSTER_ALREADY_ACTIVE", "Monster is already active.");
+  }
+
+  state.activePlayerIndex = targetIndex;
+  return {
+    actionType: "switch",
+    actorSide: "player",
+    actor: current,
+    target,
+    damage: 0,
+    isCritical: false,
+    typeMultiplier: 1,
+    hit: true,
+    logText: `Cambiaste a ${target.pokemon_name}.`,
+    result: {
+      from: {
+        player_monster_id: current?.player_monster_id || null,
+        pokemon_name: current?.pokemon_name || null,
+      },
+      to: {
+        player_monster_id: target.player_monster_id,
+        pokemon_name: target.pokemon_name,
+      },
+    },
+  };
+}
+
+async function useBattleItem(client, userId, state, itemSlug, targetPlayerMonsterId) {
+  const slug = String(itemSlug || "").trim().toLowerCase();
+  if (!BATTLE_ITEM_DEFAULTS[slug]) {
+    throw createHttpError(400, "ITEM_NOT_ALLOWED_IN_BATTLE", "Item is not allowed in battle.");
+  }
+
+  const targetIndex = findBattleMonsterIndex(state, targetPlayerMonsterId);
+  if (targetIndex < 0) {
+    throw createHttpError(400, "MONSTER_NOT_IN_BATTLE", "Monster is not in this battle.");
+  }
+  const target = state.playerTeam[targetIndex];
+
+  const itemResult = await client.query(
+    `
+    SELECT
+      i.id,
+      i.slug,
+      i.name,
+      i.display_name,
+      i.heal_amount
+    FROM game.items i
+    WHERE i.slug = $1
+    LIMIT 1
+    `,
+    [slug]
+  );
+
+  if (!itemResult.rows.length) {
+    throw createHttpError(404, "ITEM_NOT_FOUND", "Item was not found.");
+  }
+
+  const item = itemResult.rows[0];
+  const inventoryResult = await client.query(
+    `
+    SELECT quantity
+    FROM game.player_inventory
+    WHERE user_id = $1
+      AND item_id = $2
+    LIMIT 1
+    FOR UPDATE
+    `,
+    [userId, item.id]
+  );
+
+  if (!inventoryResult.rows.length || Number(inventoryResult.rows[0].quantity || 0) < 1) {
+    throw createHttpError(400, "INSUFFICIENT_ITEM", "Not enough item quantity.");
+  }
+
+  const hp = battleMonsterHp(target);
+  let healed = 0;
+  let nextHp = hp.hp;
+
+  if (slug === "revive") {
+    if (hp.hp > 0) {
+      throw createHttpError(400, "MONSTER_NOT_FAINTED", "Monster is not fainted.");
+    }
+    nextHp = Math.max(1, Math.floor(hp.max / 2));
+    healed = nextHp;
+  } else {
+    if (hp.hp <= 0) {
+      throw createHttpError(400, "MONSTER_FAINTED", "Monster is fainted.");
+    }
+    if (hp.hp >= hp.max) {
+      throw createHttpError(400, "MONSTER_ALREADY_FULL_HP", "Monster is already full HP.");
+    }
+    const healAmount = Number(item.heal_amount || BATTLE_ITEM_DEFAULTS[slug].heal || 0);
+    nextHp = Math.min(hp.max, hp.hp + healAmount);
+    healed = nextHp - hp.hp;
+  }
+
+  target.current_hp = nextHp;
+  await client.query(
+    `
+    UPDATE game.player_inventory
+    SET quantity = quantity - 1,
+        updated_at = now()
+    WHERE user_id = $1
+      AND item_id = $2
+      AND quantity > 0
+    `,
+    [userId, item.id]
+  );
+
+  await incrementQuestProgress(userId, "use_item", { itemSlug: slug, quantity: 1 }, client);
+
+  const displayName = item.display_name || item.name || BATTLE_ITEM_DEFAULTS[slug].label || slug;
+  return {
+    actionType: "use_item",
+    actorSide: "player",
+    actor: state.playerTeam[state.activePlayerIndex],
+    target,
+    item: {
+      slug,
+      name: item.name,
+      display_name: displayName,
+    },
+    damage: 0,
+    isCritical: false,
+    typeMultiplier: 1,
+    hit: true,
+    logText: `Usaste ${displayName} en ${target.pokemon_name}. RecuperÃ³ ${healed} HP.`,
+    result: {
+      itemSlug: slug,
+      targetPlayerMonsterId: target.player_monster_id,
+      healed,
+      currentHp: nextHp,
+      maxHp: hp.max,
+    },
+  };
+}
+
+async function submitBattleTurnLegacy(req, res) {
   const battleId = String(req.params.battleId || "").trim();
   const action = String(req.body?.action || "").trim().toLowerCase();
   const skillSlug = req.body?.skillSlug || req.body?.skill_slug || null;
@@ -1803,8 +2460,120 @@ async function submitBattleTurn(req, res) {
   }
 }
 
+async function submitBattleTurn(req, res) {
+  const battleId = String(req.params.battleId || "").trim();
+  const action = String(req.body?.action || "").trim().toLowerCase();
+  const skillSlug = req.body?.skillSlug || req.body?.skill_slug || null;
+  const skillId = req.body?.skillId || req.body?.skill_id || null;
+  const targetPlayerMonsterId = req.body?.targetPlayerMonsterId || req.body?.target_player_monster_id || null;
+  const itemSlug = req.body?.itemSlug || req.body?.item_slug || null;
+
+  if (!["skill", "switch", "use_item"].includes(action)) {
+    throw createHttpError(400, "INVALID_ACTION", "Unsupported battle action.");
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+    const session = await loadBattleSessionForUser(client, req.user.id, battleId);
+
+    if (session.status !== "active") {
+      throw createHttpError(400, "BATTLE_ALREADY_FINISHED", "Battle is already finished.");
+    }
+
+    const state = session.battle_state || {};
+    const player = state.playerTeam?.[state.activePlayerIndex];
+    const enemy = state.enemyTeam?.[state.activeEnemyIndex];
+
+    if (action === "skill" && (!player || Number(player.current_hp || 0) <= 0)) {
+      throw createHttpError(400, "ACTIVE_MONSTER_FAINTED", "Active monster is fainted.");
+    }
+
+    if (!enemy || Number(enemy.current_hp || 0) <= 0) {
+      throw createHttpError(400, "BATTLE_TURN_FAILED", "Active enemy is not available.");
+    }
+
+    const turnLog = [];
+    const playerTurnNumber = Number(state.turn || 1) * 2 - 1;
+    const enemyTurnNumber = Number(state.turn || 1) * 2;
+
+    if (action === "skill") {
+      const skill = findSkill(player, { skillSlug, skillId });
+      if (!skill) {
+        throw createHttpError(404, skillSlug || skillId ? "SKILL_NOT_AVAILABLE" : "SKILL_NOT_FOUND", "Skill is not available.");
+      }
+
+      const playerTurn = applySkillTurn(player, enemy, skill, "player");
+      turnLog.push(playerTurn.logText);
+      await persistBattleTurn(client, session.id, playerTurnNumber, playerTurn);
+      applyFaintingAndVictory(state, turnLog);
+      await applyEnemyResponse(client, session, state, turnLog, enemyTurnNumber);
+    } else if (action === "switch") {
+      if (!targetPlayerMonsterId) {
+        throw createHttpError(400, "MONSTER_NOT_IN_BATTLE", "targetPlayerMonsterId is required.");
+      }
+      const switchTurn = switchBattleMonster(state, targetPlayerMonsterId);
+      turnLog.push(switchTurn.logText);
+      await persistBattleTurn(client, session.id, playerTurnNumber, switchTurn);
+      await applyEnemyResponse(client, session, state, turnLog, enemyTurnNumber);
+    } else if (action === "use_item") {
+      if (!targetPlayerMonsterId) {
+        throw createHttpError(400, "MONSTER_NOT_IN_BATTLE", "targetPlayerMonsterId is required.");
+      }
+      const itemTurn = await useBattleItem(client, req.user.id, state, itemSlug, targetPlayerMonsterId);
+      turnLog.push(itemTurn.logText);
+      await persistBattleTurn(client, session.id, playerTurnNumber, itemTurn);
+      await applyEnemyResponse(client, session, state, turnLog, enemyTurnNumber);
+    }
+
+    state.log = [...(state.log || []), ...turnLog].slice(-40);
+    state.turn = Number(state.turn || 1) + 1;
+
+    const finalStatus = state.winner === "player" ? "victory" : state.winner === "enemy" ? "defeat" : "active";
+    if (state.winner === "player") {
+      await rewardBattleWin(client, req.user.id, session, state);
+    }
+
+    const updated = await client.query(
+      `
+      UPDATE game.battle_sessions
+      SET battle_state = $2::jsonb,
+          status = $3,
+          winner = $4,
+          rewards = $5::jsonb,
+          finished_at = CASE WHEN $3 <> 'active' THEN COALESCE(finished_at, now()) ELSE finished_at END,
+          completed_at = CASE WHEN $3 <> 'active' THEN COALESCE(completed_at, now()) ELSE completed_at END
+      WHERE id = $1
+      RETURNING *
+      `,
+      [
+        session.id,
+        JSON.stringify(state),
+        finalStatus,
+        state.winner,
+        state.rewards ? JSON.stringify(state.rewards) : null,
+      ]
+    );
+
+    await client.query("COMMIT");
+    res.json(await publicBattleState(updated.rows[0], state, req.user.id, client));
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (!error.code || error.code === "23514" || error.code === "23503") {
+      error.status = error.status || 500;
+      error.code = action === "switch" ? "SWITCH_FAILED" : action === "use_item" ? "ITEM_USE_FAILED" : "BATTLE_TURN_FAILED";
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 app.get("/api/me/monsters/:playerMonsterId/skills", authRequired, asyncRoute(getMonsterBattleSkills));
 app.get("/api/gyms", authRequired, asyncRoute(getGyms));
+app.get("/api/me/gym-progress", authRequired, asyncRoute(getGymProgress));
+app.get("/api/me/badges", authRequired, asyncRoute(getPlayerBadges));
 app.post("/api/battles/start", authRequired, asyncRoute(startBattle));
 app.get("/api/battles/:battleId", authRequired, asyncRoute(getBattle));
 app.post("/api/battles/:battleId/turn", authRequired, asyncRoute(submitBattleTurn));
