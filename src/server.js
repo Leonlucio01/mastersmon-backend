@@ -1464,6 +1464,187 @@ async function getPlayerBadges(req, res) {
   });
 }
 
+function compactBattleMonster(monster) {
+  if (!monster) return null;
+  return {
+    player_monster_id: monster.player_monster_id || null,
+    species_id: monster.species_id || null,
+    pokemon_name: monster.pokemon_name || monster.species_name || null,
+    level: monster.level || null,
+    current_hp: monster.current_hp ?? null,
+    max_hp: monster.max_hp ?? null,
+    is_shiny: !!monster.is_shiny,
+    selected_sprite_path: monster.selected_sprite_path || null,
+    primary_type: monster.primary_type || null,
+    secondary_type: monster.secondary_type || null,
+  };
+}
+
+function battleTotalTurns(row, state = {}) {
+  const maxTurnNumber = Number(row.max_turn_number || 0);
+  const stateTurns = Number(state.turn || 1) - 1;
+  return Math.max(0, stateTurns, Math.ceil(maxTurnNumber / 2));
+}
+
+function summarizeBattleRow(row) {
+  const state = row.battle_state || {};
+  const rewards = row.rewards || state.rewards || null;
+  return {
+    battle_id: row.id,
+    battle_type: row.battle_type,
+    target_slug: row.target_slug,
+    target_name: row.target_name || state.gym?.name || state.targetSlug || null,
+    status: row.status,
+    winner: row.winner || state.winner || null,
+    rewards,
+    created_at: row.started_at,
+    completed_at: row.completed_at || row.finished_at || null,
+    total_turns: battleTotalTurns(row, state),
+    player_team_summary: (state.playerTeam || []).map(compactBattleMonster),
+    enemy_team_summary: (state.enemyTeam || []).map(compactBattleMonster),
+  };
+}
+
+function buildBattleDetailSummary(session, turns) {
+  const state = session.battle_state || {};
+  const playerDamage = turns
+    .filter((turn) => turn.actor_side === "player")
+    .reduce((sum, turn) => sum + Number(turn.damage || 0), 0);
+  const receivedDamage = turns
+    .filter((turn) => turn.actor_side === "enemy")
+    .reduce((sum, turn) => sum + Number(turn.damage || 0), 0);
+  const skillCounts = new Map();
+  turns.forEach((turn) => {
+    if (!turn.skill_slug) return;
+    const key = turn.skill_slug;
+    const current = skillCounts.get(key) || {
+      skill_slug: turn.skill_slug,
+      skill_name: turn.skill_name,
+      uses: 0,
+    };
+    current.uses += 1;
+    skillCounts.set(key, current);
+  });
+  const playerFainted = (state.playerTeam || []).filter((monster) => Number(monster.current_hp || 0) <= 0).map(compactBattleMonster);
+  const enemyFainted = (state.enemyTeam || []).filter((monster) => Number(monster.current_hp || 0) <= 0).map(compactBattleMonster);
+
+  return {
+    total_damage_dealt: playerDamage,
+    total_damage_received: receivedDamage,
+    skills_used: [...skillCounts.values()],
+    creatures_fainted: {
+      player: playerFainted,
+      enemy: enemyFainted,
+    },
+    duration_turns: battleTotalTurns({ max_turn_number: Math.max(0, ...turns.map((turn) => Number(turn.turn_number || 0))) }, state),
+    result: (session.winner || state.winner) === "player" ? "victory" : (session.winner || state.winner) === "enemy" ? "defeat" : session.status,
+  };
+}
+
+async function getMyBattles(req, res) {
+  try {
+    const limit = getLimit(req.query.limit, 20, 100);
+    const params = [req.user.id, limit];
+    const filters = ["bs.user_id = $1"];
+
+    if (req.query.status) {
+      params.push(String(req.query.status));
+      filters.push(`bs.status = $${params.length}`);
+    }
+
+    if (req.query.battleType || req.query.battle_type) {
+      params.push(String(req.query.battleType || req.query.battle_type));
+      filters.push(`bs.battle_type = $${params.length}`);
+    }
+
+    const rows = await query(
+      `
+      SELECT
+        bs.*,
+        g.name AS target_name,
+        COALESCE(MAX(bt.turn_number), 0)::int AS max_turn_number
+      FROM game.battle_sessions bs
+      LEFT JOIN game.gyms g ON g.id = bs.gym_id
+      LEFT JOIN game.battle_turns bt ON bt.battle_id = bs.id
+      WHERE ${filters.join(" AND ")}
+      GROUP BY bs.id, g.name
+      ORDER BY bs.started_at DESC
+      LIMIT $2
+      `,
+      params
+    );
+
+    res.json(rows.map(summarizeBattleRow));
+  } catch (error) {
+    if (error.status) throw error;
+    throw createHttpError(500, "BATTLE_HISTORY_FAILED", "Could not load battle history.");
+  }
+}
+
+async function getMyBattleDetail(req, res) {
+  try {
+    const rows = await query(
+      `
+      SELECT bs.*, g.name AS target_name
+      FROM game.battle_sessions bs
+      LEFT JOIN game.gyms g ON g.id = bs.gym_id
+      WHERE bs.id = $1
+      LIMIT 1
+      `,
+      [req.params.battleId]
+    );
+
+    if (!rows.length) {
+      throw createHttpError(404, "BATTLE_NOT_FOUND", "Battle was not found.");
+    }
+    const session = rows[0];
+    if (String(session.user_id) !== String(req.user.id)) {
+      throw createHttpError(403, "BATTLE_NOT_OWNED", "Battle does not belong to the current user.");
+    }
+
+    const turns = await query(
+      `
+      SELECT
+        id,
+        battle_id,
+        turn_number,
+        actor_monster_id,
+        target_monster_id,
+        action_type,
+        damage,
+        log_text,
+        created_at,
+        actor_side,
+        actor_monster_name,
+        target_monster_name,
+        skill_slug,
+        skill_name,
+        is_critical,
+        type_multiplier,
+        item_slug,
+        item_name,
+        result
+      FROM game.battle_turns
+      WHERE battle_id = $1
+      ORDER BY turn_number, created_at
+      `,
+      [session.id]
+    );
+
+    res.json({
+      ok: true,
+      battle_session: summarizeBattleRow({ ...session, max_turn_number: Math.max(0, ...turns.map((turn) => Number(turn.turn_number || 0))) }),
+      battle_state: session.battle_state || {},
+      battle_turns: turns,
+      rewards: session.rewards || session.battle_state?.rewards || null,
+      summary: buildBattleDetailSummary(session, turns),
+    });
+  } catch (error) {
+    if (error.status) throw error;
+    throw createHttpError(500, "BATTLE_HISTORY_FAILED", "Could not load battle detail.");
+  }
+}
+
 async function findGymForBattle(targetSlug, client = pool) {
   const slug = GYM_ALIASES[String(targetSlug || "").toLowerCase()] || String(targetSlug || "").toLowerCase();
   const result = await client.query(
@@ -1590,6 +1771,13 @@ function battleMonsterHp(monster) {
     hp: Math.max(0, Number(monster?.current_hp || 0)),
     max: Math.max(1, Number(monster?.max_hp || 1)),
   };
+}
+
+function isBattleFinished(sessionOrState = {}) {
+  return sessionOrState.status === "completed" ||
+    sessionOrState.status === "victory" ||
+    sessionOrState.status === "defeat" ||
+    !!sessionOrState.winner;
 }
 
 async function getBattleItems(userId, client = pool) {
@@ -1886,10 +2074,37 @@ async function persistBattleTurn(client, battleId, turnNumber, result) {
       JSON.stringify({
         ...(result.result || {}),
         action: actionType,
+        event_type: actionType,
+        actor: result.actor ? {
+          side: result.actorSide,
+          player_monster_id: result.actor.player_monster_id || null,
+          pokemon_name: result.actor.pokemon_name || null,
+          current_hp: result.actor.current_hp ?? null,
+          max_hp: result.actor.max_hp ?? null,
+        } : null,
+        target: result.target ? {
+          player_monster_id: result.target.player_monster_id || null,
+          pokemon_name: result.target.pokemon_name || null,
+          current_hp: result.target.current_hp ?? null,
+          max_hp: result.target.max_hp ?? null,
+        } : null,
+        skill: result.skill ? {
+          slug: result.skill.slug,
+          name: result.skill.name,
+          type_slug: result.skill.type_slug || null,
+          power: result.skill.power || null,
+        } : null,
+        item: result.item ? {
+          slug: result.item.slug,
+          name: result.item.display_name || result.item.name || result.item.slug,
+        } : null,
         hit: result.hit,
         damage: Number(result.damage || 0),
         isCritical: !!result.isCritical,
+        critical: !!result.isCritical,
         typeMultiplier: Number(result.typeMultiplier || 1),
+        type_multiplier: Number(result.typeMultiplier || 1),
+        remaining_hp: result.target?.current_hp ?? null,
       }),
     ]
   );
@@ -2420,7 +2635,7 @@ async function submitBattleTurnLegacy(req, res) {
     state.log = [...(state.log || []), ...turnLog].slice(-40);
     state.turn = Number(state.turn || 1) + 1;
 
-    const finalStatus = state.winner === "player" ? "victory" : state.winner === "enemy" ? "defeat" : "active";
+    const finalStatus = state.winner ? "completed" : "active";
     if (state.winner === "player") {
       await rewardBattleWin(client, req.user.id, session, state);
     }
@@ -2530,7 +2745,7 @@ async function submitBattleTurn(req, res) {
     state.log = [...(state.log || []), ...turnLog].slice(-40);
     state.turn = Number(state.turn || 1) + 1;
 
-    const finalStatus = state.winner === "player" ? "victory" : state.winner === "enemy" ? "defeat" : "active";
+    const finalStatus = state.winner ? "completed" : "active";
     if (state.winner === "player") {
       await rewardBattleWin(client, req.user.id, session, state);
     }
@@ -2574,6 +2789,8 @@ app.get("/api/me/monsters/:playerMonsterId/skills", authRequired, asyncRoute(get
 app.get("/api/gyms", authRequired, asyncRoute(getGyms));
 app.get("/api/me/gym-progress", authRequired, asyncRoute(getGymProgress));
 app.get("/api/me/badges", authRequired, asyncRoute(getPlayerBadges));
+app.get("/api/me/battles", authRequired, asyncRoute(getMyBattles));
+app.get("/api/me/battles/:battleId", authRequired, asyncRoute(getMyBattleDetail));
 app.post("/api/battles/start", authRequired, asyncRoute(startBattle));
 app.get("/api/battles/:battleId", authRequired, asyncRoute(getBattle));
 app.post("/api/battles/:battleId/turn", authRequired, asyncRoute(submitBattleTurn));
