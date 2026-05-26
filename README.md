@@ -252,7 +252,15 @@ Usa el equipo activo real del jugador. Si un gimnasio esta bloqueado responde `G
 
 `GET /api/battles/:battleId`
 
-Devuelve estado de batalla, equipos, HP, criatura activa, skills disponibles, items disponibles en batalla, log, ganador y recompensas.
+Devuelve estado de batalla, equipos, HP, energia, criatura activa, skills disponibles, items disponibles en batalla, log, ganador y recompensas.
+
+Cada skill del activo incluye:
+
+- `energy_cost`
+- `cooldown_turns`
+- `current_cooldown`
+- `can_use`
+- `disabled_reason`
 
 `POST /api/battles/:battleId/turn`
 
@@ -263,7 +271,34 @@ Devuelve estado de batalla, equipos, HP, criatura activa, skills disponibles, it
 }
 ```
 
-El frontend no calcula dano. El backend valida la skill del Pokemon activo, calcula precision, dano, STAB, efectividad simple, critico, respuesta enemiga y guarda `battle_state` mas filas en `game.battle_turns`.
+El frontend no calcula dano, energia ni cooldowns. El backend valida la skill del Pokemon activo, calcula precision, dano, STAB, efectividad simple, critico, respuesta enemiga y guarda `battle_state` mas filas en `game.battle_turns`.
+
+Energia y cooldowns:
+
+- Cada criatura en `battle_state` tiene `energy`, `maxEnergy` y `cooldowns`.
+- Energia inicial: `100/100`.
+- Al usar una skill se descuenta `energy_cost` y se aplica `cooldown_turns`.
+- Al final de cada turno completo, los activos vivos regeneran 15 energia.
+- Los cooldowns bajan solo para criaturas activas; la skill usada mantiene su cooldown inicial durante ese cierre de turno.
+- Tackle queda como fallback de costo 0 y cooldown 0.
+
+Errores de disponibilidad:
+
+```json
+{
+  "ok": false,
+  "code": "NOT_ENOUGH_ENERGY",
+  "error": "Not enough energy to use this skill."
+}
+```
+
+```json
+{
+  "ok": false,
+  "code": "SKILL_ON_COOLDOWN",
+  "error": "Skill is on cooldown."
+}
+```
 
 Tambien soporta cambiar criatura. Cambiar consume turno y el enemigo responde:
 
@@ -300,11 +335,11 @@ Cada fila incluye `battle_id`, `battle_type`, `target_slug`, `target_name`, `sta
 
 Devuelve el detalle completo de una batalla propia: sesion, `battle_state` final, turnos ordenados, recompensas y resumen de dano causado/recibido, skills usadas, criaturas debilitadas, duracion y resultado. El historial solo lee recompensas ya persistidas; no recalcula premios.
 
-Los turnos guardan datos de auditoria en `result` JSONB cuando estan disponibles: `event_type`, `actor`, `target`, `skill`, `item`, `damage`, `critical`, `type_multiplier` y `remaining_hp`.
+Los turnos guardan datos de auditoria en `result` JSONB cuando estan disponibles: `event_type`, `actor`, `target`, `skill`, `item`, `damage`, `critical`, `type_multiplier`, `remaining_hp`, `energy_before`, `energy_after`, `cooldowns_after`, `skill_energy_cost` y `skill_cooldown_turns`.
 
 Al ganar una batalla de tipo `gym`, la victoria guarda progreso en `game.player_gym_progress`, entrega medalla en `game.player_achievements`, entrega recompensa, registra `wallet_transactions` e incrementa misiones `battle_win`, `gym_win` y `badge_earned` cuando aplica. La recompensa completa se entrega solo en la primera victoria de cada gimnasio; repetirlo entrega una recompensa reducida.
 
-Errores esperados: `BATTLE_NOT_FOUND`, `BATTLE_NOT_OWNED`, `BATTLE_ALREADY_FINISHED`, `TEAM_EMPTY`, `GYM_NOT_FOUND`, `GYM_LOCKED`, `NPC_NOT_FOUND`, `INVALID_BATTLE_TYPE`, `INVALID_ACTION`, `SKILL_NOT_FOUND`, `SKILL_NOT_AVAILABLE`, `ACTIVE_MONSTER_FAINTED`, `MONSTER_NOT_IN_BATTLE`, `MONSTER_FAINTED`, `MONSTER_ALREADY_ACTIVE`, `ITEM_NOT_ALLOWED_IN_BATTLE`, `ITEM_NOT_FOUND`, `INSUFFICIENT_ITEM`, `MONSTER_ALREADY_FULL_HP`, `MONSTER_NOT_FAINTED`, `SWITCH_FAILED`, `ITEM_USE_FAILED`, `BATTLE_TURN_FAILED`, `GYM_PROGRESS_FAILED`, `BADGE_GRANT_FAILED` y `BATTLE_REWARD_FAILED`.
+Errores esperados: `BATTLE_NOT_FOUND`, `BATTLE_NOT_OWNED`, `BATTLE_ALREADY_FINISHED`, `TEAM_EMPTY`, `GYM_NOT_FOUND`, `GYM_LOCKED`, `NPC_NOT_FOUND`, `INVALID_BATTLE_TYPE`, `INVALID_ACTION`, `SKILL_NOT_FOUND`, `SKILL_NOT_AVAILABLE`, `NOT_ENOUGH_ENERGY`, `SKILL_ON_COOLDOWN`, `NO_AVAILABLE_SKILLS`, `ENERGY_STATE_INVALID`, `ACTIVE_MONSTER_FAINTED`, `MONSTER_NOT_IN_BATTLE`, `MONSTER_FAINTED`, `MONSTER_ALREADY_ACTIVE`, `ITEM_NOT_ALLOWED_IN_BATTLE`, `ITEM_NOT_FOUND`, `INSUFFICIENT_ITEM`, `MONSTER_ALREADY_FULL_HP`, `MONSTER_NOT_FAINTED`, `SWITCH_FAILED`, `ITEM_USE_FAILED`, `BATTLE_TURN_FAILED`, `GYM_PROGRESS_FAILED`, `BADGE_GRANT_FAILED` y `BATTLE_REWARD_FAILED`.
 
 ### Progreso de gimnasios y medallas
 
@@ -354,6 +389,7 @@ database/migrations/20260521_pve_battles_skills.sql
 database/migrations/20260521_gym_progress_badges.sql
 database/migrations/20260522_battle_switch_items.sql
 database/migrations/20260524_battle_history.sql
+database/migrations/20260526_battle_energy_cooldowns.sql
 ```
 
 Agrega `password_hash` y `last_login_at` con `ADD COLUMN IF NOT EXISTS`, sin borrar datos ni cambiar IDs existentes.
@@ -363,3 +399,4 @@ La migracion de batallas crea `game.skills`, `game.monster_species_skills`, asig
 La migracion de progreso de gimnasios crea `game.player_gym_progress`, siembra achievements de medallas y agrega misiones de batalla/gimnasio de forma idempotente.
 La migracion de acciones de batalla agrega columnas opcionales `item_slug` e `item_name` a `game.battle_turns` para registrar items usados durante combate.
 La migracion de historial de batallas permite `status = completed` en `game.battle_sessions` y agrega indices para listar batallas y turnos recientes con menor costo.
+La migracion de energia/cooldowns asegura `energy_cost` y `cooldown_turns` en `game.skills` y actualiza los costos base de las skills PvE.

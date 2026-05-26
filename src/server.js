@@ -1014,6 +1014,135 @@ function hpPercent(monster) {
   return Math.max(0, Math.min(100, Math.round((Number(monster?.current_hp || 0) / maxHp) * 100)));
 }
 
+const BATTLE_MAX_ENERGY = 100;
+const BATTLE_ENERGY_REGEN = 15;
+
+function clampBattleEnergy(value, maxEnergy = BATTLE_MAX_ENERGY) {
+  const max = Math.max(1, Number(maxEnergy || BATTLE_MAX_ENERGY));
+  return Math.max(0, Math.min(max, Math.floor(Number(value ?? max))));
+}
+
+function skillEnergyCost(skill) {
+  return Math.max(0, Math.floor(Number(skill?.energy_cost || 0)));
+}
+
+function skillCooldownTurns(skill) {
+  return Math.max(0, Math.floor(Number(skill?.cooldown_turns || 0)));
+}
+
+function normalizeCooldowns(monster) {
+  const current = monster?.cooldowns && typeof monster.cooldowns === "object" && !Array.isArray(monster.cooldowns)
+    ? monster.cooldowns
+    : {};
+  const next = {};
+  for (const skill of monster?.skills || []) {
+    if (!skill?.slug) continue;
+    next[skill.slug] = Math.max(0, Math.floor(Number(current[skill.slug] || 0)));
+  }
+  for (const [slug, value] of Object.entries(current)) {
+    if (!next[slug]) next[slug] = Math.max(0, Math.floor(Number(value || 0)));
+  }
+  return next;
+}
+
+function normalizeBattleMonsterResources(monster) {
+  if (!monster) return monster;
+  const maxEnergy = Math.max(1, Math.floor(Number(monster.maxEnergy ?? monster.max_energy ?? BATTLE_MAX_ENERGY)));
+  monster.maxEnergy = maxEnergy;
+  monster.energy = clampBattleEnergy(monster.energy ?? maxEnergy, maxEnergy);
+  monster.cooldowns = normalizeCooldowns(monster);
+  return monster;
+}
+
+function normalizeBattleStateResources(state = {}) {
+  (state.playerTeam || []).forEach(normalizeBattleMonsterResources);
+  (state.enemyTeam || []).forEach(normalizeBattleMonsterResources);
+  return state;
+}
+
+function skillAvailability(monster, skill) {
+  const cooldown = Math.max(0, Math.floor(Number(monster?.cooldowns?.[skill?.slug] || 0)));
+  const cost = skillEnergyCost(skill);
+  const energy = clampBattleEnergy(monster?.energy, monster?.maxEnergy || BATTLE_MAX_ENERGY);
+
+  if (Number(monster?.current_hp || 0) <= 0) {
+    return { canUse: false, code: "ACTIVE_MONSTER_FAINTED", reason: "Debilitado", cooldown, cost, energy };
+  }
+  if (cooldown > 0) {
+    return { canUse: false, code: "SKILL_ON_COOLDOWN", reason: `CD ${cooldown}`, cooldown, cost, energy };
+  }
+  if (energy < cost) {
+    return { canUse: false, code: "NOT_ENOUGH_ENERGY", reason: "Sin energía", cooldown, cost, energy };
+  }
+  return { canUse: true, code: null, reason: null, cooldown, cost, energy };
+}
+
+function decorateSkillForMonster(monster, skill) {
+  const availability = skillAvailability(monster, skill);
+  return {
+    ...skill,
+    energy_cost: availability.cost,
+    cooldown_turns: skillCooldownTurns(skill),
+    current_cooldown: availability.cooldown,
+    can_use: availability.canUse,
+    disabled_reason: availability.reason,
+  };
+}
+
+function validateSkillUse(monster, skill) {
+  const availability = skillAvailability(monster, skill);
+  if (!availability.canUse) {
+    if (availability.code === "SKILL_ON_COOLDOWN") {
+      throw createHttpError(400, "SKILL_ON_COOLDOWN", "Skill is on cooldown.");
+    }
+    if (availability.code === "NOT_ENOUGH_ENERGY") {
+      throw createHttpError(400, "NOT_ENOUGH_ENERGY", "Not enough energy to use this skill.");
+    }
+    throw createHttpError(400, availability.code || "ENERGY_STATE_INVALID", "Skill cannot be used now.");
+  }
+}
+
+function tickCooldowns(monster, skipSlug = null) {
+  normalizeBattleMonsterResources(monster);
+  const after = {};
+  for (const [slug, value] of Object.entries(monster.cooldowns || {})) {
+    const current = Math.max(0, Math.floor(Number(value || 0)));
+    after[slug] = slug === skipSlug ? current : Math.max(0, current - 1);
+  }
+  monster.cooldowns = after;
+  return after;
+}
+
+function regenerateEnergy(monster) {
+  normalizeBattleMonsterResources(monster);
+  if (!monster || Number(monster.current_hp || 0) <= 0) {
+    return { before: Number(monster?.energy || 0), after: Number(monster?.energy || 0), gained: 0 };
+  }
+  const before = Number(monster.energy || 0);
+  const after = clampBattleEnergy(before + BATTLE_ENERGY_REGEN, monster.maxEnergy);
+  monster.energy = after;
+  return { before, after, gained: after - before };
+}
+
+function applyEndOfTurnResources(state, turnLog, context = {}) {
+  const activePlayer = state.playerTeam?.[state.activePlayerIndex] || null;
+  const activeEnemy = state.enemyTeam?.[state.activeEnemyIndex] || null;
+  const actors = [
+    { monster: activePlayer, usedActor: context.playerActor, skipSlug: context.playerSkillSlug },
+    { monster: activeEnemy, usedActor: context.enemyActor, skipSlug: context.enemySkillSlug },
+  ];
+
+  for (const entry of actors) {
+    if (!entry.monster || Number(entry.monster.current_hp || 0) <= 0) continue;
+    const skipSlug = entry.monster === entry.usedActor ? entry.skipSlug : null;
+    tickCooldowns(entry.monster, skipSlug);
+    const regen = regenerateEnergy(entry.monster);
+    if (regen.gained > 0) {
+      turnLog.push(`${entry.monster.pokemon_name} recuperó ${regen.gained} energía.`);
+    }
+  }
+}
+
 function typeEffectiveness(attackType, defender) {
   const atk = String(attackType || "").toLowerCase();
   const defenderTypes = [defender.primary_type, defender.secondary_type].filter(Boolean).map((t) => String(t).toLowerCase());
@@ -1182,7 +1311,7 @@ function asBattleMonster(row, side, index, skills) {
     ? maxHp
     : Math.max(0, Math.min(maxHp, Number(row.current_hp)));
 
-  return {
+  return normalizeBattleMonsterResources({
     side,
     index,
     player_monster_id: row.player_monster_id || null,
@@ -1201,7 +1330,7 @@ function asBattleMonster(row, side, index, skills) {
     secondary_type: row.secondary_type,
     selected_sprite_path: row.selected_sprite_path,
     skills,
-  };
+  });
 }
 
 async function getPlayerBattleTeam(userId, client = pool) {
@@ -1815,9 +1944,11 @@ async function getBattleItems(userId, client = pool) {
 }
 
 async function publicBattleState(session, state, userId = null, client = pool) {
+  normalizeBattleStateResources(state);
   const activePlayer = state.playerTeam[state.activePlayerIndex] || null;
   const activeEnemy = state.enemyTeam[state.activeEnemyIndex] || null;
   const battleItems = userId ? await getBattleItems(userId, client) : [];
+  const availableSkills = activePlayer?.skills?.map((skill) => decorateSkillForMonster(activePlayer, skill)) || [];
 
   return {
     ok: true,
@@ -1834,7 +1965,9 @@ async function publicBattleState(session, state, userId = null, client = pool) {
     active_enemy_index: state.activeEnemyIndex,
     active_player_monster: activePlayer ? { ...activePlayer, hp_percent: hpPercent(activePlayer) } : null,
     active_enemy_monster: activeEnemy ? { ...activeEnemy, hp_percent: hpPercent(activeEnemy) } : null,
-    available_skills: activePlayer?.skills || [],
+    active_player_energy: activePlayer ? { energy: activePlayer.energy, maxEnergy: activePlayer.maxEnergy } : null,
+    active_enemy_energy: activeEnemy ? { energy: activeEnemy.energy, maxEnergy: activeEnemy.maxEnergy } : null,
+    available_skills: availableSkills,
     battle_items: battleItems,
     log: state.log || [],
   };
@@ -1959,8 +2092,24 @@ function findSkill(monster, { skillSlug, skillId }) {
 }
 
 function applySkillTurn(actor, target, skill, actorSide) {
+  normalizeBattleMonsterResources(actor);
+  normalizeBattleMonsterResources(target);
+  const energyBefore = Number(actor.energy || 0);
+  const cooldownsBefore = { ...(actor.cooldowns || {}) };
+  const energyCost = skillEnergyCost(skill);
+  const cooldownTurns = skillCooldownTurns(skill);
+  const buildEnergyResult = () => ({
+    energy_before: energyBefore,
+    energy_after: actor.energy,
+    cooldowns_before: cooldownsBefore,
+    cooldowns_after: { ...(actor.cooldowns || {}) },
+    skill_energy_cost: energyCost,
+    skill_cooldown_turns: cooldownTurns,
+  });
   const accuracy = Number(skill.accuracy || 100);
   const hit = accuracy >= 100 || Math.random() * 100 <= accuracy;
+  actor.energy = clampBattleEnergy(energyBefore - energyCost, actor.maxEnergy);
+  if (cooldownTurns > 0) actor.cooldowns[skill.slug] = cooldownTurns;
   if (!hit) {
     return {
       actorSide,
@@ -1972,6 +2121,7 @@ function applySkillTurn(actor, target, skill, actorSide) {
       typeMultiplier: 1,
       logText: `${actor.pokemon_name} falló ${skill.name}.`,
       hit: false,
+      result: buildEnergyResult(),
     };
   }
 
@@ -1992,11 +2142,51 @@ function applySkillTurn(actor, target, skill, actorSide) {
     typeMultiplier: damageResult.typeMultiplier,
     logText: `${actor.pokemon_name} usó ${skill.name} e hizo ${damageResult.damage} de daño.${extra}${crit}`,
     hit: true,
+    result: buildEnergyResult(),
+  };
+}
+
+function applyEnergySkillTurn(actor, target, skill, actorSide) {
+  validateSkillUse(actor, skill);
+  return applySkillTurn(actor, target, skill, actorSide);
+}
+
+function appendSkillResourceLog(turnLog, turn) {
+  const cost = Number(turn?.result?.skill_energy_cost || 0);
+  const cooldown = Number(turn?.result?.skill_cooldown_turns || 0);
+  if (cost > 0) {
+    turnLog.push(`${turn.actor?.pokemon_name || "La criatura"} consumió ${cost} energía.`);
+  }
+  if (cooldown > 0 && turn.skill?.name) {
+    turnLog.push(`${turn.skill.name} entra en cooldown.`);
+  }
+}
+
+function recoverBattleEnergyTurn(actor, target, actorSide) {
+  normalizeBattleMonsterResources(actor);
+  const before = Number(actor.energy || 0);
+  return {
+    actionType: "recover",
+    actorSide,
+    actor,
+    target,
+    damage: 0,
+    isCritical: false,
+    typeMultiplier: 1,
+    hit: true,
+    logText: `${actor.pokemon_name} no tuvo skills disponibles.`,
+    result: {
+      disabled_reason: "NO_AVAILABLE_SKILLS",
+      energy_before: before,
+      energy_after: actor.energy,
+      cooldowns_after: { ...(actor.cooldowns || {}) },
+    },
   };
 }
 
 function chooseEnemySkill(enemy, target) {
-  const skills = enemy.skills || [];
+  normalizeBattleMonsterResources(enemy);
+  const skills = (enemy.skills || []).filter((skill) => skillAvailability(enemy, skill).canUse);
   if (!skills.length) return null;
   return [...skills].sort((a, b) => {
     const aScore = Number(a.power || 0) * typeEffectiveness(a.type_slug, target);
@@ -2105,6 +2295,12 @@ async function persistBattleTurn(client, battleId, turnNumber, result) {
         typeMultiplier: Number(result.typeMultiplier || 1),
         type_multiplier: Number(result.typeMultiplier || 1),
         remaining_hp: result.target?.current_hp ?? null,
+        energy_before: result.result?.energy_before ?? null,
+        energy_after: result.result?.energy_after ?? result.actor?.energy ?? null,
+        cooldowns_after: result.result?.cooldowns_after ?? result.actor?.cooldowns ?? null,
+        disabled_reason: result.result?.disabled_reason ?? null,
+        skill_energy_cost: result.result?.skill_energy_cost ?? skillEnergyCost(result.skill),
+        skill_cooldown_turns: result.result?.skill_cooldown_turns ?? skillCooldownTurns(result.skill),
       }),
     ]
   );
@@ -2399,13 +2595,18 @@ async function applyEnemyResponse(client, session, state, turnLog, turnNumber) {
 
   const enemySkill = chooseEnemySkill(activeEnemy, activePlayer);
   if (!enemySkill) {
-    throw createHttpError(500, "BATTLE_TURN_FAILED", "Enemy has no available skills.");
+    const recoverTurn = recoverBattleEnergyTurn(activeEnemy, activePlayer, "enemy");
+    turnLog.push(recoverTurn.logText);
+    await persistBattleTurn(client, session.id, turnNumber, recoverTurn);
+    return { actor: activeEnemy, skillSlug: null };
   }
 
-  const enemyTurn = applySkillTurn(activeEnemy, activePlayer, enemySkill, "enemy");
+  const enemyTurn = applyEnergySkillTurn(activeEnemy, activePlayer, enemySkill, "enemy");
   turnLog.push(enemyTurn.logText);
+  appendSkillResourceLog(turnLog, enemyTurn);
   await persistBattleTurn(client, session.id, turnNumber, enemyTurn);
   applyPlayerFaintingAndDefeat(state, turnLog);
+  return { actor: activeEnemy, skillSlug: enemySkill.slug };
 }
 
 function switchBattleMonster(state, targetPlayerMonsterId) {
@@ -2577,7 +2778,7 @@ async function submitBattleTurnLegacy(req, res) {
       throw createHttpError(400, "BATTLE_ALREADY_FINISHED", "Battle is already finished.");
     }
 
-    const state = session.battle_state || {};
+    const state = normalizeBattleStateResources(session.battle_state || {});
     const player = state.playerTeam?.[state.activePlayerIndex];
     const enemy = state.enemyTeam?.[state.activeEnemyIndex];
 
@@ -2697,7 +2898,7 @@ async function submitBattleTurn(req, res) {
       throw createHttpError(400, "BATTLE_ALREADY_FINISHED", "Battle is already finished.");
     }
 
-    const state = session.battle_state || {};
+    const state = normalizeBattleStateResources(session.battle_state || {});
     const player = state.playerTeam?.[state.activePlayerIndex];
     const enemy = state.enemyTeam?.[state.activeEnemyIndex];
 
@@ -2713,17 +2914,27 @@ async function submitBattleTurn(req, res) {
     const playerTurnNumber = Number(state.turn || 1) * 2 - 1;
     const enemyTurnNumber = Number(state.turn || 1) * 2;
 
+    let playerResourceActor = null;
+    let playerResourceSkillSlug = null;
+    let enemyResourceActor = null;
+    let enemyResourceSkillSlug = null;
+
     if (action === "skill") {
       const skill = findSkill(player, { skillSlug, skillId });
       if (!skill) {
         throw createHttpError(404, skillSlug || skillId ? "SKILL_NOT_AVAILABLE" : "SKILL_NOT_FOUND", "Skill is not available.");
       }
 
-      const playerTurn = applySkillTurn(player, enemy, skill, "player");
+      const playerTurn = applyEnergySkillTurn(player, enemy, skill, "player");
+      playerResourceActor = player;
+      playerResourceSkillSlug = skill.slug;
       turnLog.push(playerTurn.logText);
+      appendSkillResourceLog(turnLog, playerTurn);
       await persistBattleTurn(client, session.id, playerTurnNumber, playerTurn);
       applyFaintingAndVictory(state, turnLog);
-      await applyEnemyResponse(client, session, state, turnLog, enemyTurnNumber);
+      const enemyResource = await applyEnemyResponse(client, session, state, turnLog, enemyTurnNumber);
+      enemyResourceActor = enemyResource?.actor || null;
+      enemyResourceSkillSlug = enemyResource?.skillSlug || null;
     } else if (action === "switch") {
       if (!targetPlayerMonsterId) {
         throw createHttpError(400, "MONSTER_NOT_IN_BATTLE", "targetPlayerMonsterId is required.");
@@ -2731,7 +2942,9 @@ async function submitBattleTurn(req, res) {
       const switchTurn = switchBattleMonster(state, targetPlayerMonsterId);
       turnLog.push(switchTurn.logText);
       await persistBattleTurn(client, session.id, playerTurnNumber, switchTurn);
-      await applyEnemyResponse(client, session, state, turnLog, enemyTurnNumber);
+      const enemyResource = await applyEnemyResponse(client, session, state, turnLog, enemyTurnNumber);
+      enemyResourceActor = enemyResource?.actor || null;
+      enemyResourceSkillSlug = enemyResource?.skillSlug || null;
     } else if (action === "use_item") {
       if (!targetPlayerMonsterId) {
         throw createHttpError(400, "MONSTER_NOT_IN_BATTLE", "targetPlayerMonsterId is required.");
@@ -2739,8 +2952,17 @@ async function submitBattleTurn(req, res) {
       const itemTurn = await useBattleItem(client, req.user.id, state, itemSlug, targetPlayerMonsterId);
       turnLog.push(itemTurn.logText);
       await persistBattleTurn(client, session.id, playerTurnNumber, itemTurn);
-      await applyEnemyResponse(client, session, state, turnLog, enemyTurnNumber);
+      const enemyResource = await applyEnemyResponse(client, session, state, turnLog, enemyTurnNumber);
+      enemyResourceActor = enemyResource?.actor || null;
+      enemyResourceSkillSlug = enemyResource?.skillSlug || null;
     }
+
+    applyEndOfTurnResources(state, turnLog, {
+      playerActor: playerResourceActor,
+      playerSkillSlug: playerResourceSkillSlug,
+      enemyActor: enemyResourceActor,
+      enemySkillSlug: enemyResourceSkillSlug,
+    });
 
     state.log = [...(state.log || []), ...turnLog].slice(-40);
     state.turn = Number(state.turn || 1) + 1;
