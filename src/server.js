@@ -1032,6 +1032,12 @@ const STATUS_LABELS = {
   attack_down: "ataque reducido",
   defense_down: "defensa reducida",
 };
+const GYM_LEVEL_RANGES = {
+  1: { min: 8, max: 12, recommended: 10 },
+  2: { min: 14, max: 18, recommended: 16 },
+  3: { min: 20, max: 24, recommended: 22 },
+  4: { min: 26, max: 32, recommended: 29 },
+};
 
 function clampBattleEnergy(value, maxEnergy = BATTLE_MAX_ENERGY) {
   const max = Math.max(1, Number(maxEnergy || BATTLE_MAX_ENERGY));
@@ -1197,6 +1203,17 @@ function effectiveSkillAccuracy(skill, attacker) {
   const base = Number(skill?.accuracy || 100);
   const modifier = Number(attacker?.statStages?.accuracyModifier || 0);
   return Math.max(5, Math.min(100, base + modifier));
+}
+
+function gymLevelRange(gym = {}) {
+  const order = Math.max(1, Number(gym.gym_order || 1));
+  if (GYM_LEVEL_RANGES[order]) return GYM_LEVEL_RANGES[order];
+  const recommended = Math.max(8, Number(gym.required_trainer_level || order * 2) * 3 + order * 2);
+  return {
+    min: Math.max(3, recommended - 2),
+    max: recommended + 2,
+    recommended,
+  };
 }
 
 function normalizeBattleStateResources(state = {}) {
@@ -1417,6 +1434,29 @@ function calculateBattleDamage(attacker, defender, skill) {
     isCritical,
     typeMultiplier,
     randomFactor,
+    stab,
+  };
+}
+
+function estimateBattleDamage(attacker, defender, skill) {
+  normalizeBattleMonsterResources(attacker);
+  normalizeBattleMonsterResources(defender);
+  const level = Number(attacker.level || 1);
+  const attackModifier = 1 + Number(attacker.statStages?.attackModifier || 0) / 100;
+  const defenseModifier = 1 + Number(defender.statStages?.defenseModifier || 0) / 100;
+  const attackStat = (10 + level * 2 + Number(attacker.iv_attack || 0)) * Math.max(0.7, attackModifier);
+  const defenseStat = (8 + Number(defender.level || 1) + Number(defender.iv_defense || 0)) * Math.max(0.7, defenseModifier);
+  const basePower = Number(skill.power || 40);
+  const baseDamage = Math.floor(((((level * 0.4 + 2) * basePower * attackStat) / Math.max(1, defenseStat)) / 8) + 2);
+  const stab = skill.type_slug && [attacker.primary_type, attacker.secondary_type].includes(skill.type_slug) ? 1.2 : 1;
+  const typeMultiplier = typeEffectiveness(skill.type_slug, defender);
+  const accuracy = effectiveSkillAccuracy(skill, attacker);
+  const rawDamage = typeMultiplier === 0 ? 0 : Math.max(1, Math.floor(baseDamage * 0.925 * stab * typeMultiplier));
+  return {
+    expectedDamage: Math.floor(rawDamage * (accuracy / 100)),
+    rawDamage,
+    typeMultiplier,
+    accuracy,
     stab,
   };
 }
@@ -1667,6 +1707,7 @@ async function decorateRewardItems(reward, client = pool) {
 }
 
 async function getGymRowsForUser(userId, client = pool) {
+  const teamPower = await getPlayerTeamPower(userId, client);
   const result = await client.query(
     `
     WITH ordered_gyms AS (
@@ -1729,6 +1770,8 @@ async function getGymRowsForUser(userId, client = pool) {
     const isCompleted = row.progress_status === "completed";
     const isUnlocked = Number(row.region_order || 1) === 1 || row.previous_status === "completed";
     const reward = await decorateRewardItems(gymRewardFor(row, true), client);
+    const levelRange = gymLevelRange(row);
+    const difficulty = gymDifficultyFor(teamPower.averageLevel, levelRange.recommended, teamPower.teamSize);
     rows.push({
       ...row,
       gym_id: row.id,
@@ -1736,6 +1779,12 @@ async function getGymRowsForUser(userId, client = pool) {
       is_unlocked: isUnlocked,
       is_completed: isCompleted,
       wins: Number(row.wins || 0),
+      recommended_level: levelRange.recommended,
+      min_enemy_level: levelRange.min,
+      max_enemy_level: levelRange.max,
+      difficulty_label: difficulty,
+      player_team_power: teamPower.power,
+      player_average_level: teamPower.averageLevel,
       reward_gold: reward.gold,
       reward_items: reward.items,
       repeat_reward_gold: 500,
@@ -1743,6 +1792,34 @@ async function getGymRowsForUser(userId, client = pool) {
     });
   }
   return rows;
+}
+
+async function getPlayerTeamPower(userId, client = pool) {
+  const result = await client.query(
+    `
+    SELECT
+      COUNT(pm.id)::int AS team_size,
+      COALESCE(AVG(pm.level), 0)::numeric AS average_level,
+      COALESCE(SUM((pm.level * 100) + COALESCE(pm.iv_hp, 0) + COALESCE(pm.iv_attack, 0) + COALESCE(pm.iv_defense, 0)), 0)::int AS power
+    FROM game.player_team_slots pts
+    JOIN game.player_monsters pm ON pm.id = pts.player_monster_id
+    WHERE pts.user_id = $1
+    `,
+    [userId]
+  );
+  const row = result.rows[0] || {};
+  return {
+    teamSize: Number(row.team_size || 0),
+    averageLevel: Math.round(Number(row.average_level || 0)),
+    power: Number(row.power || 0),
+  };
+}
+
+function gymDifficultyFor(averageLevel, recommendedLevel, teamSize = 0) {
+  if (!teamSize) return "hard";
+  if (Number(averageLevel || 0) >= Number(recommendedLevel || 1) + 5) return "easy";
+  if (Number(averageLevel || 0) >= Number(recommendedLevel || 1) - 2) return "normal";
+  return "hard";
 }
 
 async function getGymProgressState(userId, gymId, client = pool) {
@@ -2044,12 +2121,13 @@ async function getGymEnemyRows(gym, client = pool) {
 
   if (teamResult.rows.length) return teamResult.rows;
 
-  const level = Math.max(3, Number(gym.required_trainer_level || 2) * 3 + Number(gym.gym_order || 1) * 2);
+  const levelRange = gymLevelRange(gym);
+  const levelStep = Math.max(1, Math.floor((levelRange.max - levelRange.min) / 2));
   const fallback = await client.query(
     `
     SELECT
       ms.id AS species_id,
-      ($2::int + ROW_NUMBER() OVER (ORDER BY ms.dex_number)::int - 1) AS level,
+      LEAST($3::int, $2::int + ((ROW_NUMBER() OVER (ORDER BY ms.dex_number)::int - 1) * $4::int)) AS level,
       ms.dex_number,
       ms.name AS pokemon_name,
       COALESCE(ms.animated_path, ms.sprite_path) AS selected_sprite_path,
@@ -2063,7 +2141,7 @@ async function getGymEnemyRows(gym, client = pool) {
     ORDER BY ms.dex_number
     LIMIT 3
     `,
-    [gym.type_id, level]
+    [gym.type_id, levelRange.min, levelRange.max, levelStep]
   );
 
   if (fallback.rows.length) return fallback.rows;
@@ -2085,7 +2163,7 @@ async function getGymEnemyRows(gym, client = pool) {
     ORDER BY ms.dex_number
     LIMIT 3
     `,
-    [level]
+    [levelRange.recommended]
   );
   return anySpecies.rows;
 }
@@ -2194,6 +2272,7 @@ async function publicBattleState(session, state, userId = null, client = pool) {
     active_enemy_energy: activeEnemy ? { energy: activeEnemy.energy, maxEnergy: activeEnemy.maxEnergy } : null,
     available_skills: availableSkills,
     battle_items: battleItems,
+    enemy_items: state.enemyItems || {},
     log: state.log || [],
   };
 }
@@ -2248,6 +2327,8 @@ async function startBattle(req, res) {
       enemyTeam,
       activePlayerIndex: firstAliveIndex(playerTeam),
       activeEnemyIndex: firstAliveIndex(enemyTeam),
+      enemyItems: battleType === "gym" ? { potion: 1 } : {},
+      enemyLastSwitchTurn: 0,
       turn: 1,
       winner: null,
       rewards: null,
@@ -2456,15 +2537,224 @@ function recoverBattleEnergyTurn(actor, target, actorSide) {
   };
 }
 
+function statusEffectUsefulOnTarget(skill, target) {
+  const effectType = String(skill?.effect_type || "").trim().toLowerCase();
+  if (!effectType) return false;
+  normalizeBattleMonsterResources(target);
+  if (MAIN_STATUS_EFFECTS.has(effectType)) {
+    return !getStatusEffect(target, effectType);
+  }
+  if (effectType === "accuracy_down") return Number(target.statStages?.accuracyModifier || 0) > -30;
+  if (effectType === "attack_down") return Number(target.statStages?.attackModifier || 0) > -30;
+  if (effectType === "defense_down") return Number(target.statStages?.defenseModifier || 0) > -30;
+  return false;
+}
+
+function enemySkillDecisionReason(candidate, enemy, target) {
+  if (candidate.canKO) return "finish_ko";
+  if (candidate.typeMultiplier > 1) return "type_advantage";
+  if (candidate.effectUseful && hpPercent(enemy) > 35 && hpPercent(target) > 45) return "useful_status";
+  if (hpPercent(enemy) <= 35) return "low_hp_damage";
+  return "best_damage";
+}
+
+function enemyDecisionLog(enemy, action) {
+  if (!action) return null;
+  const reasons = {
+    finish_ko: "para cerrar el combate",
+    type_advantage: "por ventaja de tipo",
+    useful_status: "para aplicar presion de estado",
+    low_hp_damage: "porque estaba en peligro",
+    best_damage: "por mejor dano esperado",
+    fallback_zero_cost: "para recuperar ritmo",
+  };
+  if (action.type === "skill") {
+    return `${enemy.pokemon_name} eligio ${action.skill.name} ${reasons[action.reason] || "por estrategia"}.`;
+  }
+  if (action.type === "switch") {
+    return `El lider cambio a ${action.target?.pokemon_name}.`;
+  }
+  if (action.type === "item") {
+    return `El lider uso ${action.item?.display_name || action.item?.name || "Potion"} en ${enemy.pokemon_name}.`;
+  }
+  return null;
+}
+
+function scoreEnemySkill(enemy, target, skill) {
+  const damage = estimateBattleDamage(enemy, target, skill);
+  const effectUseful = statusEffectUsefulOnTarget(skill, target);
+  const canKO = damage.rawDamage >= Number(target.current_hp || 0);
+  const reason = enemySkillDecisionReason({
+    ...damage,
+    effectUseful,
+    canKO,
+  }, enemy, target);
+
+  return {
+    skill,
+    expectedDamage: damage.expectedDamage,
+    rawDamage: damage.rawDamage,
+    typeMultiplier: damage.typeMultiplier,
+    accuracy: damage.accuracy,
+    effectUseful,
+    canKO,
+    reason,
+    priority: [
+      canKO ? 1 : 0,
+      damage.typeMultiplier > 1 ? 1 : 0,
+      effectUseful && hpPercent(enemy) > 35 && hpPercent(target) > 45 ? 1 : 0,
+      damage.expectedDamage,
+      Number(skill.power || 0),
+    ],
+  };
+}
+
+function compareEnemySkillScores(a, b) {
+  for (let i = 0; i < a.priority.length; i += 1) {
+    if (a.priority[i] !== b.priority[i]) return b.priority[i] - a.priority[i];
+  }
+  return String(a.skill.slug).localeCompare(String(b.skill.slug));
+}
+
 function chooseEnemySkill(enemy, target) {
   normalizeBattleMonsterResources(enemy);
   const skills = (enemy.skills || []).filter((skill) => skillAvailability(enemy, skill).canUse);
   if (!skills.length) return null;
-  return [...skills].sort((a, b) => {
-    const aScore = Number(a.power || 0) * typeEffectiveness(a.type_slug, target);
-    const bScore = Number(b.power || 0) * typeEffectiveness(b.type_slug, target);
-    return bScore - aScore;
-  })[0];
+  const scored = skills.map((skill) => scoreEnemySkill(enemy, target, skill)).sort(compareEnemySkillScores);
+  const best = scored[0];
+  if (!best) return null;
+  return {
+    type: "skill",
+    skill: best.skill,
+    reason: best.reason,
+    expectedDamage: best.expectedDamage,
+    typeMultiplier: best.typeMultiplier,
+    wasBestMove: true,
+  };
+}
+
+function bestMatchupScore(monster, target) {
+  const usable = (monster?.skills || []).filter((skill) => skillAvailability(monster, skill).canUse);
+  if (!usable.length) return 0;
+  return Math.max(...usable.map((skill) => {
+    const estimate = estimateBattleDamage(monster, target, skill);
+    return estimate.typeMultiplier * 1000 + estimate.expectedDamage;
+  }));
+}
+
+function chooseEnemySwitch(state, activeEnemy, activePlayer) {
+  const currentTurn = Number(state.turn || 1);
+  if (currentTurn - Number(state.enemyLastSwitchTurn || 0) < 2) return null;
+  if (hpPercent(activeEnemy) > 25) return null;
+
+  const currentScore = bestMatchupScore(activeEnemy, activePlayer);
+  const candidates = (state.enemyTeam || [])
+    .map((monster, index) => ({ monster, index, score: bestMatchupScore(monster, activePlayer) }))
+    .filter((entry) => entry.index !== state.activeEnemyIndex && Number(entry.monster.current_hp || 0) > 0)
+    .sort((a, b) => b.score - a.score);
+
+  const best = candidates[0];
+  if (!best || best.score <= currentScore) return null;
+  return {
+    type: "switch",
+    targetIndex: best.index,
+    target: best.monster,
+    reason: "low_hp_better_matchup",
+  };
+}
+
+function chooseEnemyItem(state, activeEnemy) {
+  if (state.battleType !== "gym") return null;
+  const items = state.enemyItems || {};
+  if (Number(items.potion || 0) <= 0) return null;
+  if (hpPercent(activeEnemy) > 35 || Number(activeEnemy.current_hp || 0) <= 0) return null;
+  if (Number(activeEnemy.current_hp || 0) >= Number(activeEnemy.max_hp || 1)) return null;
+  return {
+    type: "item",
+    itemSlug: "potion",
+    item: { slug: "potion", name: "Potion", display_name: "Potion", heal_amount: 20 },
+    reason: "low_hp_heal",
+  };
+}
+
+function chooseEnemyAction(state) {
+  normalizeBattleStateResources(state);
+  const activeEnemy = state.enemyTeam?.[state.activeEnemyIndex];
+  const activePlayer = state.playerTeam?.[state.activePlayerIndex];
+  if (!activeEnemy || !activePlayer) return null;
+
+  const switchAction = chooseEnemySwitch(state, activeEnemy, activePlayer);
+  if (switchAction) return switchAction;
+
+  const itemAction = chooseEnemyItem(state, activeEnemy);
+  if (itemAction) return itemAction;
+
+  const skillAction = chooseEnemySkill(activeEnemy, activePlayer);
+  if (skillAction) return skillAction;
+
+  return { type: "recover", reason: "fallback_zero_cost" };
+}
+
+function enemySwitchTurn(state, action) {
+  const current = state.enemyTeam?.[state.activeEnemyIndex] || null;
+  const target = state.enemyTeam?.[action.targetIndex] || null;
+  state.activeEnemyIndex = action.targetIndex;
+  state.enemyLastSwitchTurn = Number(state.turn || 1);
+  return {
+    actionType: "switch",
+    actorSide: "enemy",
+    actor: current,
+    target,
+    damage: 0,
+    isCritical: false,
+    typeMultiplier: 1,
+    hit: true,
+    logText: `El lider cambio a ${target?.pokemon_name || "otra criatura"}.`,
+    result: {
+      enemy_decision_reason: action.reason,
+      enemy_switched: true,
+      was_best_move: true,
+      from: {
+        pokemon_name: current?.pokemon_name || null,
+      },
+      to: {
+        pokemon_name: target?.pokemon_name || null,
+      },
+    },
+  };
+}
+
+function enemyUseItemTurn(state, action) {
+  const activeEnemy = state.enemyTeam?.[state.activeEnemyIndex];
+  const hp = battleMonsterHp(activeEnemy);
+  const healAmount = Number(action.item?.heal_amount || 20);
+  const nextHp = Math.min(hp.max, hp.hp + healAmount);
+  const healed = nextHp - hp.hp;
+  activeEnemy.current_hp = nextHp;
+  state.enemyItems = {
+    ...(state.enemyItems || {}),
+    [action.itemSlug]: Math.max(0, Number(state.enemyItems?.[action.itemSlug] || 0) - 1),
+  };
+  return {
+    actionType: "use_item",
+    actorSide: "enemy",
+    actor: activeEnemy,
+    target: activeEnemy,
+    item: action.item,
+    damage: 0,
+    isCritical: false,
+    typeMultiplier: 1,
+    hit: true,
+    logText: `El lider uso ${action.item.display_name || action.item.name} en ${activeEnemy.pokemon_name}. Recupero ${healed} HP.`,
+    result: {
+      enemy_decision_reason: action.reason,
+      enemy_used_item: true,
+      itemSlug: action.itemSlug,
+      healed,
+      currentHp: nextHp,
+      maxHp: hp.max,
+    },
+  };
 }
 
 function finishBattleState(state, winner) {
@@ -2582,6 +2872,11 @@ async function persistBattleTurn(client, battleId, turnNumber, result) {
         effect_success: !!result.result?.effect_success,
         effect_applied: result.result?.effect_applied ?? null,
         effect_already_active: !!result.result?.effect_already_active,
+        enemy_decision_reason: result.result?.enemy_decision_reason ?? null,
+        expected_damage: result.result?.expected_damage ?? null,
+        was_best_move: result.result?.was_best_move ?? null,
+        enemy_switched: !!result.result?.enemy_switched,
+        enemy_used_item: !!result.result?.enemy_used_item,
       }),
     ]
   );
@@ -2874,15 +3169,43 @@ async function applyEnemyResponse(client, session, state, turnLog, turnNumber) {
   const activePlayer = state.playerTeam?.[state.activePlayerIndex];
   if (!activeEnemy || Number(activeEnemy.current_hp || 0) <= 0 || !activePlayer || Number(activePlayer.current_hp || 0) <= 0) return;
 
-  const enemySkill = chooseEnemySkill(activeEnemy, activePlayer);
-  if (!enemySkill) {
+  const enemyAction = chooseEnemyAction(state);
+  if (!enemyAction || enemyAction.type === "recover") {
     const recoverTurn = recoverBattleEnergyTurn(activeEnemy, activePlayer, "enemy");
+    recoverTurn.result = {
+      ...(recoverTurn.result || {}),
+      enemy_decision_reason: enemyAction?.reason || "no_available_skills",
+      was_best_move: false,
+    };
     turnLog.push(recoverTurn.logText);
     await persistBattleTurn(client, session.id, turnNumber, recoverTurn);
     return { actor: activeEnemy, skillSlug: null };
   }
 
+  if (enemyAction.type === "switch") {
+    const switchTurn = enemySwitchTurn(state, enemyAction);
+    turnLog.push(switchTurn.logText);
+    await persistBattleTurn(client, session.id, turnNumber, switchTurn);
+    return { actor: null, skillSlug: null };
+  }
+
+  if (enemyAction.type === "item") {
+    const itemTurn = enemyUseItemTurn(state, enemyAction);
+    turnLog.push(itemTurn.logText);
+    await persistBattleTurn(client, session.id, turnNumber, itemTurn);
+    return { actor: null, skillSlug: null };
+  }
+
+  const enemySkill = enemyAction.skill;
   const enemyTurn = applyEnergySkillTurn(activeEnemy, activePlayer, enemySkill, "enemy");
+  enemyTurn.result = {
+    ...(enemyTurn.result || {}),
+    enemy_decision_reason: enemyAction.reason,
+    expected_damage: enemyAction.expectedDamage,
+    was_best_move: enemyAction.wasBestMove,
+  };
+  const decisionText = enemyDecisionLog(activeEnemy, enemyAction);
+  if (decisionText) turnLog.push(decisionText);
   turnLog.push(enemyTurn.logText);
   appendSkillResourceLog(turnLog, enemyTurn);
   await persistBattleTurn(client, session.id, turnNumber, enemyTurn);

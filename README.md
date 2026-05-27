@@ -233,6 +233,10 @@ Lista gimnasios reales desde `game.gyms`, con region, tipo, medalla, poder recom
 
 - `is_unlocked`
 - `is_completed`
+- `recommended_level`
+- `difficulty_label`: `easy`, `normal` o `hard`
+- `player_team_power`
+- `player_average_level`
 - `wins`
 - `completed_at`
 - `reward_gold`
@@ -248,7 +252,7 @@ Lista gimnasios reales desde `game.gyms`, con region, tipo, medalla, poder recom
 }
 ```
 
-Usa el equipo activo real del jugador. Si un gimnasio esta bloqueado responde `GYM_LOCKED`. Si un gimnasio aun no tiene filas en `game.gym_trainer_team`, el backend genera un equipo PvE basico segun el tipo del gimnasio para mantener la fase jugable.
+Usa el equipo activo real del jugador. Si un gimnasio esta bloqueado responde `GYM_LOCKED`. Si un gimnasio aun no tiene filas en `game.gym_trainer_team`, el backend genera un equipo PvE basico segun el tipo del gimnasio para mantener la fase jugable. La migracion `20260527_gym_ai_balance.sql` siembra equipos iniciales para los primeros gimnasios de Kanto cuando estan vacios.
 
 `GET /api/battles/:battleId`
 
@@ -318,6 +322,17 @@ Ejemplo de metadata en `battle_turns.result`:
 }
 ```
 
+IA enemiga:
+
+- El enemigo evalua solo skills disponibles: respeta energia, cooldown y HP.
+- Prioriza una skill que pueda hacer KO.
+- Luego prioriza ventaja de tipo.
+- Luego prioriza efectos utiles si el objetivo aun no tiene ese estado.
+- Si tiene HP bajo, prioriza dano.
+- Si el activo enemigo esta en 25% HP o menos y otro rival vivo tiene mejor matchup, puede cambiar. El cambio consume su turno y se limita para evitar loops.
+- En gimnasios, el rival tiene una `potion` por batalla; puede usarla si baja a 35% HP o menos.
+- `battle_turns.result` guarda `enemy_decision_reason`, `expected_damage`, `was_best_move`, `enemy_switched` y `enemy_used_item` cuando aplica.
+
 ```json
 {
   "ok": false,
@@ -361,7 +376,7 @@ Cada fila incluye `battle_id`, `battle_type`, `target_slug`, `target_name`, `sta
 
 Devuelve el detalle completo de una batalla propia: sesion, `battle_state` final, turnos ordenados, recompensas y resumen de dano causado/recibido, skills usadas, criaturas debilitadas, duracion y resultado. El historial solo lee recompensas ya persistidas; no recalcula premios.
 
-Los turnos guardan datos de auditoria en `result` JSONB cuando estan disponibles: `event_type`, `actor`, `target`, `skill`, `item`, `damage`, `critical`, `type_multiplier`, `remaining_hp`, `energy_before`, `energy_after`, `cooldowns_after`, `skill_energy_cost`, `skill_cooldown_turns`, `effect_type`, `effect_chance`, `effect_applied`, `status_blocked` y `blocked_by`.
+Los turnos guardan datos de auditoria en `result` JSONB cuando estan disponibles: `event_type`, `actor`, `target`, `skill`, `item`, `damage`, `critical`, `type_multiplier`, `remaining_hp`, `energy_before`, `energy_after`, `cooldowns_after`, `skill_energy_cost`, `skill_cooldown_turns`, `effect_type`, `effect_chance`, `effect_applied`, `status_blocked`, `blocked_by`, `enemy_decision_reason`, `expected_damage`, `was_best_move`, `enemy_switched` y `enemy_used_item`.
 
 Al ganar una batalla de tipo `gym`, la victoria guarda progreso en `game.player_gym_progress`, entrega medalla en `game.player_achievements`, entrega recompensa, registra `wallet_transactions` e incrementa misiones `battle_win`, `gym_win` y `badge_earned` cuando aplica. La recompensa completa se entrega solo en la primera victoria de cada gimnasio; repetirlo entrega una recompensa reducida.
 
