@@ -1016,6 +1016,22 @@ function hpPercent(monster) {
 
 const BATTLE_MAX_ENERGY = 100;
 const BATTLE_ENERGY_REGEN = 15;
+const MAIN_STATUS_EFFECTS = new Set(["poison", "burn", "paralysis", "sleep"]);
+const STATUS_DEFAULT_TURNS = {
+  poison: 3,
+  burn: 3,
+  paralysis: 2,
+  sleep: 2,
+};
+const STATUS_LABELS = {
+  poison: "veneno",
+  burn: "quemadura",
+  paralysis: "parálisis",
+  sleep: "sueño",
+  accuracy_down: "precisión reducida",
+  attack_down: "ataque reducido",
+  defense_down: "defensa reducida",
+};
 
 function clampBattleEnergy(value, maxEnergy = BATTLE_MAX_ENERGY) {
   const max = Math.max(1, Number(maxEnergy || BATTLE_MAX_ENERGY));
@@ -1051,7 +1067,136 @@ function normalizeBattleMonsterResources(monster) {
   monster.maxEnergy = maxEnergy;
   monster.energy = clampBattleEnergy(monster.energy ?? maxEnergy, maxEnergy);
   monster.cooldowns = normalizeCooldowns(monster);
+  monster.statusEffects = normalizeStatusEffects(monster.statusEffects);
+  monster.statStages = normalizeStatStages(monster.statStages);
   return monster;
+}
+
+function normalizeStatusEffects(statusEffects) {
+  if (!Array.isArray(statusEffects)) return [];
+  const seen = new Set();
+  const normalized = [];
+  for (const effect of statusEffects) {
+    const type = String(effect?.type || "").trim().toLowerCase();
+    if (!type || seen.has(type)) continue;
+    seen.add(type);
+    normalized.push({
+      type,
+      turns: Math.max(1, Math.floor(Number(effect.turns || STATUS_DEFAULT_TURNS[type] || 3))),
+      value: effect.value === undefined ? null : effect.value,
+    });
+  }
+  return normalized;
+}
+
+function normalizeStatStages(statStages) {
+  const stages = statStages && typeof statStages === "object" && !Array.isArray(statStages) ? statStages : {};
+  return {
+    attackModifier: clampStatModifier(stages.attackModifier),
+    defenseModifier: clampStatModifier(stages.defenseModifier),
+    accuracyModifier: clampStatModifier(stages.accuracyModifier),
+  };
+}
+
+function clampStatModifier(value) {
+  return Math.max(-30, Math.min(30, Math.floor(Number(value || 0))));
+}
+
+function statusLabel(type) {
+  return STATUS_LABELS[String(type || "").toLowerCase()] || String(type || "estado");
+}
+
+function getStatusEffect(monster, type) {
+  normalizeBattleMonsterResources(monster);
+  return (monster?.statusEffects || []).find((effect) => effect.type === type) || null;
+}
+
+function upsertStatusEffect(target, type, value = null) {
+  normalizeBattleMonsterResources(target);
+  if (MAIN_STATUS_EFFECTS.has(type)) {
+    const existing = getStatusEffect(target, type);
+    if (existing) {
+      return { applied: false, alreadyActive: true, effect: existing };
+    }
+    const effect = {
+      type,
+      turns: STATUS_DEFAULT_TURNS[type] || 3,
+      value,
+    };
+    target.statusEffects.push(effect);
+    return { applied: true, alreadyActive: false, effect };
+  }
+
+  const valueAmount = Math.max(1, Number(value || 10));
+  const mapping = {
+    attack_down: "attackModifier",
+    defense_down: "defenseModifier",
+    accuracy_down: "accuracyModifier",
+  };
+  const key = mapping[type];
+  if (!key) return { applied: false, alreadyActive: false, effect: null };
+  target.statStages[key] = clampStatModifier(Number(target.statStages[key] || 0) - valueAmount);
+  return { applied: true, alreadyActive: false, effect: { type, value: valueAmount } };
+}
+
+function applySkillEffect(actor, target, skill) {
+  const effectType = String(skill?.effect_type || "").trim().toLowerCase();
+  const effectChance = Math.max(0, Math.min(100, Number(skill?.effect_chance || 0)));
+  const effectValue = Number(skill?.effect_value || 0) || null;
+
+  if (!effectType || effectChance <= 0 || Number(target?.current_hp || 0) <= 0) {
+    return null;
+  }
+
+  const roll = Math.random() * 100;
+  const metadata = {
+    effect_type: effectType,
+    effect_chance: effectChance,
+    effect_value: effectValue,
+    effect_success: false,
+    effect_applied: null,
+    effect_already_active: false,
+  };
+
+  if (roll > effectChance) return metadata;
+
+  const applied = upsertStatusEffect(target, effectType, effectValue);
+  return {
+    ...metadata,
+    effect_success: applied.applied,
+    effect_applied: applied.applied ? effectType : null,
+    effect_already_active: !!applied.alreadyActive,
+  };
+}
+
+function statusActionBlock(monster) {
+  normalizeBattleMonsterResources(monster);
+  if (!monster || Number(monster.current_hp || 0) <= 0) return null;
+
+  const sleep = getStatusEffect(monster, "sleep");
+  if (sleep) {
+    return {
+      type: "sleep",
+      logText: `${monster.pokemon_name} esta dormido y no pudo moverse.`,
+    };
+  }
+
+  const paralysis = getStatusEffect(monster, "paralysis");
+  if (paralysis && Math.random() < 0.25) {
+    return {
+      type: "paralysis",
+      logText: `${monster.pokemon_name} esta paralizado y no pudo moverse.`,
+    };
+  }
+
+  return null;
+}
+
+function effectiveSkillAccuracy(skill, attacker) {
+  normalizeBattleMonsterResources(attacker);
+  const base = Number(skill?.accuracy || 100);
+  const modifier = Number(attacker?.statStages?.accuracyModifier || 0);
+  return Math.max(5, Math.min(100, base + modifier));
 }
 
 function normalizeBattleStateResources(state = {}) {
@@ -1083,6 +1228,9 @@ function decorateSkillForMonster(monster, skill) {
     ...skill,
     energy_cost: availability.cost,
     cooldown_turns: skillCooldownTurns(skill),
+    effect_type: skill.effect_type || null,
+    effect_chance: Number(skill.effect_chance || 0),
+    effect_value: Number(skill.effect_value || 0),
     current_cooldown: availability.cooldown,
     can_use: availability.canUse,
     disabled_reason: availability.reason,
@@ -1143,6 +1291,73 @@ function applyEndOfTurnResources(state, turnLog, context = {}) {
   }
 }
 
+function applyOngoingStatusForMonster(monster, side, turnLog) {
+  normalizeBattleMonsterResources(monster);
+  if (!monster || Number(monster.current_hp || 0) <= 0) return [];
+
+  const events = [];
+  const remaining = [];
+  for (const effect of monster.statusEffects || []) {
+    let remove = false;
+    if (effect.type === "poison" || effect.type === "burn") {
+      const percent = effect.type === "poison" ? 0.08 : 0.05;
+      const damage = Math.max(1, Math.floor(Number(monster.max_hp || 1) * percent));
+      const beforeHp = Number(monster.current_hp || 0);
+      monster.current_hp = Math.max(0, beforeHp - damage);
+      const line = `${monster.pokemon_name} sufrio ${damage} de dano por ${statusLabel(effect.type)}.`;
+      turnLog.push(line);
+      events.push({
+        event_type: "status_damage",
+        side,
+        pokemon_name: monster.pokemon_name,
+        status: effect.type,
+        damage,
+        hp_before: beforeHp,
+        remaining_hp: monster.current_hp,
+      });
+    }
+
+    effect.turns = Math.max(0, Number(effect.turns || 1) - 1);
+    if (effect.turns <= 0) {
+      remove = true;
+      const line = `${statusLabel(effect.type)} de ${monster.pokemon_name} termino.`;
+      turnLog.push(line);
+      events.push({
+        event_type: "status_expired",
+        side,
+        pokemon_name: monster.pokemon_name,
+        status: effect.type,
+      });
+    }
+
+    if (!remove) remaining.push(effect);
+  }
+
+  monster.statusEffects = remaining;
+  return events;
+}
+
+function applyEndOfTurnStatusEffects(state, turnLog) {
+  if (state.winner) return [];
+  const events = [];
+  const activePlayer = state.playerTeam?.[state.activePlayerIndex] || null;
+  const activeEnemy = state.enemyTeam?.[state.activeEnemyIndex] || null;
+
+  if (activePlayer && Number(activePlayer.current_hp || 0) > 0) {
+    events.push(...applyOngoingStatusForMonster(activePlayer, "player", turnLog));
+    applyPlayerFaintingAndDefeat(state, turnLog);
+  }
+
+  if (state.winner) return events;
+
+  if (activeEnemy && Number(activeEnemy.current_hp || 0) > 0) {
+    events.push(...applyOngoingStatusForMonster(activeEnemy, "enemy", turnLog));
+    applyFaintingAndVictory(state, turnLog);
+  }
+
+  return events;
+}
+
 function typeEffectiveness(attackType, defender) {
   const atk = String(attackType || "").toLowerCase();
   const defenderTypes = [defender.primary_type, defender.secondary_type].filter(Boolean).map((t) => String(t).toLowerCase());
@@ -1182,8 +1397,12 @@ function typeEffectiveness(attackType, defender) {
 
 function calculateBattleDamage(attacker, defender, skill) {
   const level = Number(attacker.level || 1);
-  const attackStat = 10 + level * 2 + Number(attacker.iv_attack || 0);
-  const defenseStat = 8 + Number(defender.level || 1) + Number(defender.iv_defense || 0);
+  normalizeBattleMonsterResources(attacker);
+  normalizeBattleMonsterResources(defender);
+  const attackModifier = 1 + Number(attacker.statStages?.attackModifier || 0) / 100;
+  const defenseModifier = 1 + Number(defender.statStages?.defenseModifier || 0) / 100;
+  const attackStat = (10 + level * 2 + Number(attacker.iv_attack || 0)) * Math.max(0.7, attackModifier);
+  const defenseStat = (8 + Number(defender.level || 1) + Number(defender.iv_defense || 0)) * Math.max(0.7, defenseModifier);
   const basePower = Number(skill.power || 40);
   const baseDamage = Math.floor(((((level * 0.4 + 2) * basePower * attackStat) / Math.max(1, defenseStat)) / 8) + 2);
   const randomFactor = 0.85 + Math.random() * 0.15;
@@ -1215,7 +1434,10 @@ async function getSkillsForSpecies(speciesId, level, client = pool) {
       s.accuracy,
       s.energy_cost,
       s.cooldown_turns,
-      s.skill_kind
+      s.skill_kind,
+      s.effect_type,
+      s.effect_chance,
+      s.effect_value
     FROM game.monster_species_skills mss
     JOIN game.skills s ON s.id = mss.skill_id
     WHERE mss.species_id = $1
@@ -1241,7 +1463,10 @@ async function getSkillsForSpecies(speciesId, level, client = pool) {
       accuracy,
       energy_cost,
       cooldown_turns,
-      skill_kind
+      skill_kind,
+      effect_type,
+      effect_chance,
+      effect_value
     FROM game.skills
     WHERE slug = 'tackle'
     LIMIT 1
@@ -2106,7 +2331,7 @@ function applySkillTurn(actor, target, skill, actorSide) {
     skill_energy_cost: energyCost,
     skill_cooldown_turns: cooldownTurns,
   });
-  const accuracy = Number(skill.accuracy || 100);
+  const accuracy = effectiveSkillAccuracy(skill, actor);
   const hit = accuracy >= 100 || Math.random() * 100 <= accuracy;
   actor.energy = clampBattleEnergy(energyBefore - energyCost, actor.maxEnergy);
   if (cooldownTurns > 0) actor.cooldowns[skill.slug] = cooldownTurns;
@@ -2121,13 +2346,17 @@ function applySkillTurn(actor, target, skill, actorSide) {
       typeMultiplier: 1,
       logText: `${actor.pokemon_name} falló ${skill.name}.`,
       hit: false,
-      result: buildEnergyResult(),
+      result: {
+        ...buildEnergyResult(),
+        effective_accuracy: accuracy,
+      },
     };
   }
 
   const damageResult = calculateBattleDamage(actor, target, skill);
   const nextHp = Math.max(0, Number(target.current_hp || 0) - damageResult.damage);
   target.current_hp = nextHp;
+  const effectResult = applySkillEffect(actor, target, skill);
 
   const extra = damageResult.typeMultiplier > 1 ? " Es supereficaz." : damageResult.typeMultiplier > 0 && damageResult.typeMultiplier < 1 ? " No fue muy eficaz." : damageResult.typeMultiplier === 0 ? " No tuvo efecto." : "";
   const crit = damageResult.isCritical ? " Golpe crítico." : "";
@@ -2142,12 +2371,43 @@ function applySkillTurn(actor, target, skill, actorSide) {
     typeMultiplier: damageResult.typeMultiplier,
     logText: `${actor.pokemon_name} usó ${skill.name} e hizo ${damageResult.damage} de daño.${extra}${crit}`,
     hit: true,
-    result: buildEnergyResult(),
+    result: {
+      ...buildEnergyResult(),
+      effective_accuracy: accuracy,
+      ...(effectResult || {}),
+    },
   };
 }
 
 function applyEnergySkillTurn(actor, target, skill, actorSide) {
   validateSkillUse(actor, skill);
+  const block = statusActionBlock(actor);
+  if (block) {
+    normalizeBattleMonsterResources(actor);
+    return {
+      actionType: "status_block",
+      actorSide,
+      actor,
+      target,
+      skill,
+      damage: 0,
+      isCritical: false,
+      typeMultiplier: 1,
+      hit: false,
+      logText: block.logText,
+      result: {
+        status_blocked: true,
+        blocked_by: block.type,
+        energy_before: Number(actor.energy || 0),
+        energy_after: Number(actor.energy || 0),
+        cooldowns_after: { ...(actor.cooldowns || {}) },
+        selected_skill_energy_cost: skillEnergyCost(skill),
+        selected_skill_cooldown_turns: skillCooldownTurns(skill),
+        skill_energy_cost: 0,
+        skill_cooldown_turns: 0,
+      },
+    };
+  }
   return applySkillTurn(actor, target, skill, actorSide);
 }
 
@@ -2159,6 +2419,18 @@ function appendSkillResourceLog(turnLog, turn) {
   }
   if (cooldown > 0 && turn.skill?.name) {
     turnLog.push(`${turn.skill.name} entra en cooldown.`);
+  }
+  const effect = turn?.result?.effect_applied;
+  if (effect) {
+    const targetName = turn.target?.pokemon_name || "La criatura";
+    if (MAIN_STATUS_EFFECTS.has(effect)) {
+      turnLog.push(`${targetName} quedo afectado por ${statusLabel(effect)}.`);
+    } else {
+      turnLog.push(`${targetName} sufrio ${statusLabel(effect)}.`);
+    }
+  }
+  if (turn?.result?.effect_already_active) {
+    turnLog.push(`${turn.target?.pokemon_name || "La criatura"} ya tenia ${statusLabel(turn.result.effect_type)}.`);
   }
 }
 
@@ -2301,6 +2573,15 @@ async function persistBattleTurn(client, battleId, turnNumber, result) {
         disabled_reason: result.result?.disabled_reason ?? null,
         skill_energy_cost: result.result?.skill_energy_cost ?? skillEnergyCost(result.skill),
         skill_cooldown_turns: result.result?.skill_cooldown_turns ?? skillCooldownTurns(result.skill),
+        effective_accuracy: result.result?.effective_accuracy ?? null,
+        status_blocked: !!result.result?.status_blocked,
+        blocked_by: result.result?.blocked_by ?? null,
+        effect_type: result.result?.effect_type ?? result.skill?.effect_type ?? null,
+        effect_chance: result.result?.effect_chance ?? result.skill?.effect_chance ?? null,
+        effect_value: result.result?.effect_value ?? result.skill?.effect_value ?? null,
+        effect_success: !!result.result?.effect_success,
+        effect_applied: result.result?.effect_applied ?? null,
+        effect_already_active: !!result.result?.effect_already_active,
       }),
     ]
   );
@@ -2606,7 +2887,7 @@ async function applyEnemyResponse(client, session, state, turnLog, turnNumber) {
   appendSkillResourceLog(turnLog, enemyTurn);
   await persistBattleTurn(client, session.id, turnNumber, enemyTurn);
   applyPlayerFaintingAndDefeat(state, turnLog);
-  return { actor: activeEnemy, skillSlug: enemySkill.slug };
+  return { actor: enemyTurn.actionType === "skill" ? activeEnemy : null, skillSlug: enemyTurn.actionType === "skill" ? enemySkill.slug : null };
 }
 
 function switchBattleMonster(state, targetPlayerMonsterId) {
@@ -2926,8 +3207,8 @@ async function submitBattleTurn(req, res) {
       }
 
       const playerTurn = applyEnergySkillTurn(player, enemy, skill, "player");
-      playerResourceActor = player;
-      playerResourceSkillSlug = skill.slug;
+      playerResourceActor = playerTurn.actionType === "skill" ? player : null;
+      playerResourceSkillSlug = playerTurn.actionType === "skill" ? skill.slug : null;
       turnLog.push(playerTurn.logText);
       appendSkillResourceLog(turnLog, playerTurn);
       await persistBattleTurn(client, session.id, playerTurnNumber, playerTurn);
@@ -2963,6 +3244,10 @@ async function submitBattleTurn(req, res) {
       enemyActor: enemyResourceActor,
       enemySkillSlug: enemyResourceSkillSlug,
     });
+    const statusEvents = applyEndOfTurnStatusEffects(state, turnLog);
+    if (statusEvents.length) {
+      state.lastStatusEvents = statusEvents.slice(-12);
+    }
 
     state.log = [...(state.log || []), ...turnLog].slice(-40);
     state.turn = Number(state.turn || 1) + 1;

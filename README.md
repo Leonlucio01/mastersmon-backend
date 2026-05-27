@@ -258,6 +258,9 @@ Cada skill del activo incluye:
 
 - `energy_cost`
 - `cooldown_turns`
+- `effect_type`
+- `effect_chance`
+- `effect_value`
 - `current_cooldown`
 - `can_use`
 - `disabled_reason`
@@ -289,6 +292,29 @@ Errores de disponibilidad:
   "ok": false,
   "code": "NOT_ENOUGH_ENERGY",
   "error": "Not enough energy to use this skill."
+}
+```
+
+Efectos y estados basicos:
+
+- La migracion `20260526_battle_status_effects.sql` agrega `effect_type`, `effect_chance` y `effect_value` a `game.skills`.
+- `poison-sting` puede aplicar `poison`, `ember` puede aplicar `burn`, `thunder-shock` puede aplicar `paralysis` y `mud-slap` puede aplicar `accuracy_down`.
+- Los estados viven dentro de `battle_state` por criatura en `statusEffects`; los modificadores temporales viven en `statStages`.
+- `poison` causa 8% del HP maximo al cierre de turno durante 3 turnos.
+- `burn` causa 5% del HP maximo al cierre de turno durante 3 turnos.
+- `paralysis` dura 2 turnos y tiene 25% de probabilidad de bloquear la accion antes de consumir energia o cooldown.
+- Cambiar criatura conserva sus estados en `battle_state`.
+- Usar potion/revive en batalla cura HP, pero no limpia estados.
+
+Ejemplo de metadata en `battle_turns.result`:
+
+```json
+{
+  "effect_type": "poison",
+  "effect_chance": 30,
+  "effect_success": true,
+  "effect_applied": "poison",
+  "status_blocked": false
 }
 ```
 
@@ -335,11 +361,11 @@ Cada fila incluye `battle_id`, `battle_type`, `target_slug`, `target_name`, `sta
 
 Devuelve el detalle completo de una batalla propia: sesion, `battle_state` final, turnos ordenados, recompensas y resumen de dano causado/recibido, skills usadas, criaturas debilitadas, duracion y resultado. El historial solo lee recompensas ya persistidas; no recalcula premios.
 
-Los turnos guardan datos de auditoria en `result` JSONB cuando estan disponibles: `event_type`, `actor`, `target`, `skill`, `item`, `damage`, `critical`, `type_multiplier`, `remaining_hp`, `energy_before`, `energy_after`, `cooldowns_after`, `skill_energy_cost` y `skill_cooldown_turns`.
+Los turnos guardan datos de auditoria en `result` JSONB cuando estan disponibles: `event_type`, `actor`, `target`, `skill`, `item`, `damage`, `critical`, `type_multiplier`, `remaining_hp`, `energy_before`, `energy_after`, `cooldowns_after`, `skill_energy_cost`, `skill_cooldown_turns`, `effect_type`, `effect_chance`, `effect_applied`, `status_blocked` y `blocked_by`.
 
 Al ganar una batalla de tipo `gym`, la victoria guarda progreso en `game.player_gym_progress`, entrega medalla en `game.player_achievements`, entrega recompensa, registra `wallet_transactions` e incrementa misiones `battle_win`, `gym_win` y `badge_earned` cuando aplica. La recompensa completa se entrega solo en la primera victoria de cada gimnasio; repetirlo entrega una recompensa reducida.
 
-Errores esperados: `BATTLE_NOT_FOUND`, `BATTLE_NOT_OWNED`, `BATTLE_ALREADY_FINISHED`, `TEAM_EMPTY`, `GYM_NOT_FOUND`, `GYM_LOCKED`, `NPC_NOT_FOUND`, `INVALID_BATTLE_TYPE`, `INVALID_ACTION`, `SKILL_NOT_FOUND`, `SKILL_NOT_AVAILABLE`, `NOT_ENOUGH_ENERGY`, `SKILL_ON_COOLDOWN`, `NO_AVAILABLE_SKILLS`, `ENERGY_STATE_INVALID`, `ACTIVE_MONSTER_FAINTED`, `MONSTER_NOT_IN_BATTLE`, `MONSTER_FAINTED`, `MONSTER_ALREADY_ACTIVE`, `ITEM_NOT_ALLOWED_IN_BATTLE`, `ITEM_NOT_FOUND`, `INSUFFICIENT_ITEM`, `MONSTER_ALREADY_FULL_HP`, `MONSTER_NOT_FAINTED`, `SWITCH_FAILED`, `ITEM_USE_FAILED`, `BATTLE_TURN_FAILED`, `GYM_PROGRESS_FAILED`, `BADGE_GRANT_FAILED` y `BATTLE_REWARD_FAILED`.
+Errores esperados: `BATTLE_NOT_FOUND`, `BATTLE_NOT_OWNED`, `BATTLE_ALREADY_FINISHED`, `TEAM_EMPTY`, `GYM_NOT_FOUND`, `GYM_LOCKED`, `NPC_NOT_FOUND`, `INVALID_BATTLE_TYPE`, `INVALID_ACTION`, `SKILL_NOT_FOUND`, `SKILL_NOT_AVAILABLE`, `NOT_ENOUGH_ENERGY`, `SKILL_ON_COOLDOWN`, `NO_AVAILABLE_SKILLS`, `ENERGY_STATE_INVALID`, `STATUS_STATE_INVALID`, `EFFECT_APPLY_FAILED`, `ACTIVE_MONSTER_FAINTED`, `MONSTER_NOT_IN_BATTLE`, `MONSTER_FAINTED`, `MONSTER_ALREADY_ACTIVE`, `ITEM_NOT_ALLOWED_IN_BATTLE`, `ITEM_NOT_FOUND`, `INSUFFICIENT_ITEM`, `MONSTER_ALREADY_FULL_HP`, `MONSTER_NOT_FAINTED`, `SWITCH_FAILED`, `ITEM_USE_FAILED`, `BATTLE_TURN_FAILED`, `GYM_PROGRESS_FAILED`, `BADGE_GRANT_FAILED` y `BATTLE_REWARD_FAILED`.
 
 ### Progreso de gimnasios y medallas
 
