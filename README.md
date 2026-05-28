@@ -380,7 +380,35 @@ Los turnos guardan datos de auditoria en `result` JSONB cuando estan disponibles
 
 Al ganar una batalla de tipo `gym`, la victoria guarda progreso en `game.player_gym_progress`, entrega medalla en `game.player_achievements`, entrega recompensa, registra `wallet_transactions` e incrementa misiones `battle_win`, `gym_win` y `badge_earned` cuando aplica. La recompensa completa se entrega solo en la primera victoria de cada gimnasio; repetirlo entrega una recompensa reducida.
 
-Errores esperados: `BATTLE_NOT_FOUND`, `BATTLE_NOT_OWNED`, `BATTLE_ALREADY_FINISHED`, `TEAM_EMPTY`, `GYM_NOT_FOUND`, `GYM_LOCKED`, `NPC_NOT_FOUND`, `INVALID_BATTLE_TYPE`, `INVALID_ACTION`, `SKILL_NOT_FOUND`, `SKILL_NOT_AVAILABLE`, `NOT_ENOUGH_ENERGY`, `SKILL_ON_COOLDOWN`, `NO_AVAILABLE_SKILLS`, `ENERGY_STATE_INVALID`, `STATUS_STATE_INVALID`, `EFFECT_APPLY_FAILED`, `ACTIVE_MONSTER_FAINTED`, `MONSTER_NOT_IN_BATTLE`, `MONSTER_FAINTED`, `MONSTER_ALREADY_ACTIVE`, `ITEM_NOT_ALLOWED_IN_BATTLE`, `ITEM_NOT_FOUND`, `INSUFFICIENT_ITEM`, `MONSTER_ALREADY_FULL_HP`, `MONSTER_NOT_FAINTED`, `SWITCH_FAILED`, `ITEM_USE_FAILED`, `BATTLE_TURN_FAILED`, `GYM_PROGRESS_FAILED`, `BADGE_GRANT_FAILED` y `BATTLE_REWARD_FAILED`.
+Al ganar una batalla de tipo `arena`, la victoria actualiza `game.player_arena_progress`, suma puntos, victorias, racha, rango, entrega oro, registra `wallet_transactions` e incrementa misiones `battle_win`, `arena_win` y `arena_streak` cuando aplica. Al perder, suma derrotas y corta la racha.
+
+Errores esperados: `BATTLE_NOT_FOUND`, `BATTLE_NOT_OWNED`, `BATTLE_ALREADY_FINISHED`, `TEAM_EMPTY`, `GYM_NOT_FOUND`, `GYM_LOCKED`, `NPC_NOT_FOUND`, `INVALID_BATTLE_TYPE`, `INVALID_ACTION`, `SKILL_NOT_FOUND`, `SKILL_NOT_AVAILABLE`, `NOT_ENOUGH_ENERGY`, `SKILL_ON_COOLDOWN`, `NO_AVAILABLE_SKILLS`, `ENERGY_STATE_INVALID`, `STATUS_STATE_INVALID`, `EFFECT_APPLY_FAILED`, `ACTIVE_MONSTER_FAINTED`, `MONSTER_NOT_IN_BATTLE`, `MONSTER_FAINTED`, `MONSTER_ALREADY_ACTIVE`, `ITEM_NOT_ALLOWED_IN_BATTLE`, `ITEM_NOT_FOUND`, `INSUFFICIENT_ITEM`, `MONSTER_ALREADY_FULL_HP`, `MONSTER_NOT_FAINTED`, `SWITCH_FAILED`, `ITEM_USE_FAILED`, `BATTLE_TURN_FAILED`, `GYM_PROGRESS_FAILED`, `BADGE_GRANT_FAILED`, `ARENA_RIVAL_NOT_FOUND`, `ARENA_TEAM_EMPTY`, `ARENA_BATTLE_START_FAILED`, `ARENA_PROGRESS_FAILED`, `ARENA_REWARD_FAILED` y `BATTLE_REWARD_FAILED`.
+
+### Arena PvE
+
+`GET /api/arena`
+
+Devuelve progreso del jugador, rivales disponibles, ranking simple, preview de recompensas y rival recomendado:
+
+- `progress`: puntos, victorias, derrotas, racha, mejor racha, rango actual y siguiente rango.
+- `rivals`: `slug`, nombre, rango, nivel recomendado, dificultad, equipo preview, oro y puntos de recompensa.
+- `ranking`: top Arena con jugadores reales y filas de sistema si todavia no hay suficientes usuarios.
+
+`POST /api/arena/battles/start`
+
+```json
+{
+  "targetSlug": "ragnar-bronce-ii"
+}
+```
+
+Inicia una `battle_session` con `battle_type = "arena"` y reutiliza el mismo motor PvE: skills, energia, cooldowns, estados, cambio de criatura, items, IA enemiga, historial y rewards. Tambien se puede iniciar desde `POST /api/battles/start` enviando `battleType: "arena"`.
+
+`GET /api/arena/ranking`
+
+Devuelve top Arena ordenado por puntos, victorias y mejor racha. Incluye `player_position` cuando el jugador actual no aparece en el corte solicitado.
+
+La migracion `20260527_arena_ladder.sql` crea `game.player_arena_progress`, `game.arena_npc_profiles`, `game.arena_npc_teams`, siembra rivales base y agrega misiones `arena_win` / `arena_streak` de forma idempotente.
 
 ### Progreso de gimnasios y medallas
 

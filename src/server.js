@@ -721,6 +721,10 @@ async function incrementQuestProgress(userId, eventType, payload = {}, client = 
     await updateQuestProgressByAmount(userId, "gym_win", 1, client);
   } else if (eventType === "badge_earned") {
     await updateQuestProgressByAmount(userId, "badge_earned", 1, client);
+  } else if (eventType === "arena_win") {
+    await updateQuestProgressByAmount(userId, "arena_win", 1, client);
+  } else if (eventType === "arena_streak") {
+    await updateQuestProgressMax(userId, "arena_streak", payload.winStreak || 0, client);
   } else if (eventType === "team_update") {
     await updateQuestProgressMax(userId, "team_size", payload.teamSize || 0, client);
   } else if (eventType === "pokedex_species") {
@@ -1672,6 +1676,405 @@ function gymRewardFor(gym, firstClear = true) {
   };
 }
 
+const ARENA_RANKS = [
+  { name: "Bronce I", points: 0 },
+  { name: "Bronce II", points: 100 },
+  { name: "Bronce III", points: 250 },
+  { name: "Plata I", points: 500 },
+  { name: "Plata II", points: 800 },
+  { name: "Plata III", points: 1200 },
+  { name: "Oro I", points: 1700 },
+  { name: "Oro II", points: 2300 },
+  { name: "Oro III", points: 3000 },
+  { name: "Maestro", points: 4000 },
+];
+
+function calculateArenaRank(points) {
+  const value = Math.max(0, Number(points || 0));
+  return [...ARENA_RANKS].reverse().find((rank) => value >= rank.points)?.name || ARENA_RANKS[0].name;
+}
+
+function arenaRankIndex(rankName) {
+  const index = ARENA_RANKS.findIndex((rank) => rank.name === rankName);
+  return index < 0 ? 0 : index;
+}
+
+function arenaDifficultyFor(averageLevel, recommendedLevel, teamSize = 0) {
+  return gymDifficultyFor(averageLevel, recommendedLevel, teamSize);
+}
+
+async function ensureArenaProgress(userId, client = pool) {
+  await client.query(
+    `
+    INSERT INTO game.player_arena_progress (user_id, current_rank, highest_rank, created_at, updated_at)
+    VALUES ($1, 'Bronce I', 'Bronce I', now(), now())
+    ON CONFLICT (user_id) DO NOTHING
+    `,
+    [userId]
+  );
+
+  const result = await client.query(
+    `
+    SELECT *
+    FROM game.player_arena_progress
+    WHERE user_id = $1
+    LIMIT 1
+    `,
+    [userId]
+  );
+  return result.rows[0] || null;
+}
+
+function formatArenaProgress(row = {}) {
+  const points = Number(row.arena_points || 0);
+  const currentRank = row.current_rank || calculateArenaRank(points);
+  const nextRank = ARENA_RANKS.find((rank) => rank.points > points) || null;
+  return {
+    arena_points: points,
+    wins: Number(row.wins || 0),
+    losses: Number(row.losses || 0),
+    win_streak: Number(row.win_streak || 0),
+    best_streak: Number(row.best_streak || 0),
+    current_rank: currentRank,
+    highest_rank: row.highest_rank || currentRank,
+    last_battle_session_id: row.last_battle_session_id || null,
+    next_rank: nextRank ? {
+      name: nextRank.name,
+      points_required: nextRank.points,
+      points_to_next: Math.max(0, nextRank.points - points),
+    } : null,
+  };
+}
+
+async function getArenaRivalRows(userId, client = pool) {
+  const teamPower = await getPlayerTeamPower(userId, client);
+  const result = await client.query(
+    `
+    SELECT
+      nt.id AS npc_id,
+      nt.slug,
+      nt.name,
+      nt.avatar_path,
+      nt.description,
+      ap.rank_name,
+      ap.recommended_level,
+      ap.reward_gold,
+      ap.reward_points,
+      ap.sort_order,
+      COALESCE(
+        json_agg(
+          json_build_object(
+            'species_id', ms.id,
+            'dex_number', ms.dex_number,
+            'pokemon_name', ms.name,
+            'level', ant.level,
+            'selected_sprite_path', COALESCE(ms.animated_path, ms.sprite_path),
+            'slot_number', ant.slot_number
+          )
+          ORDER BY ant.slot_number
+        ) FILTER (WHERE ant.id IS NOT NULL),
+        '[]'::json
+      ) AS team_preview
+    FROM game.npc_trainers nt
+    JOIN game.arena_npc_profiles ap ON ap.npc_trainer_id = nt.id
+    LEFT JOIN game.arena_npc_teams ant ON ant.npc_trainer_id = nt.id
+    LEFT JOIN game.monster_species ms ON ms.id = ant.species_id
+    WHERE ap.is_active = true
+    GROUP BY nt.id, ap.npc_trainer_id, ap.rank_name, ap.recommended_level, ap.reward_gold, ap.reward_points, ap.sort_order
+    ORDER BY ap.sort_order, ap.recommended_level, nt.name
+    `,
+    []
+  );
+
+  return result.rows.map((row) => ({
+    npc_id: row.npc_id,
+    slug: row.slug,
+    name: row.name,
+    avatar_path: row.avatar_path,
+    description: row.description,
+    rank: row.rank_name,
+    recommended_level: Number(row.recommended_level || 1),
+    difficulty_label: arenaDifficultyFor(teamPower.averageLevel, row.recommended_level, teamPower.teamSize),
+    player_average_level: teamPower.averageLevel,
+    player_team_power: teamPower.power,
+    team_preview: row.team_preview || [],
+    reward_gold: Number(row.reward_gold || 0),
+    reward_points: Number(row.reward_points || 0),
+    is_available: true,
+    sort_order: Number(row.sort_order || 0),
+  }));
+}
+
+async function findArenaRival(targetSlug, client = pool) {
+  const slug = String(targetSlug || "").trim().toLowerCase();
+  const result = await client.query(
+    `
+    SELECT
+      nt.id AS npc_id,
+      nt.slug,
+      nt.name,
+      nt.avatar_path,
+      nt.description,
+      ap.rank_name,
+      ap.recommended_level,
+      ap.reward_gold,
+      ap.reward_points,
+      ap.sort_order
+    FROM game.npc_trainers nt
+    JOIN game.arena_npc_profiles ap ON ap.npc_trainer_id = nt.id
+    WHERE nt.slug = $1
+      AND ap.is_active = true
+    LIMIT 1
+    `,
+    [slug]
+  );
+  return result.rows[0] || null;
+}
+
+async function buildArenaEnemyTeam(rival, client = pool) {
+  const result = await client.query(
+    `
+    SELECT
+      ant.species_id,
+      ant.level,
+      ant.slot_number,
+      ms.dex_number,
+      ms.name AS pokemon_name,
+      COALESCE(ms.animated_path, ms.sprite_path) AS selected_sprite_path,
+      pt.slug AS primary_type,
+      st.slug AS secondary_type
+    FROM game.arena_npc_teams ant
+    JOIN game.monster_species ms ON ms.id = ant.species_id
+    LEFT JOIN game.monster_types pt ON pt.id = ms.primary_type_id
+    LEFT JOIN game.monster_types st ON st.id = ms.secondary_type_id
+    WHERE ant.npc_trainer_id = $1
+    ORDER BY ant.slot_number
+    `,
+    [rival.npc_id]
+  );
+
+  const team = [];
+  for (let index = 0; index < result.rows.length; index += 1) {
+    const row = {
+      ...result.rows[index],
+      player_monster_id: null,
+      current_hp: null,
+      iv_hp: 8 + index,
+      iv_attack: 8 + index,
+      iv_defense: 8 + index,
+      is_shiny: false,
+    };
+    const skills = await getSkillsForSpecies(row.species_id, row.level, client);
+    team.push(asBattleMonster(row, "enemy", index, skills));
+  }
+  return team;
+}
+
+function arenaRewardFor(rival) {
+  return {
+    gold: Number(rival.reward_gold || 0),
+    diamonds: 0,
+    items: [],
+    first_clear: true,
+    arena_points: Number(rival.reward_points || 0),
+  };
+}
+
+async function updateArenaProgressOnWin(client, userId, session, state) {
+  const rival = await findArenaRival(session.target_slug || state.targetSlug, client);
+  if (!rival) {
+    throw createHttpError(404, "ARENA_RIVAL_NOT_FOUND", "Arena rival was not found.");
+  }
+
+  await ensureArenaProgress(userId, client);
+  const progressResult = await client.query(
+    `
+    SELECT *
+    FROM game.player_arena_progress
+    WHERE user_id = $1
+    LIMIT 1
+    FOR UPDATE
+    `,
+    [userId]
+  );
+  const progress = progressResult.rows[0];
+  const rewards = await decorateRewardItems(arenaRewardFor(rival), client);
+  const previousPoints = Number(progress.arena_points || 0);
+  const previousRank = progress.current_rank || calculateArenaRank(previousPoints);
+  const pointsAwarded = Number(rewards.arena_points || 0);
+  const nextPoints = previousPoints + pointsAwarded;
+  const currentRank = calculateArenaRank(nextPoints);
+  const highestRank = arenaRankIndex(currentRank) > arenaRankIndex(progress.highest_rank)
+    ? currentRank
+    : (progress.highest_rank || currentRank);
+  const nextStreak = Number(progress.win_streak || 0) + 1;
+  const nextBestStreak = Math.max(Number(progress.best_streak || 0), nextStreak);
+
+  await client.query(
+    `
+    UPDATE game.player_arena_progress
+    SET
+      arena_points = $2,
+      wins = wins + 1,
+      win_streak = $3,
+      best_streak = $4,
+      current_rank = $5,
+      highest_rank = $6,
+      last_battle_session_id = $7,
+      updated_at = now()
+    WHERE user_id = $1
+    `,
+    [userId, nextPoints, nextStreak, nextBestStreak, currentRank, highestRank, session.id]
+  );
+
+  await incrementQuestProgress(userId, "arena_win", { targetSlug: rival.slug, arenaPoints: pointsAwarded }, client);
+  await incrementQuestProgress(userId, "arena_streak", { winStreak: nextStreak }, client);
+
+  return {
+    rival,
+    rewards: {
+      ...rewards,
+      rival_slug: rival.slug,
+      rival_name: rival.name,
+      previous_points: previousPoints,
+      arena_points_total: nextPoints,
+      previous_rank: previousRank,
+      current_rank: currentRank,
+      highest_rank: highestRank,
+      rank_up: arenaRankIndex(currentRank) > arenaRankIndex(previousRank),
+      win_streak: nextStreak,
+      best_streak: nextBestStreak,
+    },
+  };
+}
+
+async function updateArenaProgressOnLoss(client, userId, session, state) {
+  if (session.battle_type !== "arena") return null;
+  await ensureArenaProgress(userId, client);
+  const progressResult = await client.query(
+    `
+    SELECT *
+    FROM game.player_arena_progress
+    WHERE user_id = $1
+    LIMIT 1
+    FOR UPDATE
+    `,
+    [userId]
+  );
+  const progress = progressResult.rows[0] || {};
+  await client.query(
+    `
+    UPDATE game.player_arena_progress
+    SET losses = losses + 1,
+        win_streak = 0,
+        last_battle_session_id = $2,
+        updated_at = now()
+    WHERE user_id = $1
+    `,
+    [userId, session.id]
+  );
+  state.rewards = {
+    gold: 0,
+    diamonds: 0,
+    items: [],
+    arena_points: 0,
+    arena_points_total: Number(progress.arena_points || 0),
+    current_rank: progress.current_rank || calculateArenaRank(progress.arena_points || 0),
+    win_streak: 0,
+    loss: true,
+  };
+  return state.rewards;
+}
+
+async function getArenaRankingRows(userId, client = pool, limit = 20) {
+  const result = await client.query(
+    `
+    SELECT
+      pap.user_id,
+      COALESCE(tp.trainer_name, split_part(u.email, '@', 1)) AS trainer_name,
+      pap.arena_points,
+      pap.wins,
+      pap.losses,
+      pap.win_streak,
+      pap.best_streak,
+      pap.current_rank,
+      false AS is_system
+    FROM game.player_arena_progress pap
+    JOIN game.users u ON u.id = pap.user_id
+    LEFT JOIN game.trainer_profiles tp ON tp.user_id = pap.user_id
+    ORDER BY pap.arena_points DESC, pap.wins DESC, pap.best_streak DESC, pap.updated_at ASC
+    LIMIT $1
+    `,
+    [limit]
+  );
+
+  const rows = result.rows.map((row, index) => ({
+    position: index + 1,
+    user_id: row.user_id,
+    trainer_name: row.trainer_name,
+    arena_points: Number(row.arena_points || 0),
+    wins: Number(row.wins || 0),
+    losses: Number(row.losses || 0),
+    win_streak: Number(row.win_streak || 0),
+    best_streak: Number(row.best_streak || 0),
+    current_rank: row.current_rank || calculateArenaRank(row.arena_points || 0),
+    is_system: false,
+    is_current_user: String(row.user_id) === String(userId),
+  }));
+
+  if (rows.length < Math.min(8, limit)) {
+    const npcResult = await client.query(
+      `
+      SELECT nt.slug, nt.name, ap.rank_name, ap.reward_points, ap.sort_order
+      FROM game.npc_trainers nt
+      JOIN game.arena_npc_profiles ap ON ap.npc_trainer_id = nt.id
+      WHERE ap.is_active = true
+      ORDER BY ap.sort_order
+      LIMIT $1
+      `,
+      [Math.min(8, limit) - rows.length]
+    );
+    npcResult.rows.forEach((row) => {
+      const syntheticPoints = Math.max(0, Number(row.reward_points || 0) * 12 + Math.max(0, 120 - Number(row.sort_order || 0)));
+      rows.push({
+        position: rows.length + 1,
+        user_id: null,
+        trainer_name: row.name,
+        arena_points: syntheticPoints,
+        wins: Math.max(1, Math.floor(syntheticPoints / 100)),
+        losses: 0,
+        win_streak: 0,
+        best_streak: Math.max(1, Math.floor(syntheticPoints / 250)),
+        current_rank: row.rank_name || calculateArenaRank(syntheticPoints),
+        is_system: true,
+        is_current_user: false,
+      });
+    });
+  }
+
+  rows.sort((a, b) => (b.arena_points - a.arena_points) || (b.wins - a.wins) || (b.best_streak - a.best_streak));
+  rows.forEach((row, index) => { row.position = index + 1; });
+
+  let playerPosition = rows.find((row) => row.is_current_user)?.position || null;
+  if (!playerPosition) {
+    const rankResult = await client.query(
+      `
+      SELECT COUNT(*)::int + 1 AS position
+      FROM game.player_arena_progress pap
+      WHERE (pap.arena_points, pap.wins, pap.best_streak) > (
+        SELECT arena_points, wins, best_streak
+        FROM game.player_arena_progress
+        WHERE user_id = $1
+      )
+      `,
+      [userId]
+    );
+    playerPosition = rankResult.rows[0]?.position || null;
+  }
+
+  return { rows: rows.slice(0, limit), playerPosition };
+}
+
 const rewardItemCache = new Map();
 
 async function decorateRewardItems(reward, client = pool) {
@@ -1848,6 +2251,50 @@ async function getGymProgress(req, res) {
   });
 }
 
+async function getArena(req, res) {
+  try {
+    const progressRow = await ensureArenaProgress(req.user.id);
+    const progress = formatArenaProgress(progressRow);
+    const rivals = await getArenaRivalRows(req.user.id);
+    const ranking = await getArenaRankingRows(req.user.id, pool, 10);
+    const nextRival = rivals.find((rival) => rival.difficulty_label !== "hard") || rivals[0] || null;
+
+    res.json({
+      ok: true,
+      progress,
+      rivals,
+      ranking: ranking.rows,
+      player_position: ranking.playerPosition,
+      rewards_preview: {
+        win: rivals[0] ? {
+          gold: rivals[0].reward_gold,
+          arena_points: rivals[0].reward_points,
+        } : null,
+      },
+      next_rival: nextRival,
+    });
+  } catch (error) {
+    if (error.status) throw error;
+    throw createHttpError(500, "ARENA_PROGRESS_FAILED", "Could not load arena progress.");
+  }
+}
+
+async function getArenaRanking(req, res) {
+  try {
+    await ensureArenaProgress(req.user.id);
+    const limit = getLimit(req.query.limit, 20, 100);
+    const ranking = await getArenaRankingRows(req.user.id, pool, limit);
+    res.json({
+      ok: true,
+      ranking: ranking.rows,
+      player_position: ranking.playerPosition,
+    });
+  } catch (error) {
+    if (error.status) throw error;
+    throw createHttpError(500, "ARENA_PROGRESS_FAILED", "Could not load arena ranking.");
+  }
+}
+
 async function getPlayerBadgesRows(userId, client = pool) {
   const result = await client.query(
     `
@@ -1992,13 +2439,14 @@ async function getMyBattles(req, res) {
       `
       SELECT
         bs.*,
-        g.name AS target_name,
+        COALESCE(g.name, nt.name) AS target_name,
         COALESCE(MAX(bt.turn_number), 0)::int AS max_turn_number
       FROM game.battle_sessions bs
       LEFT JOIN game.gyms g ON g.id = bs.gym_id
+      LEFT JOIN game.npc_trainers nt ON nt.id = bs.npc_trainer_id
       LEFT JOIN game.battle_turns bt ON bt.battle_id = bs.id
       WHERE ${filters.join(" AND ")}
-      GROUP BY bs.id, g.name
+      GROUP BY bs.id, g.name, nt.name
       ORDER BY bs.started_at DESC
       LIMIT $2
       `,
@@ -2016,9 +2464,10 @@ async function getMyBattleDetail(req, res) {
   try {
     const rows = await query(
       `
-      SELECT bs.*, g.name AS target_name
+      SELECT bs.*, COALESCE(g.name, nt.name) AS target_name
       FROM game.battle_sessions bs
       LEFT JOIN game.gyms g ON g.id = bs.gym_id
+      LEFT JOIN game.npc_trainers nt ON nt.id = bs.npc_trainer_id
       WHERE bs.id = $1
       LIMIT 1
       `,
@@ -2285,8 +2734,12 @@ async function startBattle(req, res) {
     throw createHttpError(400, "INVALID_BATTLE_TYPE", "Invalid battle type.");
   }
 
+  if (battleType === "arena") {
+    return startArenaBattle(req, res);
+  }
+
   if (!targetSlug) {
-    throw createHttpError(400, battleType === "gym" ? "GYM_NOT_FOUND" : "NPC_NOT_FOUND", "targetSlug is required.");
+    throw createHttpError(400, "GYM_NOT_FOUND", "targetSlug is required.");
   }
 
   const client = await pool.connect();
@@ -2348,6 +2801,78 @@ async function startBattle(req, res) {
     res.status(201).json(await publicBattleState(inserted.rows[0], state, req.user.id, client));
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function startArenaBattle(req, res) {
+  const targetSlug = String(req.body?.targetSlug || req.body?.target_slug || "").trim().toLowerCase();
+  if (!targetSlug) {
+    throw createHttpError(400, "ARENA_RIVAL_NOT_FOUND", "targetSlug is required.");
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+    const playerTeam = await getPlayerBattleTeam(req.user.id, client);
+    if (!playerTeam.length || firstAliveIndex(playerTeam) < 0) {
+      throw createHttpError(400, "ARENA_TEAM_EMPTY", "You need at least one available monster in your team.");
+    }
+
+    await ensureArenaProgress(req.user.id, client);
+    const rival = await findArenaRival(targetSlug, client);
+    if (!rival) {
+      throw createHttpError(404, "ARENA_RIVAL_NOT_FOUND", "Arena rival was not found.");
+    }
+
+    const enemyTeam = await buildArenaEnemyTeam(rival, client);
+    if (!enemyTeam.length) {
+      throw createHttpError(404, "ARENA_RIVAL_NOT_FOUND", "Arena rival has no available team.");
+    }
+
+    const state = {
+      battleType: "arena",
+      targetSlug: rival.slug,
+      arena: {
+        npc_id: rival.npc_id,
+        slug: rival.slug,
+        name: rival.name,
+        rank: rival.rank_name,
+        recommended_level: Number(rival.recommended_level || 1),
+        reward_gold: Number(rival.reward_gold || 0),
+        reward_points: Number(rival.reward_points || 0),
+      },
+      playerTeam,
+      enemyTeam,
+      activePlayerIndex: firstAliveIndex(playerTeam),
+      activeEnemyIndex: firstAliveIndex(enemyTeam),
+      enemyItems: { potion: 1 },
+      enemyLastSwitchTurn: 0,
+      turn: 1,
+      winner: null,
+      rewards: null,
+      log: [`Batalla de Arena iniciada contra ${rival.name}.`],
+    };
+
+    const inserted = await client.query(
+      `
+      INSERT INTO game.battle_sessions (user_id, battle_type, gym_id, npc_trainer_id, status, target_slug, battle_state)
+      VALUES ($1, 'arena', NULL, $2, 'active', $3, $4::jsonb)
+      RETURNING *
+      `,
+      [req.user.id, rival.npc_id, rival.slug, JSON.stringify(state)]
+    );
+
+    await client.query("COMMIT");
+    res.status(201).json(await publicBattleState(inserted.rows[0], state, req.user.id, client));
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (!error.status) {
+      throw createHttpError(500, "ARENA_BATTLE_START_FAILED", "Could not start arena battle.");
+    }
     throw error;
   } finally {
     client.release();
@@ -3076,6 +3601,9 @@ async function rewardBattleWin(client, userId, session, state) {
     if (session.battle_type === "gym") {
       const gymReward = await updateGymProgressOnWin(client, userId, session, state);
       rewards = gymReward.rewards;
+    } else if (session.battle_type === "arena") {
+      const arenaReward = await updateArenaProgressOnWin(client, userId, session, state);
+      rewards = arenaReward.rewards;
     } else {
       rewards = {
         gold: 1000,
@@ -3106,7 +3634,7 @@ async function rewardBattleWin(client, userId, session, state) {
           INSERT INTO game.wallet_transactions (user_id, currency, amount, reason, reference_type, reference_id)
           VALUES ($1, 'gold', $2, $3, 'battle', $4)
           `,
-          [userId, gold, session.battle_type === "gym" ? "gym_reward" : "battle_reward", session.id]
+          [userId, gold, session.battle_type === "gym" ? "gym_reward" : session.battle_type === "arena" ? "arena_reward" : "battle_reward", session.id]
         );
       }
 
@@ -3116,7 +3644,7 @@ async function rewardBattleWin(client, userId, session, state) {
           INSERT INTO game.wallet_transactions (user_id, currency, amount, reason, reference_type, reference_id)
           VALUES ($1, 'diamonds', $2, $3, 'battle', $4)
           `,
-          [userId, diamonds, session.battle_type === "gym" ? "gym_reward" : "battle_reward", session.id]
+          [userId, diamonds, session.battle_type === "gym" ? "gym_reward" : session.battle_type === "arena" ? "arena_reward" : "battle_reward", session.id]
         );
       }
     }
@@ -3128,7 +3656,7 @@ async function rewardBattleWin(client, userId, session, state) {
     }
   } catch (error) {
     if (error.status) throw error;
-    throw createHttpError(500, session.battle_type === "gym" ? "GYM_PROGRESS_FAILED" : "BATTLE_REWARD_FAILED", "Could not deliver battle rewards.");
+    throw createHttpError(500, session.battle_type === "gym" ? "GYM_PROGRESS_FAILED" : session.battle_type === "arena" ? "ARENA_REWARD_FAILED" : "BATTLE_REWARD_FAILED", "Could not deliver battle rewards.");
   }
 }
 
@@ -3443,6 +3971,8 @@ async function submitBattleTurnLegacy(req, res) {
     const finalStatus = state.winner ? "completed" : "active";
     if (state.winner === "player") {
       await rewardBattleWin(client, req.user.id, session, state);
+    } else if (state.winner === "enemy" && session.battle_type === "arena") {
+      await updateArenaProgressOnLoss(client, req.user.id, session, state);
     }
 
     const updated = await client.query(
@@ -3578,6 +4108,8 @@ async function submitBattleTurn(req, res) {
     const finalStatus = state.winner ? "completed" : "active";
     if (state.winner === "player") {
       await rewardBattleWin(client, req.user.id, session, state);
+    } else if (state.winner === "enemy" && session.battle_type === "arena") {
+      await updateArenaProgressOnLoss(client, req.user.id, session, state);
     }
 
     const updated = await client.query(
@@ -3621,6 +4153,9 @@ app.get("/api/me/gym-progress", authRequired, asyncRoute(getGymProgress));
 app.get("/api/me/badges", authRequired, asyncRoute(getPlayerBadges));
 app.get("/api/me/battles", authRequired, asyncRoute(getMyBattles));
 app.get("/api/me/battles/:battleId", authRequired, asyncRoute(getMyBattleDetail));
+app.get("/api/arena", authRequired, asyncRoute(getArena));
+app.get("/api/arena/ranking", authRequired, asyncRoute(getArenaRanking));
+app.post("/api/arena/battles/start", authRequired, asyncRoute(startArenaBattle));
 app.post("/api/battles/start", authRequired, asyncRoute(startBattle));
 app.get("/api/battles/:battleId", authRequired, asyncRoute(getBattle));
 app.post("/api/battles/:battleId/turn", authRequired, asyncRoute(submitBattleTurn));
