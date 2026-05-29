@@ -725,6 +725,10 @@ async function incrementQuestProgress(userId, eventType, payload = {}, client = 
     await updateQuestProgressByAmount(userId, "arena_win", 1, client);
   } else if (eventType === "arena_streak") {
     await updateQuestProgressMax(userId, "arena_streak", payload.winStreak || 0, client);
+  } else if (eventType === "trade_list") {
+    await updateQuestProgressByAmount(userId, "trade_list", payload.quantity || 1, client);
+  } else if (eventType === "trade_complete") {
+    await updateQuestProgressByAmount(userId, "trade_complete", payload.quantity || 1, client);
   } else if (eventType === "team_update") {
     await updateQuestProgressMax(userId, "team_size", payload.teamSize || 0, client);
   } else if (eventType === "pokedex_species") {
@@ -751,6 +755,24 @@ async function syncComputedQuestProgress(userId, client = pool) {
 
   await updateQuestProgressMax(userId, "team_size", await getTeamSize(userId, client), client);
   await updateQuestProgressMax(userId, "pokedex_species", await getCaughtSpeciesCount(userId, client), client);
+
+  const tradeListResult = await client.query(
+    "SELECT COUNT(*)::int AS count FROM game.trade_offers WHERE owner_user_id = $1",
+    [userId]
+  );
+  await updateQuestProgressMax(userId, "trade_list", tradeListResult.rows[0]?.count || 0, client);
+
+  const tradeCompleteResult = await client.query(
+    `
+    SELECT COUNT(*)::int AS count
+    FROM game.trade_history
+    WHERE owner_user_id = $1
+       OR accepted_by_user_id = $1
+    `,
+    [userId]
+  );
+  await updateQuestProgressMax(userId, "trade_complete", tradeCompleteResult.rows[0]?.count || 0, client);
+
   await completeEligibleQuests(userId, client);
 }
 
@@ -5012,6 +5034,532 @@ async function evolveMonster(req, res) {
 
 app.get("/api/me/monsters/:playerMonsterId/evolutions", authRequired, asyncRoute(getMonsterEvolutions));
 app.post("/api/evolutions/evolve", authRequired, asyncRoute(evolveMonster));
+
+// =======================================================
+// Trade Center
+// =======================================================
+
+const TRADE_REQUEST_TYPES = new Set(["any", "species", "type", "rarity", "specific"]);
+
+function normalizeTradeRequestType(value) {
+  const requestedType = String(value || "any").trim().toLowerCase();
+  if (!TRADE_REQUEST_TYPES.has(requestedType)) {
+    throw createHttpError(400, "TRADE_REQUIREMENT_NOT_MET", "Invalid trade request type.");
+  }
+  return requestedType;
+}
+
+function parseOptionalPositiveInt(value, code = "TRADE_REQUIREMENT_NOT_MET") {
+  if (value === null || value === undefined || value === "") return null;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw createHttpError(400, code, "Value must be a positive integer.");
+  }
+  return parsed;
+}
+
+function tradeMonsterObject(row, prefix = "offered") {
+  return {
+    player_monster_id: row[`${prefix}_player_monster_id`],
+    species_id: row[`${prefix}_species_id`],
+    dex_number: row[`${prefix}_dex_number`],
+    pokemon_slug: row[`${prefix}_pokemon_slug`],
+    pokemon_name: row[`${prefix}_pokemon_name`],
+    level: Number(row[`${prefix}_level`] || 0),
+    rarity: row[`${prefix}_rarity`],
+    is_shiny: !!row[`${prefix}_is_shiny`],
+    primary_type: row[`${prefix}_primary_type`],
+    secondary_type: row[`${prefix}_secondary_type`],
+    sprite: row[`${prefix}_sprite`],
+    selected_sprite_path: row[`${prefix}_sprite`],
+    power_score: Number(row[`${prefix}_power_score`] || 0),
+    is_favorite: !!row[`${prefix}_is_favorite`],
+    is_locked: !!row[`${prefix}_is_locked`],
+  };
+}
+
+function tradeRequestedObject(row) {
+  return {
+    requested_type: row.requested_type || "any",
+    requested_species_id: row.requested_species_id,
+    requested_species_name: row.requested_species_name || null,
+    requested_type_slug: row.requested_type_slug || null,
+    requested_rarity: row.requested_rarity || null,
+    requested_min_level: row.requested_min_level || null,
+    requested_notes: row.requested_notes || null,
+  };
+}
+
+function formatTradeOffer(row, currentUserId) {
+  const isOwner = String(row.owner_user_id) === String(currentUserId);
+  const status = row.status || "open";
+  return {
+    trade_offer_id: row.trade_offer_id || row.id,
+    owner_user_id: row.owner_user_id,
+    owner: {
+      user_id: row.owner_user_id,
+      trainer_name: row.owner_trainer_name || "Entrenador",
+    },
+    offered_monster: tradeMonsterObject(row, "offered"),
+    requested: tradeRequestedObject(row),
+    status,
+    created_at: row.created_at,
+    expires_at: row.expires_at,
+    accepted_at: row.accepted_at,
+    cancelled_at: row.cancelled_at,
+    accepted_by_user_id: row.accepted_by_user_id || null,
+    accepted_monster: row.accepted_player_monster_id ? tradeMonsterObject(row, "accepted") : null,
+    can_accept: status === "open" && !isOwner,
+    can_cancel: status === "open" && isOwner,
+  };
+}
+
+function tradeBaseSelect() {
+  return `
+    SELECT
+      t.id AS trade_offer_id,
+      t.owner_user_id,
+      t.offered_player_monster_id,
+      t.requested_type,
+      t.requested_species_id,
+      rs.name AS requested_species_name,
+      t.requested_type_slug,
+      t.requested_rarity,
+      t.requested_min_level,
+      t.requested_notes,
+      t.status,
+      t.accepted_by_user_id,
+      t.accepted_player_monster_id,
+      t.accepted_at,
+      t.cancelled_at,
+      t.expires_at,
+      t.created_at,
+      COALESCE(tp.trainer_name, split_part(u.email::text, '@', 1)) AS owner_trainer_name,
+      opm.id AS offered_player_monster_id,
+      oms.id AS offered_species_id,
+      oms.dex_number AS offered_dex_number,
+      oms.slug AS offered_pokemon_slug,
+      oms.name AS offered_pokemon_name,
+      opm.level AS offered_level,
+      oms.rarity AS offered_rarity,
+      opm.is_shiny AS offered_is_shiny,
+      opt.slug AS offered_primary_type,
+      ost.slug AS offered_secondary_type,
+      COALESCE(oms.animated_path, oms.sprite_path) AS offered_sprite,
+      ((opm.level * 100) + opm.iv_hp + opm.iv_attack + opm.iv_defense + opm.iv_sp_attack + opm.iv_sp_defense + opm.iv_speed)::int AS offered_power_score,
+      opm.is_favorite AS offered_is_favorite,
+      opm.is_locked AS offered_is_locked,
+      apm.id AS accepted_player_monster_id,
+      ams.id AS accepted_species_id,
+      ams.dex_number AS accepted_dex_number,
+      ams.slug AS accepted_pokemon_slug,
+      ams.name AS accepted_pokemon_name,
+      apm.level AS accepted_level,
+      ams.rarity AS accepted_rarity,
+      apm.is_shiny AS accepted_is_shiny,
+      apt.slug AS accepted_primary_type,
+      ast.slug AS accepted_secondary_type,
+      COALESCE(ams.animated_path, ams.sprite_path) AS accepted_sprite,
+      COALESCE(((apm.level * 100) + apm.iv_hp + apm.iv_attack + apm.iv_defense + apm.iv_sp_attack + apm.iv_sp_defense + apm.iv_speed)::int, 0) AS accepted_power_score,
+      COALESCE(apm.is_favorite, false) AS accepted_is_favorite,
+      COALESCE(apm.is_locked, false) AS accepted_is_locked
+    FROM game.trade_offers t
+    JOIN game.users u ON u.id = t.owner_user_id
+    LEFT JOIN game.trainer_profiles tp ON tp.user_id = t.owner_user_id
+    JOIN game.player_monsters opm ON opm.id = t.offered_player_monster_id
+    JOIN game.monster_species oms ON oms.id = opm.species_id
+    LEFT JOIN game.monster_types opt ON opt.id = oms.primary_type_id
+    LEFT JOIN game.monster_types ost ON ost.id = oms.secondary_type_id
+    LEFT JOIN game.monster_species rs ON rs.id = t.requested_species_id
+    LEFT JOIN game.player_monsters apm ON apm.id = t.accepted_player_monster_id
+    LEFT JOIN game.monster_species ams ON ams.id = apm.species_id
+    LEFT JOIN game.monster_types apt ON apt.id = ams.primary_type_id
+    LEFT JOIN game.monster_types ast ON ast.id = ams.secondary_type_id
+  `;
+}
+
+async function getTradeOfferRows({ userId, mine = false, includeClosed = false, limit = 30, offset = 0, queryParams = {} }, client = pool) {
+  const params = [];
+  const filters = [];
+  if (!includeClosed) filters.push("t.status = 'open'");
+  if (mine) {
+    params.push(userId);
+    filters.push(`(t.owner_user_id = $${params.length} OR t.accepted_by_user_id = $${params.length})`);
+  }
+  if (queryParams.tradeOfferId) {
+    params.push(String(queryParams.tradeOfferId));
+    filters.push(`t.id::text = $${params.length}`);
+  }
+  if (queryParams.species) {
+    params.push(String(queryParams.species).toLowerCase());
+    filters.push(`(oms.slug = $${params.length} OR LOWER(oms.name) = $${params.length})`);
+  }
+  if (queryParams.type) {
+    params.push(String(queryParams.type).toLowerCase());
+    filters.push(`(opt.slug = $${params.length} OR ost.slug = $${params.length})`);
+  }
+  if (queryParams.rarity) {
+    params.push(String(queryParams.rarity).toLowerCase());
+    filters.push(`LOWER(oms.rarity) = $${params.length}`);
+  }
+  if (queryParams.minLevel || queryParams.min_level) {
+    params.push(parseOptionalPositiveInt(queryParams.minLevel || queryParams.min_level));
+    filters.push(`opm.level >= $${params.length}`);
+  }
+  if (queryParams.search) {
+    params.push(`%${String(queryParams.search).trim()}%`);
+    filters.push(`(oms.name ILIKE $${params.length} OR COALESCE(tp.trainer_name, '') ILIKE $${params.length} OR COALESCE(t.requested_notes, '') ILIKE $${params.length})`);
+  }
+  params.push(limit);
+  const limitIndex = params.length;
+  params.push(offset);
+  const offsetIndex = params.length;
+
+  const result = await client.query(
+    `
+    ${tradeBaseSelect()}
+    ${filters.length ? `WHERE ${filters.join(" AND ")}` : ""}
+    ORDER BY t.created_at DESC
+    LIMIT $${limitIndex}
+    OFFSET $${offsetIndex}
+    `,
+    params
+  );
+  return result.rows.map((row) => formatTradeOffer(row, userId));
+}
+
+async function getTrades(req, res) {
+  const limit = getLimit(req.query.limit, 30, 100);
+  const offset = Math.max(0, Number(req.query.offset || 0));
+  const mine = String(req.query.mine || "").toLowerCase() === "true";
+  const trades = await getTradeOfferRows({
+    userId: req.user.id,
+    mine,
+    includeClosed: mine,
+    limit,
+    offset,
+    queryParams: req.query,
+  });
+  res.json(trades);
+}
+
+async function getMyTrades(req, res) {
+  const rows = await getTradeOfferRows({
+    userId: req.user.id,
+    mine: true,
+    includeClosed: true,
+    limit: getLimit(req.query.limit, 60, 100),
+    offset: Math.max(0, Number(req.query.offset || 0)),
+    queryParams: req.query,
+  });
+  res.json({
+    ok: true,
+    open: rows.filter((row) => row.status === "open" && String(row.owner_user_id) === String(req.user.id)),
+    closed: rows.filter((row) => row.status !== "open" && String(row.owner_user_id) === String(req.user.id)),
+    accepted: rows.filter((row) => String(row.accepted_by_user_id) === String(req.user.id)),
+    all: rows,
+  });
+}
+
+async function getTradeMonsterForValidation(client, playerMonsterId, lock = false) {
+  const result = await client.query(
+    `
+    SELECT
+      pm.*,
+      ms.dex_number,
+      ms.slug AS pokemon_slug,
+      ms.name AS pokemon_name,
+      ms.rarity,
+      COALESCE(ms.animated_path, ms.sprite_path) AS selected_sprite_path,
+      pt.slug AS primary_type,
+      st.slug AS secondary_type
+    FROM game.player_monsters pm
+    JOIN game.monster_species ms ON ms.id = pm.species_id
+    LEFT JOIN game.monster_types pt ON pt.id = ms.primary_type_id
+    LEFT JOIN game.monster_types st ON st.id = ms.secondary_type_id
+    WHERE pm.id = $1
+    LIMIT 1
+    ${lock ? "FOR UPDATE OF pm" : ""}
+    `,
+    [playerMonsterId]
+  );
+  return result.rows[0] || null;
+}
+
+async function assertMonsterTradeable(client, userId, playerMonsterId, codePrefix = "MONSTER") {
+  const monster = await getTradeMonsterForValidation(client, playerMonsterId, true);
+  if (!monster) {
+    throw createHttpError(404, codePrefix === "ACCEPT_MONSTER" ? "ACCEPT_MONSTER_NOT_FOUND" : "MONSTER_NOT_FOUND", "Monster was not found.");
+  }
+  if (String(monster.user_id) !== String(userId)) {
+    throw createHttpError(403, codePrefix === "ACCEPT_MONSTER" ? "ACCEPT_MONSTER_NOT_OWNED" : "MONSTER_NOT_OWNED", "Monster does not belong to the current user.");
+  }
+  if (monster.is_locked) {
+    throw createHttpError(400, codePrefix === "ACCEPT_MONSTER" ? "ACCEPT_MONSTER_LOCKED" : "MONSTER_LOCKED", "This monster is locked.");
+  }
+  const teamResult = await client.query("SELECT 1 FROM game.player_team_slots WHERE player_monster_id = $1 LIMIT 1", [playerMonsterId]);
+  if (teamResult.rows.length) {
+    throw createHttpError(400, codePrefix === "ACCEPT_MONSTER" ? "ACCEPT_MONSTER_IN_TEAM" : "MONSTER_IN_TEAM", "This monster is in an active team.");
+  }
+  const listedResult = await client.query("SELECT 1 FROM game.trade_offers WHERE offered_player_monster_id = $1 AND status = 'open' LIMIT 1", [playerMonsterId]);
+  if (listedResult.rows.length) {
+    throw createHttpError(400, codePrefix === "ACCEPT_MONSTER" ? "ACCEPT_MONSTER_ALREADY_LISTED" : "MONSTER_ALREADY_LISTED", "This monster is already listed in a trade offer.");
+  }
+  return monster;
+}
+
+function buildTradeSnapshot(monster) {
+  return {
+    player_monster_id: monster.id,
+    user_id: monster.user_id,
+    species_id: monster.species_id,
+    dex_number: monster.dex_number,
+    pokemon_slug: monster.pokemon_slug,
+    pokemon_name: monster.pokemon_name,
+    rarity: monster.rarity,
+    level: monster.level,
+    exp: monster.exp,
+    is_shiny: monster.is_shiny,
+    nickname: monster.nickname,
+    primary_type: monster.primary_type,
+    secondary_type: monster.secondary_type,
+    selected_sprite_path: monster.selected_sprite_path,
+    is_favorite: monster.is_favorite,
+    is_locked: monster.is_locked,
+    captured_at: monster.captured_at,
+  };
+}
+
+async function markPokedexCaught(client, userId, monster) {
+  await client.query(
+    `
+    INSERT INTO game.player_pokedex (
+      user_id, species_id, seen, caught, shiny_seen, shiny_caught, total_seen, total_caught,
+      total_shiny_caught, first_seen_at, first_caught_at, updated_at
+    )
+    VALUES ($1, $2, true, true, $3, $3, 1, 1, $4, now(), now(), now())
+    ON CONFLICT (user_id, species_id)
+    DO UPDATE SET
+      seen = true,
+      caught = true,
+      shiny_seen = game.player_pokedex.shiny_seen OR EXCLUDED.shiny_seen,
+      shiny_caught = game.player_pokedex.shiny_caught OR EXCLUDED.shiny_caught,
+      total_seen = GREATEST(game.player_pokedex.total_seen, 1),
+      total_caught = GREATEST(game.player_pokedex.total_caught, 1),
+      total_shiny_caught = GREATEST(game.player_pokedex.total_shiny_caught, EXCLUDED.total_shiny_caught),
+      first_seen_at = COALESCE(game.player_pokedex.first_seen_at, EXCLUDED.first_seen_at),
+      first_caught_at = COALESCE(game.player_pokedex.first_caught_at, EXCLUDED.first_caught_at),
+      updated_at = now()
+    `,
+    [userId, monster.species_id, !!monster.is_shiny, monster.is_shiny ? 1 : 0]
+  );
+}
+
+function tradeRequirementMet(monster, offer) {
+  const requestedType = offer.requested_type || "any";
+  if (offer.requested_min_level && Number(monster.level || 0) < Number(offer.requested_min_level)) return false;
+  if (requestedType === "any") return true;
+  if (requestedType === "species") return String(monster.species_id) === String(offer.requested_species_id);
+  if (requestedType === "type") return monster.primary_type === offer.requested_type_slug || monster.secondary_type === offer.requested_type_slug;
+  if (requestedType === "rarity") return String(monster.rarity || "").toLowerCase() === String(offer.requested_rarity || "").toLowerCase();
+  if (requestedType === "specific") {
+    if (offer.requested_species_id && String(monster.species_id) !== String(offer.requested_species_id)) return false;
+    if (offer.requested_type_slug && monster.primary_type !== offer.requested_type_slug && monster.secondary_type !== offer.requested_type_slug) return false;
+    if (offer.requested_rarity && String(monster.rarity || "").toLowerCase() !== String(offer.requested_rarity).toLowerCase()) return false;
+    return true;
+  }
+  return false;
+}
+
+async function createTradeOffer(req, res) {
+  const offeredPlayerMonsterId = req.body?.offeredPlayerMonsterId || req.body?.offered_player_monster_id;
+  const requestedType = normalizeTradeRequestType(req.body?.requestedType || req.body?.requested_type);
+  const requestedSpeciesId = parseOptionalPositiveInt(req.body?.requestedSpeciesId || req.body?.requested_species_id);
+  const requestedTypeSlug = req.body?.requestedTypeSlug || req.body?.requested_type_slug ? String(req.body?.requestedTypeSlug || req.body?.requested_type_slug).trim().toLowerCase() : null;
+  const requestedRarity = req.body?.requestedRarity || req.body?.requested_rarity ? String(req.body?.requestedRarity || req.body?.requested_rarity).trim().toLowerCase() : null;
+  const requestedMinLevel = parseOptionalPositiveInt(req.body?.requestedMinLevel || req.body?.requested_min_level);
+  const requestedNotes = req.body?.requestedNotes || req.body?.requested_notes ? String(req.body?.requestedNotes || req.body?.requested_notes).trim().slice(0, 240) : null;
+
+  if (requestedType === "species" && !requestedSpeciesId) throw createHttpError(400, "TRADE_REQUIREMENT_NOT_MET", "requestedSpeciesId is required.");
+  if (requestedType === "type" && !requestedTypeSlug) throw createHttpError(400, "TRADE_REQUIREMENT_NOT_MET", "requestedTypeSlug is required.");
+  if (requestedType === "rarity" && !requestedRarity) throw createHttpError(400, "TRADE_REQUIREMENT_NOT_MET", "requestedRarity is required.");
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const monster = await assertMonsterTradeable(client, req.user.id, offeredPlayerMonsterId, "MONSTER");
+    const inserted = await client.query(
+      `
+      INSERT INTO game.trade_offers (
+        user_id, offered_monster_id, owner_user_id, offered_player_monster_id,
+        requested_type, requested_species_id, requested_type_slug, requested_rarity,
+        requested_min_level, requested_notes, status, created_at, updated_at
+      )
+      VALUES ($1, $2, $1, $2, $3, $4, $5, $6, $7, $8, 'open', now(), now())
+      RETURNING id
+      `,
+      [req.user.id, monster.id, requestedType, requestedSpeciesId, requestedTypeSlug, requestedRarity, requestedMinLevel, requestedNotes]
+    );
+    await incrementQuestProgress(req.user.id, "trade_list", { quantity: 1 }, client);
+    await client.query("COMMIT");
+
+    const rows = await getTradeOfferRows({ userId: req.user.id, mine: true, includeClosed: true, limit: 1, queryParams: { tradeOfferId: inserted.rows[0].id } });
+    res.status(201).json({ ok: true, trade: rows[0] || null });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (error.code === "23505") throw createHttpError(400, "MONSTER_ALREADY_LISTED", "This monster is already listed.");
+    if (error.status) throw error;
+    throw createHttpError(500, "TRADE_CREATE_FAILED", "Could not create trade offer.");
+  } finally {
+    client.release();
+  }
+}
+
+async function getTradeOfferForUpdate(client, tradeOfferId) {
+  const result = await client.query("SELECT * FROM game.trade_offers WHERE id = $1 LIMIT 1 FOR UPDATE", [tradeOfferId]);
+  return result.rows[0] || null;
+}
+
+async function acceptTradeOffer(req, res) {
+  const tradeOfferId = String(req.params.tradeOfferId || "").trim();
+  const acceptedPlayerMonsterId = req.body?.acceptedPlayerMonsterId || req.body?.accepted_player_monster_id;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const offer = await getTradeOfferForUpdate(client, tradeOfferId);
+    if (!offer) throw createHttpError(404, "TRADE_NOT_FOUND", "Trade offer was not found.");
+    if (offer.status !== "open") throw createHttpError(400, "TRADE_NOT_OPEN", "Trade offer is no longer open.");
+    if (String(offer.owner_user_id) === String(req.user.id)) throw createHttpError(400, "CANNOT_ACCEPT_OWN_TRADE", "You cannot accept your own trade.");
+
+    const offeredMonster = await getTradeMonsterForValidation(client, offer.offered_player_monster_id, true);
+    if (!offeredMonster || String(offeredMonster.user_id) !== String(offer.owner_user_id)) throw createHttpError(400, "TRADE_NOT_OPEN", "Trade offer is no longer valid.");
+    if (offeredMonster.is_locked) throw createHttpError(400, "MONSTER_LOCKED", "Offered monster is locked.");
+    const offeredTeamResult = await client.query("SELECT 1 FROM game.player_team_slots WHERE player_monster_id = $1 LIMIT 1", [offeredMonster.id]);
+    if (offeredTeamResult.rows.length) throw createHttpError(400, "MONSTER_IN_TEAM", "Offered monster is in an active team.");
+
+    const acceptedMonster = await assertMonsterTradeable(client, req.user.id, acceptedPlayerMonsterId, "ACCEPT_MONSTER");
+    if (!tradeRequirementMet(acceptedMonster, offer)) throw createHttpError(400, "TRADE_REQUIREMENT_NOT_MET", "Selected monster does not meet the trade requirements.");
+
+    await client.query("UPDATE game.player_team_slots SET player_monster_id = NULL, updated_at = now() WHERE player_monster_id = ANY($1::uuid[])", [[offeredMonster.id, acceptedMonster.id]]);
+    await client.query("UPDATE game.player_monsters SET user_id = $2, updated_at = now() WHERE id = $1", [offeredMonster.id, req.user.id]);
+    await client.query("UPDATE game.player_monsters SET user_id = $2, updated_at = now() WHERE id = $1", [acceptedMonster.id, offer.owner_user_id]);
+    await client.query(
+      `
+      UPDATE game.trade_offers
+      SET status = 'accepted',
+          accepted_by_user_id = $2,
+          accepted_player_monster_id = $3,
+          accepted_at = now(),
+          updated_at = now()
+      WHERE id = $1
+      `,
+      [offer.id, req.user.id, acceptedMonster.id]
+    );
+    await client.query(
+      `
+      INSERT INTO game.trade_history (
+        trade_offer_id, owner_user_id, accepted_by_user_id, offered_player_monster_id,
+        accepted_player_monster_id, offered_snapshot, accepted_snapshot
+      )
+      VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb)
+      `,
+      [offer.id, offer.owner_user_id, req.user.id, offeredMonster.id, acceptedMonster.id, JSON.stringify(buildTradeSnapshot(offeredMonster)), JSON.stringify(buildTradeSnapshot(acceptedMonster))]
+    );
+    await markPokedexCaught(client, req.user.id, offeredMonster);
+    await markPokedexCaught(client, offer.owner_user_id, acceptedMonster);
+    await incrementQuestProgress(offer.owner_user_id, "trade_complete", { quantity: 1 }, client);
+    await incrementQuestProgress(req.user.id, "trade_complete", { quantity: 1 }, client);
+    await incrementQuestProgress(offer.owner_user_id, "pokedex_species", { caughtSpeciesCount: await getCaughtSpeciesCount(offer.owner_user_id, client) }, client);
+    await incrementQuestProgress(req.user.id, "pokedex_species", { caughtSpeciesCount: await getCaughtSpeciesCount(req.user.id, client) }, client);
+    await client.query("COMMIT");
+
+    res.json({
+      ok: true,
+      trade_offer_id: offer.id,
+      received_monster: buildTradeSnapshot(offeredMonster),
+      sent_monster: buildTradeSnapshot(acceptedMonster),
+      collection: await query("SELECT * FROM game.v_player_collection WHERE user_id = $1 ORDER BY captured_at DESC LIMIT 240", [req.user.id]),
+      team: await getCurrentTeamRows(req.user.id),
+      pokedex_summary: (await query("SELECT * FROM game.v_player_pokedex_summary WHERE user_id = $1 LIMIT 1", [req.user.id]))[0] || null,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (error.status) throw error;
+    throw createHttpError(500, "TRADE_ACCEPT_FAILED", "Could not accept trade offer.");
+  } finally {
+    client.release();
+  }
+}
+
+async function cancelTradeOffer(req, res) {
+  const tradeOfferId = String(req.params.tradeOfferId || "").trim();
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const offer = await getTradeOfferForUpdate(client, tradeOfferId);
+    if (!offer) throw createHttpError(404, "TRADE_NOT_FOUND", "Trade offer was not found.");
+    if (String(offer.owner_user_id) !== String(req.user.id)) throw createHttpError(403, "TRADE_NOT_OWNED", "Trade offer does not belong to the current user.");
+    if (offer.status !== "open") throw createHttpError(400, "TRADE_NOT_OPEN", "Trade offer is no longer open.");
+    await client.query("UPDATE game.trade_offers SET status = 'cancelled', cancelled_at = now(), updated_at = now() WHERE id = $1", [offer.id]);
+    await client.query("COMMIT");
+    res.json({ ok: true, trade_offer_id: offer.id, status: "cancelled" });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (error.status) throw error;
+    throw createHttpError(500, "TRADE_CANCEL_FAILED", "Could not cancel trade offer.");
+  } finally {
+    client.release();
+  }
+}
+
+async function getTradeHistory(req, res) {
+  const limit = getLimit(req.query.limit, 30, 100);
+  const rows = await query(
+    `
+    SELECT
+      th.id AS trade_id,
+      th.trade_offer_id,
+      th.owner_user_id,
+      th.accepted_by_user_id,
+      th.offered_snapshot,
+      th.accepted_snapshot,
+      th.created_at,
+      COALESCE(owner_tp.trainer_name, split_part(owner_u.email::text, '@', 1)) AS owner_trainer_name,
+      COALESCE(accept_tp.trainer_name, split_part(accept_u.email::text, '@', 1)) AS accepter_trainer_name
+    FROM game.trade_history th
+    JOIN game.users owner_u ON owner_u.id = th.owner_user_id
+    JOIN game.users accept_u ON accept_u.id = th.accepted_by_user_id
+    LEFT JOIN game.trainer_profiles owner_tp ON owner_tp.user_id = th.owner_user_id
+    LEFT JOIN game.trainer_profiles accept_tp ON accept_tp.user_id = th.accepted_by_user_id
+    WHERE th.owner_user_id = $1
+       OR th.accepted_by_user_id = $1
+    ORDER BY th.created_at DESC
+    LIMIT $2
+    `,
+    [req.user.id, limit]
+  );
+  res.json(rows.map((row) => {
+    const created = String(row.owner_user_id) === String(req.user.id);
+    return {
+      trade_id: row.trade_id,
+      trade_offer_id: row.trade_offer_id,
+      direction: created ? "created" : "accepted",
+      other_trainer_name: created ? row.accepter_trainer_name : row.owner_trainer_name,
+      sent_monster: created ? row.offered_snapshot : row.accepted_snapshot,
+      received_monster: created ? row.accepted_snapshot : row.offered_snapshot,
+      offered_snapshot: row.offered_snapshot,
+      accepted_snapshot: row.accepted_snapshot,
+      created_at: row.created_at,
+    };
+  }));
+}
+
+app.get("/api/trades", authRequired, asyncRoute(getTrades));
+app.get("/api/trades/mine", authRequired, asyncRoute(getMyTrades));
+app.post("/api/trades", authRequired, asyncRoute(createTradeOffer));
+app.post("/api/trades/:tradeOfferId/accept", authRequired, asyncRoute(acceptTradeOffer));
+app.post("/api/trades/:tradeOfferId/cancel", authRequired, asyncRoute(cancelTradeOffer));
+app.get("/api/trades/history", authRequired, asyncRoute(getTradeHistory));
 
 // =======================================================
 // Maps / spawns

@@ -216,10 +216,62 @@ Eventos de progreso integrados:
 - `battle_win`: avanza victorias PvE.
 - `gym_win`: avanza victorias de gimnasio.
 - `badge_earned`: avanza medallas ganadas.
+- `arena_win`: avanza victorias de Arena.
+- `arena_streak`: sincroniza la mejor racha actual de Arena.
+- `trade_list`: avanza ofertas publicadas.
+- `trade_complete`: avanza intercambios completados.
 - `team_update`: sincroniza el tamano del equipo activo.
 - `pokedex_species`: sincroniza especies capturadas en Pokedex.
 
 Errores esperados: `QUEST_NOT_FOUND`, `QUEST_NOT_COMPLETED`, `QUEST_ALREADY_CLAIMED`, `QUEST_REWARD_FAILED` y `QUEST_PROGRESS_FAILED`.
+
+### Trade Center
+
+`GET /api/trades`
+
+Lista ofertas abiertas. Soporta `limit`, `offset`, `species`, `type`, `rarity`, `minLevel`, `search` y `mine=true`.
+
+`GET /api/trades/mine`
+
+Devuelve las ofertas abiertas del usuario, sus ofertas cerradas recientes y trades que acepto.
+
+`POST /api/trades`
+
+```json
+{
+  "offeredPlayerMonsterId": "UUID_DEL_PLAYER_MONSTER",
+  "requestedType": "any",
+  "requestedSpeciesId": null,
+  "requestedTypeSlug": null,
+  "requestedRarity": null,
+  "requestedMinLevel": null,
+  "requestedNotes": "Busco criatura de agua"
+}
+```
+
+Crea una oferta abierta. El backend bloquea criaturas de otro usuario, bloqueadas, en equipo o ya publicadas.
+
+`POST /api/trades/:tradeOfferId/accept`
+
+```json
+{
+  "acceptedPlayerMonsterId": "UUID_DEL_PLAYER_MONSTER"
+}
+```
+
+Acepta una oferta abierta en una transaccion: bloquea la oferta, valida ownership/requisitos, mueve `game.player_monsters.user_id` de ambas criaturas, marca la oferta como `accepted`, inserta `game.trade_history`, actualiza Pokedex de ambos usuarios y avanza misiones `trade_complete`.
+
+`POST /api/trades/:tradeOfferId/cancel`
+
+Cancela una oferta abierta propia sin mover criaturas.
+
+`GET /api/trades/history`
+
+Devuelve los ultimos intercambios del usuario con snapshots JSONB de criatura enviada y recibida.
+
+La migracion `20260529_trade_center.sql` adapta `game.trade_offers`, crea `game.trade_history`, indices parciales para evitar doble oferta abierta y misiones `complete_1_trade`, `complete_3_trades`, `list_1_trade`.
+
+Errores esperados: `MONSTER_NOT_FOUND`, `MONSTER_NOT_OWNED`, `MONSTER_LOCKED`, `MONSTER_IN_TEAM`, `MONSTER_ALREADY_LISTED`, `TRADE_NOT_FOUND`, `TRADE_NOT_OPEN`, `CANNOT_ACCEPT_OWN_TRADE`, `ACCEPT_MONSTER_NOT_FOUND`, `ACCEPT_MONSTER_NOT_OWNED`, `ACCEPT_MONSTER_LOCKED`, `ACCEPT_MONSTER_IN_TEAM`, `ACCEPT_MONSTER_ALREADY_LISTED`, `TRADE_REQUIREMENT_NOT_MET`, `TRADE_NOT_OWNED`, `TRADE_CREATE_FAILED`, `TRADE_ACCEPT_FAILED` y `TRADE_CANCEL_FAILED`.
 
 ### Batallas PvE con skills
 
