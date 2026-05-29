@@ -271,6 +271,95 @@ Devuelve los ultimos intercambios del usuario con snapshots JSONB de criatura en
 
 La migracion `20260529_trade_center.sql` adapta `game.trade_offers`, crea `game.trade_history`, indices parciales para evitar doble oferta abierta y misiones `complete_1_trade`, `complete_3_trades`, `list_1_trade`.
 
+### Mercado global y subastas
+
+`GET /api/market/listings`
+
+Lista ventas directas abiertas. Query params opcionales: `type`, `search`, `rarity`, `minLevel`, `maxPrice`, `currency`, `mine`, `limit` y `offset`.
+
+`POST /api/market/listings`
+
+Crear venta de criatura:
+
+```json
+{
+  "listingType": "monster",
+  "playerMonsterId": "uuid",
+  "priceGold": 5000,
+  "priceDiamonds": 0
+}
+```
+
+Crear venta de item:
+
+```json
+{
+  "listingType": "item",
+  "itemSlug": "rare-candy",
+  "quantity": 1,
+  "priceGold": 3000,
+  "priceDiamonds": 0
+}
+```
+
+Los items se reservan descontandolos al publicar; si se cancela la venta se devuelven. Las criaturas no cambian de owner al publicar, pero quedan bloqueadas por validacion para trade/equipo/otra venta/subasta.
+
+`POST /api/market/listings/:listingId/buy`
+
+Compra una venta abierta. Usa transaccion, lock del listing y wallets, transfiere oro/diamantes, mueve `player_monsters.user_id` o suma inventario, actualiza Pokedex del comprador, registra `wallet_transactions`, `market_history` y misiones `market_buy` / `market_sell`.
+
+`POST /api/market/listings/:listingId/cancel`
+
+Cancela una venta propia abierta. Si era item, devuelve el stock reservado.
+
+`GET /api/market/auctions`
+
+Lista subastas abiertas o propias con `mine=true`. Devuelve item/criatura, vendedor, puja actual, buyout, mayor postor, vencimiento y flags `can_bid`, `can_buyout`, `can_cancel`.
+
+`POST /api/market/auctions`
+
+Crear subasta de criatura o item:
+
+```json
+{
+  "auctionType": "monster",
+  "playerMonsterId": "uuid",
+  "startingPriceGold": 1000,
+  "buyoutPriceGold": 10000,
+  "durationHours": 24
+}
+```
+
+`POST /api/market/auctions/:auctionId/bid`
+
+```json
+{
+  "bidGold": 2000
+}
+```
+
+La puja se reserva descontando oro al pujar. Si existe postor anterior, se le devuelve su puja en la misma transaccion.
+
+`POST /api/market/auctions/:auctionId/buyout`
+
+Compra directa de subasta. Devuelve la puja previa si existe, transfiere criatura/item, paga al vendedor y registra historial/misiones.
+
+`POST /api/market/auctions/:auctionId/cancel`
+
+Cancela una subasta propia abierta. Si habia puja, la devuelve; si era item, devuelve el stock reservado.
+
+`POST /api/market/auctions/:auctionId/claim`
+
+Finaliza subasta vencida de forma idempotente. Si hay mayor postor, entrega el lote y paga al vendedor; si no hay pujas, marca `expired` y devuelve el item reservado cuando aplica.
+
+`GET /api/market/history`
+
+Devuelve compras, ventas, pujas y subastas del usuario actual.
+
+Errores esperados: `MARKET_INVALID_PRICE`, `MARKET_MONSTER_NOT_FOUND`, `MARKET_MONSTER_NOT_OWNED`, `MARKET_MONSTER_IN_TEAM`, `MARKET_MONSTER_LOCKED`, `MARKET_MONSTER_ALREADY_LISTED`, `MARKET_ITEM_NOT_FOUND`, `MARKET_ITEM_INSUFFICIENT`, `MARKET_LISTING_NOT_FOUND`, `MARKET_LISTING_NOT_OPEN`, `CANNOT_BUY_OWN_LISTING`, `INSUFFICIENT_FUNDS`, `AUCTION_NOT_FOUND`, `AUCTION_NOT_OPEN`, `CANNOT_BID_OWN_AUCTION`, `BID_TOO_LOW`, `AUCTION_BID_FAILED`, `AUCTION_BUYOUT_FAILED`, `AUCTION_CLAIM_FAILED` y `AUCTION_CANCEL_FAILED`.
+
+La migracion `20260529_market_auctions.sql` adapta `game.market_listings`, `game.auction_listings`, `game.auction_bids`, crea `game.market_history`, indices parciales para evitar listings/subastas abiertas duplicadas por criatura y misiones `market_buy`, `market_sell`, `auction_bid`, `auction_win`.
+
 Errores esperados: `MONSTER_NOT_FOUND`, `MONSTER_NOT_OWNED`, `MONSTER_LOCKED`, `MONSTER_IN_TEAM`, `MONSTER_ALREADY_LISTED`, `TRADE_NOT_FOUND`, `TRADE_NOT_OPEN`, `CANNOT_ACCEPT_OWN_TRADE`, `ACCEPT_MONSTER_NOT_FOUND`, `ACCEPT_MONSTER_NOT_OWNED`, `ACCEPT_MONSTER_LOCKED`, `ACCEPT_MONSTER_IN_TEAM`, `ACCEPT_MONSTER_ALREADY_LISTED`, `TRADE_REQUIREMENT_NOT_MET`, `TRADE_NOT_OWNED`, `TRADE_CREATE_FAILED`, `TRADE_ACCEPT_FAILED` y `TRADE_CANCEL_FAILED`.
 
 ### Batallas PvE con skills
@@ -511,6 +600,9 @@ database/migrations/20260521_gym_progress_badges.sql
 database/migrations/20260522_battle_switch_items.sql
 database/migrations/20260524_battle_history.sql
 database/migrations/20260526_battle_energy_cooldowns.sql
+database/migrations/20260526_battle_status_effects.sql
+database/migrations/20260529_trade_center.sql
+database/migrations/20260529_market_auctions.sql
 ```
 
 Agrega `password_hash` y `last_login_at` con `ADD COLUMN IF NOT EXISTS`, sin borrar datos ni cambiar IDs existentes.
@@ -521,3 +613,6 @@ La migracion de progreso de gimnasios crea `game.player_gym_progress`, siembra a
 La migracion de acciones de batalla agrega columnas opcionales `item_slug` e `item_name` a `game.battle_turns` para registrar items usados durante combate.
 La migracion de historial de batallas permite `status = completed` en `game.battle_sessions` y agrega indices para listar batallas y turnos recientes con menor costo.
 La migracion de energia/cooldowns asegura `energy_cost` y `cooldown_turns` en `game.skills` y actualiza los costos base de las skills PvE.
+La migracion de estados agrega efectos simples a `game.skills` para poison, burn, paralysis y accuracy_down.
+La migracion de Trade Center crea ofertas/historial real de intercambio.
+La migracion de Mercado global adapta ventas directas, subastas, pujas, historial e inserta misiones de mercado de forma idempotente.

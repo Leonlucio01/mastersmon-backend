@@ -729,6 +729,14 @@ async function incrementQuestProgress(userId, eventType, payload = {}, client = 
     await updateQuestProgressByAmount(userId, "trade_list", payload.quantity || 1, client);
   } else if (eventType === "trade_complete") {
     await updateQuestProgressByAmount(userId, "trade_complete", payload.quantity || 1, client);
+  } else if (eventType === "market_buy") {
+    await updateQuestProgressByAmount(userId, "market_buy", payload.quantity || 1, client);
+  } else if (eventType === "market_sell") {
+    await updateQuestProgressByAmount(userId, "market_sell", payload.quantity || 1, client);
+  } else if (eventType === "auction_bid") {
+    await updateQuestProgressByAmount(userId, "auction_bid", payload.quantity || 1, client);
+  } else if (eventType === "auction_win") {
+    await updateQuestProgressByAmount(userId, "auction_win", payload.quantity || 1, client);
   } else if (eventType === "team_update") {
     await updateQuestProgressMax(userId, "team_size", payload.teamSize || 0, client);
   } else if (eventType === "pokedex_species") {
@@ -772,6 +780,24 @@ async function syncComputedQuestProgress(userId, client = pool) {
     [userId]
   );
   await updateQuestProgressMax(userId, "trade_complete", tradeCompleteResult.rows[0]?.count || 0, client);
+
+  const marketBuyResult = await client.query(
+    "SELECT COUNT(*)::int AS count FROM game.market_history WHERE buyer_user_id = $1 AND event_type IN ('market_buy', 'auction_win')",
+    [userId]
+  );
+  await updateQuestProgressMax(userId, "market_buy", marketBuyResult.rows[0]?.count || 0, client);
+
+  const marketSellResult = await client.query(
+    "SELECT COUNT(*)::int AS count FROM game.market_history WHERE seller_user_id = $1 AND event_type IN ('market_sell', 'auction_sell')",
+    [userId]
+  );
+  await updateQuestProgressMax(userId, "market_sell", marketSellResult.rows[0]?.count || 0, client);
+
+  const auctionBidResult = await client.query(
+    "SELECT COUNT(*)::int AS count FROM game.auction_bids WHERE bidder_user_id = $1",
+    [userId]
+  );
+  await updateQuestProgressMax(userId, "auction_bid", auctionBidResult.rows[0]?.count || 0, client);
 
   await completeEligibleQuests(userId, client);
 }
@@ -5560,6 +5586,751 @@ app.post("/api/trades", authRequired, asyncRoute(createTradeOffer));
 app.post("/api/trades/:tradeOfferId/accept", authRequired, asyncRoute(acceptTradeOffer));
 app.post("/api/trades/:tradeOfferId/cancel", authRequired, asyncRoute(cancelTradeOffer));
 app.get("/api/trades/history", authRequired, asyncRoute(getTradeHistory));
+
+// =======================================================
+// Global Market / Auctions
+// =======================================================
+
+const MARKET_TYPES = new Set(["monster", "item"]);
+const OPEN_MARKET_STATUSES = ["open", "active"];
+
+function normalizeMarketType(value, code = "MARKET_CREATE_FAILED") {
+  const type = String(value || "").trim().toLowerCase();
+  if (!MARKET_TYPES.has(type)) throw createHttpError(400, code, "Invalid market type.");
+  return type;
+}
+
+function parseMarketPrice({ gold, diamonds = 0, requireGoldOnly = false }) {
+  const priceGold = Number(gold || 0);
+  const priceDiamonds = Number(diamonds || 0);
+  if (!Number.isInteger(priceGold) || !Number.isInteger(priceDiamonds) || priceGold < 0 || priceDiamonds < 0) {
+    throw createHttpError(400, "MARKET_INVALID_PRICE", "Price must be a non-negative integer.");
+  }
+  if (requireGoldOnly ? priceGold <= 0 : (priceGold <= 0 && priceDiamonds <= 0)) {
+    throw createHttpError(400, "MARKET_INVALID_PRICE", "Price must be greater than zero.");
+  }
+  return { priceGold, priceDiamonds };
+}
+
+function parseMarketQuantity(value) {
+  const quantity = Number(value || 1);
+  if (!Number.isInteger(quantity) || quantity < 1 || quantity > 999) {
+    throw createHttpError(400, "MARKET_ITEM_INSUFFICIENT", "Quantity must be between 1 and 999.");
+  }
+  return quantity;
+}
+
+async function assertMarketMonsterAvailable(client, userId, playerMonsterId, codePrefix = "MARKET_MONSTER") {
+  const monster = await getTradeMonsterForValidation(client, playerMonsterId, true);
+  if (!monster) throw createHttpError(404, `${codePrefix}_NOT_FOUND`, "Monster was not found.");
+  if (String(monster.user_id) !== String(userId)) throw createHttpError(403, `${codePrefix}_NOT_OWNED`, "Monster does not belong to the current user.");
+  if (monster.is_locked) throw createHttpError(400, `${codePrefix}_LOCKED`, "This monster is locked.");
+
+  const teamResult = await client.query("SELECT 1 FROM game.player_team_slots WHERE player_monster_id = $1 LIMIT 1", [playerMonsterId]);
+  if (teamResult.rows.length) throw createHttpError(400, `${codePrefix}_IN_TEAM`, "This monster is in an active team.");
+
+  const tradeResult = await client.query("SELECT 1 FROM game.trade_offers WHERE offered_player_monster_id = $1 AND status = 'open' LIMIT 1", [playerMonsterId]);
+  if (tradeResult.rows.length) throw createHttpError(400, `${codePrefix}_ALREADY_LISTED`, "This monster is already listed.");
+
+  const marketResult = await client.query("SELECT 1 FROM game.market_listings WHERE player_monster_id = $1 AND status = ANY($2::text[]) LIMIT 1", [playerMonsterId, OPEN_MARKET_STATUSES]);
+  if (marketResult.rows.length) throw createHttpError(400, `${codePrefix}_ALREADY_LISTED`, "This monster is already listed.");
+
+  const auctionResult = await client.query("SELECT 1 FROM game.auction_listings WHERE player_monster_id = $1 AND status = ANY($2::text[]) LIMIT 1", [playerMonsterId, OPEN_MARKET_STATUSES]);
+  if (auctionResult.rows.length) throw createHttpError(400, `${codePrefix}_ALREADY_LISTED`, "This monster is already listed.");
+
+  return monster;
+}
+
+async function getMarketItemForSale(client, userId, itemSlug, quantity, reserve = false) {
+  const itemResult = await client.query(
+    `
+    SELECT
+      i.id,
+      i.slug,
+      COALESCE(i.display_name, i.name) AS display_name,
+      i.icon_path,
+      i.is_tradeable
+    FROM game.items i
+    WHERE i.slug = $1
+    LIMIT 1
+    `,
+    [String(itemSlug || "").trim().toLowerCase()]
+  );
+  if (!itemResult.rows.length || !itemResult.rows[0].is_tradeable) throw createHttpError(404, "MARKET_ITEM_NOT_FOUND", "Item was not found.");
+  const inventoryResult = await client.query(
+    `
+    SELECT quantity::int AS quantity
+    FROM game.player_inventory
+    WHERE user_id = $1 AND item_id = $2
+    LIMIT 1
+    ${reserve ? "FOR UPDATE" : ""}
+    `,
+    [userId, itemResult.rows[0].id]
+  );
+  const quantityOwned = Number(inventoryResult.rows[0]?.quantity || 0);
+  if (quantityOwned < quantity) throw createHttpError(400, "MARKET_ITEM_INSUFFICIENT", "Not enough item quantity.");
+  return { ...itemResult.rows[0], quantity: quantityOwned };
+}
+
+async function addInventoryItem(client, userId, itemId, quantity) {
+  await client.query(
+    `
+    INSERT INTO game.player_inventory (user_id, item_id, quantity)
+    VALUES ($1, $2, $3)
+    ON CONFLICT (user_id, item_id)
+    DO UPDATE SET quantity = game.player_inventory.quantity + EXCLUDED.quantity, updated_at = now()
+    `,
+    [userId, itemId, quantity]
+  );
+}
+
+async function subtractInventoryItem(client, userId, itemId, quantity) {
+  const result = await client.query(
+    `
+    UPDATE game.player_inventory
+    SET quantity = quantity - $3,
+        updated_at = now()
+    WHERE user_id = $1
+      AND item_id = $2
+      AND quantity >= $3
+    RETURNING quantity
+    `,
+    [userId, itemId, quantity]
+  );
+  if (!result.rows.length) throw createHttpError(400, "MARKET_ITEM_INSUFFICIENT", "Not enough item quantity.");
+}
+
+async function lockWallet(client, userId) {
+  const result = await client.query("SELECT * FROM game.trainer_wallets WHERE user_id = $1 LIMIT 1 FOR UPDATE", [userId]);
+  if (!result.rows.length) throw createHttpError(400, "INSUFFICIENT_FUNDS", "Wallet was not found.");
+  return result.rows[0];
+}
+
+async function debitWallet(client, userId, gold, diamonds, reason, referenceId) {
+  const wallet = await lockWallet(client, userId);
+  if (Number(wallet.gold || 0) < Number(gold || 0) || Number(wallet.diamonds || 0) < Number(diamonds || 0)) {
+    throw createHttpError(400, "INSUFFICIENT_FUNDS", "Insufficient funds.");
+  }
+  await client.query(
+    "UPDATE game.trainer_wallets SET gold = gold - $2, diamonds = diamonds - $3, updated_at = now() WHERE user_id = $1",
+    [userId, gold, diamonds]
+  );
+  if (gold > 0) await client.query("INSERT INTO game.wallet_transactions (user_id, currency, amount, reason, reference_type, reference_id) VALUES ($1, 'gold', $2, $3, 'market', $4)", [userId, -gold, reason, referenceId]);
+  if (diamonds > 0) await client.query("INSERT INTO game.wallet_transactions (user_id, currency, amount, reason, reference_type, reference_id) VALUES ($1, 'diamonds', $2, $3, 'market', $4)", [userId, -diamonds, reason, referenceId]);
+}
+
+async function creditWallet(client, userId, gold, diamonds, reason, referenceId) {
+  await lockWallet(client, userId);
+  await client.query(
+    "UPDATE game.trainer_wallets SET gold = gold + $2, diamonds = diamonds + $3, updated_at = now() WHERE user_id = $1",
+    [userId, gold, diamonds]
+  );
+  if (gold > 0) await client.query("INSERT INTO game.wallet_transactions (user_id, currency, amount, reason, reference_type, reference_id) VALUES ($1, 'gold', $2, $3, 'market', $4)", [userId, gold, reason, referenceId]);
+  if (diamonds > 0) await client.query("INSERT INTO game.wallet_transactions (user_id, currency, amount, reason, reference_type, reference_id) VALUES ($1, 'diamonds', $2, $3, 'market', $4)", [userId, diamonds, reason, referenceId]);
+}
+
+function marketMonsterFromRow(row, prefix = "monster") {
+  if (!row[`${prefix}_id`]) return null;
+  return {
+    player_monster_id: row[`${prefix}_id`],
+    species_id: row[`${prefix}_species_id`],
+    dex_number: row[`${prefix}_dex_number`],
+    pokemon_slug: row[`${prefix}_slug`],
+    pokemon_name: row[`${prefix}_name`],
+    level: Number(row[`${prefix}_level`] || 0),
+    rarity: row[`${prefix}_rarity`],
+    is_shiny: !!row[`${prefix}_is_shiny`],
+    primary_type: row[`${prefix}_primary_type`],
+    secondary_type: row[`${prefix}_secondary_type`],
+    selected_sprite_path: row[`${prefix}_sprite`],
+    power_score: Number(row[`${prefix}_power_score`] || 0),
+  };
+}
+
+function marketItemFromRow(row) {
+  if (!row.item_id) return null;
+  return {
+    item_id: row.item_id,
+    item_slug: row.item_slug,
+    slug: row.item_slug,
+    display_name: row.item_display_name,
+    icon_path: row.item_icon_path,
+    quantity: Number(row.quantity || 1),
+  };
+}
+
+function formatMarketListing(row, userId) {
+  const isSeller = String(row.seller_user_id) === String(userId);
+  const status = row.status === "active" ? "open" : row.status;
+  return {
+    listing_id: row.listing_id,
+    listing_type: row.listing_type,
+    seller_user_id: row.seller_user_id,
+    seller: { trainer_name: row.seller_trainer_name || "Entrenador" },
+    monster: marketMonsterFromRow(row),
+    item: marketItemFromRow(row),
+    quantity: Number(row.quantity || 1),
+    price_gold: Number(row.price_gold || 0),
+    price_diamonds: Number(row.price_diamonds || 0),
+    status,
+    buyer_user_id: row.buyer_user_id || null,
+    can_buy: status === "open" && !isSeller,
+    can_cancel: status === "open" && isSeller,
+    created_at: row.created_at,
+    sold_at: row.sold_at,
+    cancelled_at: row.cancelled_at,
+  };
+}
+
+function marketListingSelect() {
+  return `
+    SELECT
+      ml.id AS listing_id,
+      ml.seller_user_id,
+      ml.listing_type,
+      ml.player_monster_id,
+      ml.item_id,
+      ml.item_slug,
+      ml.quantity,
+      ml.price_gold,
+      ml.price_diamonds,
+      ml.status,
+      ml.buyer_user_id,
+      ml.created_at,
+      ml.sold_at,
+      ml.cancelled_at,
+      COALESCE(tp.trainer_name, split_part(u.email::text, '@', 1)) AS seller_trainer_name,
+      pm.id AS monster_id,
+      ms.id AS monster_species_id,
+      ms.dex_number AS monster_dex_number,
+      ms.slug AS monster_slug,
+      ms.name AS monster_name,
+      pm.level AS monster_level,
+      ms.rarity AS monster_rarity,
+      pm.is_shiny AS monster_is_shiny,
+      pt.slug AS monster_primary_type,
+      st.slug AS monster_secondary_type,
+      COALESCE(ms.animated_path, ms.sprite_path) AS monster_sprite,
+      COALESCE(((pm.level * 100) + pm.iv_hp + pm.iv_attack + pm.iv_defense + pm.iv_sp_attack + pm.iv_sp_defense + pm.iv_speed)::int, 0) AS monster_power_score,
+      i.slug AS item_slug,
+      COALESCE(i.display_name, i.name) AS item_display_name,
+      i.icon_path AS item_icon_path
+    FROM game.market_listings ml
+    JOIN game.users u ON u.id = ml.seller_user_id
+    LEFT JOIN game.trainer_profiles tp ON tp.user_id = ml.seller_user_id
+    LEFT JOIN game.player_monsters pm ON pm.id = ml.player_monster_id
+    LEFT JOIN game.monster_species ms ON ms.id = pm.species_id
+    LEFT JOIN game.monster_types pt ON pt.id = ms.primary_type_id
+    LEFT JOIN game.monster_types st ON st.id = ms.secondary_type_id
+    LEFT JOIN game.items i ON i.id = ml.item_id
+  `;
+}
+
+async function getMarketListings(req, res) {
+  const limit = getLimit(req.query.limit, 30, 100);
+  const offset = Math.max(0, Number(req.query.offset || 0));
+  const params = [];
+  const filters = [];
+  const pushFilter = (value, sqlBuilder) => {
+    params.push(value);
+    filters.push(sqlBuilder(params.length));
+  };
+  const mine = String(req.query.mine || "").toLowerCase() === "true";
+  if (mine) {
+    pushFilter(req.user.id, (idx) => `(ml.seller_user_id = $${idx} OR ml.buyer_user_id = $${idx})`);
+  } else {
+    pushFilter(OPEN_MARKET_STATUSES, (idx) => `ml.status = ANY($${idx}::text[])`);
+  }
+  const type = String(req.query.type || "all").toLowerCase();
+  if (type !== "all") {
+    pushFilter(type, (idx) => `ml.listing_type = $${idx}`);
+  }
+  if (req.query.rarity) {
+    pushFilter(String(req.query.rarity).toLowerCase(), (idx) => `LOWER(ms.rarity) = $${idx}`);
+  }
+  if (req.query.minLevel) {
+    pushFilter(parseOptionalPositiveInt(req.query.minLevel), (idx) => `pm.level >= $${idx}`);
+  }
+  if (req.query.maxPrice) {
+    pushFilter(parseOptionalPositiveInt(req.query.maxPrice), (idx) => `ml.price_gold <= $${idx}`);
+  }
+  if (req.query.search) {
+    pushFilter(`%${String(req.query.search).trim()}%`, (idx) => `(ms.name ILIKE $${idx} OR i.name ILIKE $${idx} OR COALESCE(tp.trainer_name, '') ILIKE $${idx})`);
+  }
+  params.push(limit);
+  const limitIndex = params.length;
+  params.push(offset);
+  const offsetIndex = params.length;
+  const rows = await query(
+    `
+    ${marketListingSelect()}
+    ${filters.length ? `WHERE ${filters.join(" AND ")}` : ""}
+    ORDER BY ml.created_at DESC
+    LIMIT $${limitIndex}
+    OFFSET $${offsetIndex}
+    `,
+    params
+  );
+  res.json(rows.map((row) => formatMarketListing(row, req.user.id)));
+}
+
+async function createMarketListing(req, res) {
+  const listingType = normalizeMarketType(req.body?.listingType || req.body?.listing_type, "MARKET_CREATE_FAILED");
+  const { priceGold, priceDiamonds } = parseMarketPrice({ gold: req.body?.priceGold || req.body?.price_gold, diamonds: req.body?.priceDiamonds || req.body?.price_diamonds });
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    let monster = null;
+    let item = null;
+    let quantity = 1;
+    if (listingType === "monster") {
+      monster = await assertMarketMonsterAvailable(client, req.user.id, req.body?.playerMonsterId || req.body?.player_monster_id);
+    } else {
+      quantity = parseMarketQuantity(req.body?.quantity);
+      item = await getMarketItemForSale(client, req.user.id, req.body?.itemSlug || req.body?.item_slug, quantity, true);
+      await subtractInventoryItem(client, req.user.id, item.id, quantity);
+    }
+    const inserted = await client.query(
+      `
+      INSERT INTO game.market_listings (
+        seller_id, seller_user_id, listing_type, monster_id, player_monster_id, item_id, item_slug,
+        item_quantity, quantity, price_gold, price_diamonds, status, created_at, updated_at
+      )
+      VALUES ($1, $1, $2, $3, $3, $4, $5, $6, $6, $7, $8, 'open', now(), now())
+      RETURNING id
+      `,
+      [req.user.id, listingType, monster?.id || null, item?.id || null, item?.slug || null, quantity, priceGold, priceDiamonds]
+    );
+    await client.query("COMMIT");
+    res.status(201).json({ ok: true, listing_id: inserted.rows[0].id });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (error.code === "23505") throw createHttpError(400, "MARKET_MONSTER_ALREADY_LISTED", "Monster is already listed.");
+    if (error.status) throw error;
+    throw createHttpError(500, "MARKET_CREATE_FAILED", "Could not create market listing.");
+  } finally {
+    client.release();
+  }
+}
+
+async function getMarketListingForUpdate(client, listingId) {
+  const result = await client.query("SELECT * FROM game.market_listings WHERE id = $1 LIMIT 1 FOR UPDATE", [listingId]);
+  return result.rows[0] || null;
+}
+
+async function recordMarketHistory(client, payload) {
+  await client.query(
+    `
+    INSERT INTO game.market_history (
+      event_type, listing_id, auction_id, seller_user_id, buyer_user_id, bidder_user_id,
+      listing_type, item_id, item_slug, player_monster_id, quantity,
+      price_gold, price_diamonds, snapshot
+    )
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb)
+    `,
+    [
+      payload.eventType,
+      payload.listingId || null,
+      payload.auctionId || null,
+      payload.sellerUserId || null,
+      payload.buyerUserId || null,
+      payload.bidderUserId || null,
+      payload.listingType || null,
+      payload.itemId || null,
+      payload.itemSlug || null,
+      payload.playerMonsterId || null,
+      payload.quantity || 1,
+      payload.priceGold || 0,
+      payload.priceDiamonds || 0,
+      JSON.stringify(payload.snapshot || {}),
+    ]
+  );
+}
+
+async function buyMarketListing(req, res) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const listing = await getMarketListingForUpdate(client, req.params.listingId);
+    if (!listing) throw createHttpError(404, "MARKET_LISTING_NOT_FOUND", "Listing was not found.");
+    if (!OPEN_MARKET_STATUSES.includes(listing.status)) throw createHttpError(400, "MARKET_LISTING_NOT_OPEN", "Listing is not open.");
+    if (String(listing.seller_user_id) === String(req.user.id)) throw createHttpError(400, "CANNOT_BUY_OWN_LISTING", "You cannot buy your own listing.");
+    await debitWallet(client, req.user.id, Number(listing.price_gold || 0), Number(listing.price_diamonds || 0), "market_buy", listing.id);
+    await creditWallet(client, listing.seller_user_id, Number(listing.price_gold || 0), Number(listing.price_diamonds || 0), "market_sell", listing.id);
+    let snapshot = {};
+    if (listing.listing_type === "monster") {
+      const monster = await getTradeMonsterForValidation(client, listing.player_monster_id, true);
+      if (!monster || String(monster.user_id) !== String(listing.seller_user_id)) throw createHttpError(400, "MARKET_LISTING_NOT_OPEN", "Listing is no longer valid.");
+      if (monster.is_locked) throw createHttpError(400, "MARKET_MONSTER_LOCKED", "This monster is locked.");
+      const teamResult = await client.query("SELECT 1 FROM game.player_team_slots WHERE player_monster_id = $1 LIMIT 1", [monster.id]);
+      if (teamResult.rows.length) throw createHttpError(400, "MARKET_MONSTER_IN_TEAM", "This monster is in an active team.");
+      snapshot = buildTradeSnapshot(monster);
+      await client.query("UPDATE game.player_team_slots SET player_monster_id = NULL, updated_at = now() WHERE player_monster_id = $1", [monster.id]);
+      await client.query("UPDATE game.player_monsters SET user_id = $2, updated_at = now() WHERE id = $1", [monster.id, req.user.id]);
+      await markPokedexCaught(client, req.user.id, monster);
+    } else {
+      await addInventoryItem(client, req.user.id, listing.item_id, Number(listing.quantity || listing.item_quantity || 1));
+      snapshot = { item_id: listing.item_id, item_slug: listing.item_slug, quantity: Number(listing.quantity || listing.item_quantity || 1) };
+    }
+    await client.query("UPDATE game.market_listings SET status = 'sold', buyer_user_id = $2, sold_at = now(), updated_at = now() WHERE id = $1", [listing.id, req.user.id]);
+    await recordMarketHistory(client, {
+      eventType: "market_buy",
+      listingId: listing.id,
+      sellerUserId: listing.seller_user_id,
+      buyerUserId: req.user.id,
+      listingType: listing.listing_type,
+      itemId: listing.item_id,
+      itemSlug: listing.item_slug,
+      playerMonsterId: listing.player_monster_id,
+      quantity: Number(listing.quantity || listing.item_quantity || 1),
+      priceGold: Number(listing.price_gold || 0),
+      priceDiamonds: Number(listing.price_diamonds || 0),
+      snapshot,
+    });
+    await incrementQuestProgress(req.user.id, "market_buy", { quantity: 1 }, client);
+    await incrementQuestProgress(listing.seller_user_id, "market_sell", { quantity: 1 }, client);
+    await client.query("COMMIT");
+    res.json({ ok: true, listing_id: listing.id, wallet: (await query("SELECT * FROM game.trainer_wallets WHERE user_id = $1 LIMIT 1", [req.user.id]))[0] || null });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (error.status) throw error;
+    throw createHttpError(500, "MARKET_BUY_FAILED", "Could not buy listing.");
+  } finally {
+    client.release();
+  }
+}
+
+async function cancelMarketListing(req, res) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const listing = await getMarketListingForUpdate(client, req.params.listingId);
+    if (!listing) throw createHttpError(404, "MARKET_LISTING_NOT_FOUND", "Listing was not found.");
+    if (String(listing.seller_user_id) !== String(req.user.id)) throw createHttpError(403, "MARKET_LISTING_NOT_OWNED", "Listing is not yours.");
+    if (!OPEN_MARKET_STATUSES.includes(listing.status)) throw createHttpError(400, "MARKET_LISTING_NOT_OPEN", "Listing is not open.");
+    if (listing.listing_type === "item") await addInventoryItem(client, req.user.id, listing.item_id, Number(listing.quantity || listing.item_quantity || 1));
+    await client.query("UPDATE game.market_listings SET status = 'cancelled', cancelled_at = now(), updated_at = now() WHERE id = $1", [listing.id]);
+    await client.query("COMMIT");
+    res.json({ ok: true, listing_id: listing.id, status: "cancelled" });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (error.status) throw error;
+    throw createHttpError(500, "MARKET_CANCEL_FAILED", "Could not cancel listing.");
+  } finally {
+    client.release();
+  }
+}
+
+function auctionSelect() {
+  return `
+    SELECT
+      al.id AS auction_id,
+      al.seller_user_id,
+      al.auction_type,
+      al.player_monster_id,
+      al.item_id,
+      al.item_slug,
+      al.quantity,
+      al.starting_price_gold,
+      al.current_price_gold,
+      al.buyout_price_gold,
+      al.highest_bidder_user_id,
+      al.status,
+      al.ends_at,
+      al.created_at,
+      al.sold_at,
+      al.cancelled_at,
+      COALESCE(tp.trainer_name, split_part(u.email::text, '@', 1)) AS seller_trainer_name,
+      COALESCE(htp.trainer_name, split_part(hu.email::text, '@', 1)) AS highest_bidder_name,
+      pm.id AS monster_id,
+      ms.id AS monster_species_id,
+      ms.dex_number AS monster_dex_number,
+      ms.slug AS monster_slug,
+      ms.name AS monster_name,
+      pm.level AS monster_level,
+      ms.rarity AS monster_rarity,
+      pm.is_shiny AS monster_is_shiny,
+      pt.slug AS monster_primary_type,
+      st.slug AS monster_secondary_type,
+      COALESCE(ms.animated_path, ms.sprite_path) AS monster_sprite,
+      COALESCE(((pm.level * 100) + pm.iv_hp + pm.iv_attack + pm.iv_defense + pm.iv_sp_attack + pm.iv_sp_defense + pm.iv_speed)::int, 0) AS monster_power_score,
+      i.slug AS item_slug,
+      COALESCE(i.display_name, i.name) AS item_display_name,
+      i.icon_path AS item_icon_path
+    FROM game.auction_listings al
+    JOIN game.users u ON u.id = al.seller_user_id
+    LEFT JOIN game.trainer_profiles tp ON tp.user_id = al.seller_user_id
+    LEFT JOIN game.users hu ON hu.id = al.highest_bidder_user_id
+    LEFT JOIN game.trainer_profiles htp ON htp.user_id = al.highest_bidder_user_id
+    LEFT JOIN game.player_monsters pm ON pm.id = al.player_monster_id
+    LEFT JOIN game.monster_species ms ON ms.id = pm.species_id
+    LEFT JOIN game.monster_types pt ON pt.id = ms.primary_type_id
+    LEFT JOIN game.monster_types st ON st.id = ms.secondary_type_id
+    LEFT JOIN game.items i ON i.id = al.item_id
+  `;
+}
+
+function formatAuction(row, userId) {
+  const status = row.status === "active" ? "open" : row.status;
+  const isSeller = String(row.seller_user_id) === String(userId);
+  return {
+    auction_id: row.auction_id,
+    auction_type: row.auction_type,
+    seller_user_id: row.seller_user_id,
+    seller: { trainer_name: row.seller_trainer_name || "Entrenador" },
+    highest_bidder_user_id: row.highest_bidder_user_id,
+    highest_bidder: row.highest_bidder_user_id ? { trainer_name: row.highest_bidder_name || "Entrenador" } : null,
+    monster: marketMonsterFromRow(row),
+    item: marketItemFromRow(row),
+    quantity: Number(row.quantity || 1),
+    starting_price_gold: Number(row.starting_price_gold || 0),
+    current_price_gold: Number(row.current_price_gold || 0),
+    buyout_price_gold: row.buyout_price_gold === null ? null : Number(row.buyout_price_gold || 0),
+    ends_at: row.ends_at,
+    status,
+    can_bid: status === "open" && !isSeller,
+    can_buyout: status === "open" && !isSeller && Number(row.buyout_price_gold || 0) > 0,
+    can_cancel: status === "open" && isSeller && !row.highest_bidder_user_id,
+    created_at: row.created_at,
+  };
+}
+
+async function getMarketAuctions(req, res) {
+  const limit = getLimit(req.query.limit, 30, 100);
+  const filters = [];
+  const params = [];
+  const mine = String(req.query.mine || "").toLowerCase() === "true";
+  if (mine) {
+    params.push(req.user.id);
+    filters.push(`(al.seller_user_id = $${params.length} OR al.highest_bidder_user_id = $${params.length})`);
+  } else {
+    params.push(OPEN_MARKET_STATUSES);
+    filters.push(`al.status = ANY($${params.length}::text[])`);
+  }
+  params.push(OPEN_MARKET_STATUSES);
+  const openStatusIndex = params.length;
+  params.push(limit);
+  const limitIndex = params.length;
+  const rows = await query(
+    `
+    ${auctionSelect()}
+    WHERE ${filters.join(" AND ")}
+    ORDER BY CASE WHEN al.status = ANY($${openStatusIndex}::text[]) THEN 0 ELSE 1 END, al.ends_at ASC, al.created_at DESC
+    LIMIT $${limitIndex}
+    `,
+    params
+  );
+  res.json(rows.map((row) => formatAuction(row, req.user.id)));
+}
+
+async function createMarketAuction(req, res) {
+  const auctionType = normalizeMarketType(req.body?.auctionType || req.body?.auction_type, "AUCTION_CREATE_FAILED");
+  const { priceGold: startingPriceGold } = parseMarketPrice({ gold: req.body?.startingPriceGold || req.body?.starting_price_gold, requireGoldOnly: true });
+  const buyoutRaw = req.body?.buyoutPriceGold || req.body?.buyout_price_gold;
+  const buyoutPriceGold = buyoutRaw ? parseMarketPrice({ gold: buyoutRaw, requireGoldOnly: true }).priceGold : null;
+  const durationHours = Math.min(168, Math.max(1, Number(req.body?.durationHours || req.body?.duration_hours || 24)));
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    let monster = null;
+    let item = null;
+    let quantity = 1;
+    if (auctionType === "monster") {
+      monster = await assertMarketMonsterAvailable(client, req.user.id, req.body?.playerMonsterId || req.body?.player_monster_id, "MARKET_MONSTER");
+    } else {
+      quantity = parseMarketQuantity(req.body?.quantity);
+      item = await getMarketItemForSale(client, req.user.id, req.body?.itemSlug || req.body?.item_slug, quantity, true);
+      await subtractInventoryItem(client, req.user.id, item.id, quantity);
+    }
+    const inserted = await client.query(
+      `
+      INSERT INTO game.auction_listings (
+        seller_id, seller_user_id, monster_id, player_monster_id, item_id, item_slug, item_quantity, quantity,
+        auction_type, starting_price, starting_price_gold, current_price_gold, buyout_price, buyout_price_gold,
+        currency, status, starts_at, ends_at, created_at, updated_at
+      )
+      VALUES ($1, $1, $2, $2, $3, $4, $5, $5, $6, $7, $7, $7, $8, $8, 'gold', 'open', now(), now() + ($9::text || ' hours')::interval, now(), now())
+      RETURNING id
+      `,
+      [req.user.id, monster?.id || null, item?.id || null, item?.slug || null, quantity, auctionType, startingPriceGold, buyoutPriceGold, durationHours]
+    );
+    await client.query("COMMIT");
+    res.status(201).json({ ok: true, auction_id: inserted.rows[0].id });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (error.code === "23505") throw createHttpError(400, "MARKET_MONSTER_ALREADY_LISTED", "Monster is already listed.");
+    if (error.status) throw error;
+    throw createHttpError(500, "AUCTION_CREATE_FAILED", "Could not create auction.");
+  } finally {
+    client.release();
+  }
+}
+
+async function getAuctionForUpdate(client, auctionId) {
+  const result = await client.query("SELECT * FROM game.auction_listings WHERE id = $1 LIMIT 1 FOR UPDATE", [auctionId]);
+  return result.rows[0] || null;
+}
+
+async function bidAuction(req, res) {
+  const bidGold = parseMarketPrice({ gold: req.body?.bidGold || req.body?.bid_gold, requireGoldOnly: true }).priceGold;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const auction = await getAuctionForUpdate(client, req.params.auctionId);
+    if (!auction) throw createHttpError(404, "AUCTION_NOT_FOUND", "Auction was not found.");
+    if (!OPEN_MARKET_STATUSES.includes(auction.status) || new Date(auction.ends_at) <= new Date()) throw createHttpError(400, "AUCTION_NOT_OPEN", "Auction is not open.");
+    if (String(auction.seller_user_id) === String(req.user.id)) throw createHttpError(400, "CANNOT_BID_OWN_AUCTION", "You cannot bid on your own auction.");
+    if (bidGold <= Number(auction.current_price_gold || auction.starting_price_gold || 0)) throw createHttpError(400, "BID_TOO_LOW", "Bid must be higher than current price.");
+    await debitWallet(client, req.user.id, bidGold, 0, "auction_bid", auction.id);
+    if (auction.highest_bidder_user_id) {
+      await creditWallet(client, auction.highest_bidder_user_id, Number(auction.current_price_gold || 0), 0, "auction_refund", auction.id);
+    }
+    await client.query(
+      "UPDATE game.auction_listings SET current_price_gold = $2, highest_bidder_user_id = $3, updated_at = now() WHERE id = $1",
+      [auction.id, bidGold, req.user.id]
+    );
+    await client.query("INSERT INTO game.auction_bids (auction_id, bidder_id, bidder_user_id, amount, bid_gold) VALUES ($1,$2,$2,$3,$3)", [auction.id, req.user.id, bidGold]);
+    await recordMarketHistory(client, { eventType: "auction_bid", auctionId: auction.id, bidderUserId: req.user.id, listingType: auction.auction_type, priceGold: bidGold });
+    await incrementQuestProgress(req.user.id, "auction_bid", { quantity: 1 }, client);
+    await client.query("COMMIT");
+    res.json({ ok: true, auction_id: auction.id, bid_gold: bidGold });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (error.status) throw error;
+    throw createHttpError(500, "AUCTION_BID_FAILED", "Could not place bid.");
+  } finally {
+    client.release();
+  }
+}
+
+async function finishAuctionSale(client, auction, buyerUserId, priceGold, eventType = "auction_win") {
+  if (auction.auction_type === "monster") {
+    const monster = await getTradeMonsterForValidation(client, auction.player_monster_id, true);
+    if (!monster || String(monster.user_id) !== String(auction.seller_user_id)) throw createHttpError(400, "AUCTION_NOT_OPEN", "Auction is no longer valid.");
+    await client.query("UPDATE game.player_team_slots SET player_monster_id = NULL, updated_at = now() WHERE player_monster_id = $1", [monster.id]);
+    await client.query("UPDATE game.player_monsters SET user_id = $2, updated_at = now() WHERE id = $1", [monster.id, buyerUserId]);
+    await markPokedexCaught(client, buyerUserId, monster);
+  } else {
+    await addInventoryItem(client, buyerUserId, auction.item_id, Number(auction.quantity || auction.item_quantity || 1));
+  }
+  await creditWallet(client, auction.seller_user_id, priceGold, 0, "auction_sell", auction.id);
+  await client.query("UPDATE game.auction_listings SET status = 'sold', sold_at = now(), updated_at = now() WHERE id = $1", [auction.id]);
+  await recordMarketHistory(client, { eventType, auctionId: auction.id, sellerUserId: auction.seller_user_id, buyerUserId, listingType: auction.auction_type, itemId: auction.item_id, itemSlug: auction.item_slug, playerMonsterId: auction.player_monster_id, quantity: Number(auction.quantity || auction.item_quantity || 1), priceGold });
+  await incrementQuestProgress(buyerUserId, "auction_win", { quantity: 1 }, client);
+  await incrementQuestProgress(auction.seller_user_id, "market_sell", { quantity: 1 }, client);
+}
+
+async function buyoutAuction(req, res) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const auction = await getAuctionForUpdate(client, req.params.auctionId);
+    if (!auction) throw createHttpError(404, "AUCTION_NOT_FOUND", "Auction was not found.");
+    if (!OPEN_MARKET_STATUSES.includes(auction.status)) throw createHttpError(400, "AUCTION_NOT_OPEN", "Auction is not open.");
+    if (String(auction.seller_user_id) === String(req.user.id)) throw createHttpError(400, "CANNOT_BID_OWN_AUCTION", "You cannot buy out your own auction.");
+    const buyout = Number(auction.buyout_price_gold || 0);
+    if (buyout <= 0) throw createHttpError(400, "AUCTION_NOT_OPEN", "Buyout is not available.");
+    await debitWallet(client, req.user.id, buyout, 0, "auction_buyout", auction.id);
+    if (auction.highest_bidder_user_id) await creditWallet(client, auction.highest_bidder_user_id, Number(auction.current_price_gold || 0), 0, "auction_refund", auction.id);
+    await finishAuctionSale(client, auction, req.user.id, buyout, "auction_win");
+    await client.query("COMMIT");
+    res.json({ ok: true, auction_id: auction.id, price_gold: buyout });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (error.status) throw error;
+    throw createHttpError(500, "AUCTION_BUYOUT_FAILED", "Could not buy out auction.");
+  } finally {
+    client.release();
+  }
+}
+
+async function cancelAuction(req, res) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const auction = await getAuctionForUpdate(client, req.params.auctionId);
+    if (!auction) throw createHttpError(404, "AUCTION_NOT_FOUND", "Auction was not found.");
+    if (String(auction.seller_user_id) !== String(req.user.id)) throw createHttpError(403, "MARKET_LISTING_NOT_OWNED", "Auction is not yours.");
+    if (!OPEN_MARKET_STATUSES.includes(auction.status)) throw createHttpError(400, "AUCTION_NOT_OPEN", "Auction is not open.");
+    if (auction.highest_bidder_user_id) {
+      await creditWallet(client, auction.highest_bidder_user_id, Number(auction.current_price_gold || 0), 0, "auction_refund", auction.id);
+    }
+    if (auction.auction_type === "item") {
+      await addInventoryItem(client, auction.seller_user_id, auction.item_id, Number(auction.quantity || auction.item_quantity || 1));
+    }
+    await client.query("UPDATE game.auction_listings SET status = 'cancelled', cancelled_at = now(), updated_at = now() WHERE id = $1", [auction.id]);
+    await recordMarketHistory(client, { eventType: "auction_cancel", auctionId: auction.id, sellerUserId: auction.seller_user_id, bidderUserId: auction.highest_bidder_user_id, listingType: auction.auction_type, itemId: auction.item_id, itemSlug: auction.item_slug, playerMonsterId: auction.player_monster_id, quantity: Number(auction.quantity || auction.item_quantity || 1), priceGold: Number(auction.current_price_gold || 0) });
+    await client.query("COMMIT");
+    res.json({ ok: true, auction_id: auction.id, status: "cancelled" });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (error.status) throw error;
+    throw createHttpError(500, "AUCTION_CANCEL_FAILED", "Could not cancel auction.");
+  } finally {
+    client.release();
+  }
+}
+
+async function claimAuction(req, res) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const auction = await getAuctionForUpdate(client, req.params.auctionId);
+    if (!auction) throw createHttpError(404, "AUCTION_NOT_FOUND", "Auction was not found.");
+    if (!OPEN_MARKET_STATUSES.includes(auction.status)) {
+      await client.query("COMMIT");
+      return res.json({ ok: true, auction_id: auction.id, status: auction.status });
+    }
+    if (new Date(auction.ends_at) > new Date()) throw createHttpError(400, "AUCTION_NOT_OPEN", "Auction has not ended yet.");
+    if (auction.highest_bidder_user_id) {
+      await finishAuctionSale(client, auction, auction.highest_bidder_user_id, Number(auction.current_price_gold || 0), "auction_win");
+    } else {
+      if (auction.auction_type === "item") await addInventoryItem(client, auction.seller_user_id, auction.item_id, Number(auction.quantity || auction.item_quantity || 1));
+      await client.query("UPDATE game.auction_listings SET status = 'expired', updated_at = now() WHERE id = $1", [auction.id]);
+    }
+    await client.query("COMMIT");
+    res.json({ ok: true, auction_id: auction.id });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (error.status) throw error;
+    throw createHttpError(500, "AUCTION_CLAIM_FAILED", "Could not claim auction.");
+  } finally {
+    client.release();
+  }
+}
+
+async function getMarketHistory(req, res) {
+  const limit = getLimit(req.query.limit, 30, 100);
+  const rows = await query(
+    `
+    SELECT mh.*,
+      COALESCE(seller_tp.trainer_name, split_part(seller_u.email::text, '@', 1)) AS seller_name,
+      COALESCE(buyer_tp.trainer_name, split_part(buyer_u.email::text, '@', 1)) AS buyer_name
+    FROM game.market_history mh
+    LEFT JOIN game.users seller_u ON seller_u.id = mh.seller_user_id
+    LEFT JOIN game.trainer_profiles seller_tp ON seller_tp.user_id = mh.seller_user_id
+    LEFT JOIN game.users buyer_u ON buyer_u.id = mh.buyer_user_id
+    LEFT JOIN game.trainer_profiles buyer_tp ON buyer_tp.user_id = mh.buyer_user_id
+    WHERE mh.seller_user_id = $1 OR mh.buyer_user_id = $1 OR mh.bidder_user_id = $1
+    ORDER BY mh.created_at DESC
+    LIMIT $2
+    `,
+    [req.user.id, limit]
+  );
+  res.json(rows);
+}
+
+app.get("/api/market/listings", authRequired, asyncRoute(getMarketListings));
+app.post("/api/market/listings", authRequired, asyncRoute(createMarketListing));
+app.post("/api/market/listings/:listingId/buy", authRequired, asyncRoute(buyMarketListing));
+app.post("/api/market/listings/:listingId/cancel", authRequired, asyncRoute(cancelMarketListing));
+app.get("/api/market/auctions", authRequired, asyncRoute(getMarketAuctions));
+app.post("/api/market/auctions", authRequired, asyncRoute(createMarketAuction));
+app.post("/api/market/auctions/:auctionId/bid", authRequired, asyncRoute(bidAuction));
+app.post("/api/market/auctions/:auctionId/buyout", authRequired, asyncRoute(buyoutAuction));
+app.post("/api/market/auctions/:auctionId/cancel", authRequired, asyncRoute(cancelAuction));
+app.post("/api/market/auctions/:auctionId/claim", authRequired, asyncRoute(claimAuction));
+app.get("/api/market/history", authRequired, asyncRoute(getMarketHistory));
 
 // =======================================================
 // Maps / spawns
