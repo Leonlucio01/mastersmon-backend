@@ -20,6 +20,47 @@ npm run check:db
 npm run dev
 ```
 
+## Cuenta QA controlada
+
+Para crear o refrescar una cuenta de pruebas segura sin tocar otros usuarios:
+
+```bash
+QA_USER_PASSWORD="elige-una-password-segura" node scripts/seedQaUser.js
+```
+
+En PowerShell:
+
+```powershell
+$env:QA_USER_PASSWORD="elige-una-password-segura"; node scripts/seedQaUser.js
+```
+
+El script usa `DATABASE_URL` desde el entorno o `.env`, no imprime secretos y falla si `QA_USER_PASSWORD` no existe. La cuenta controlada es:
+
+```txt
+Email: qa@mastersmon.com
+Trainer: QA Trainer
+```
+
+El seed es idempotente y solo crea/actualiza datos ligados a `qa@mastersmon.com`:
+
+- Wallet: 75000 gold, 500 diamonds, 8 boss tickets.
+- Inventario: Poke Ball, Great Ball, Ultra Ball, Master Ball, potions, revives, Rare Candy y piedras evolutivas si existen en `game.items`.
+- Equipo 6/6: Pikachu, Bulbasaur, Charmander, Squirtle, Geodude y Gastly.
+- Coleccion extra: Eevee, Vulpix, Ekans, Pidgey shiny, Caterpie y Abra locked.
+- Pokedex: marca como vistas/capturadas las especies entregadas.
+- Misiones: crea filas faltantes de `player_quests` para quests activas, sin reclamar recompensas ni borrar historial.
+
+Checklist QA recomendada:
+
+- Login con `qa@mastersmon.com` y verificar Hub, wallet e inventario.
+- Coleccion: probar filtros por tipo, shiny, rareza, nivel y busqueda.
+- Equipo: validar slots completos, mover criaturas y bloqueo de criaturas en equipo.
+- Mochila: usar Potion, Revive y Rare Candy; probar piedras evolutivas con Pikachu/Eevee.
+- Trade Center: crear oferta con una criatura fuera del equipo, validar error con criatura en equipo y locked.
+- Mercado/Subastas: crear venta de item, crear venta/subasta de criatura fuera del equipo, validar errores de fondos/listing propio.
+- Gimnasios/Arena: iniciar batalla con equipo real, usar skills, cambio de criatura e items.
+- Formularios de creacion: revisar create trade, accept trade, create market listing, create auction y bid/buyout.
+
 Auth usa JWT con modo hibrido temporal:
 
 - Si el request trae `Authorization: Bearer TOKEN`, la API usa el usuario autenticado.
