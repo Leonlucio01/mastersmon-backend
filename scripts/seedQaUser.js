@@ -48,11 +48,6 @@ const QA_MONSTERS = [
   { nickname: "QA: Locked Abra", dexNumber: 63, slug: "abra", level: 21, teamSlot: null, isLocked: true, ivs: [9, 15, 7] },
 ];
 
-if (!DATABASE_URL) {
-  console.error("Missing DATABASE_URL environment variable.");
-  process.exit(1);
-}
-
 if (!QA_PASSWORD) {
   console.error("Missing QA_USER_PASSWORD environment variable. Refusing to seed QA user without an explicit password.");
   process.exit(1);
@@ -60,6 +55,11 @@ if (!QA_PASSWORD) {
 
 if (String(QA_PASSWORD).length < 6) {
   console.error("QA_USER_PASSWORD must be at least 6 characters.");
+  process.exit(1);
+}
+
+if (!DATABASE_URL) {
+  console.error("Missing DATABASE_URL environment variable.");
   process.exit(1);
 }
 
@@ -142,7 +142,7 @@ async function upsertQaUser(client, passwordHash) {
       `,
       [...columns.map((column) => updates[column]), existing.rows[0].id]
     );
-    return existing.rows[0].id;
+    return { userId: existing.rows[0].id, action: "updated" };
   }
 
   const insertPayload = {
@@ -161,7 +161,7 @@ async function upsertQaUser(client, passwordHash) {
     columns.map((column) => insertPayload[column])
   );
 
-  return inserted.rows[0].id;
+  return { userId: inserted.rows[0].id, action: "created" };
 }
 
 async function upsertProfile(client, userId) {
@@ -187,7 +187,7 @@ async function upsertProfile(client, userId) {
         [...updateColumns.map((column) => updates[column]), userId]
       );
     }
-    return;
+    return "updated";
   }
 
   const insertPayload = {
@@ -203,6 +203,7 @@ async function upsertProfile(client, userId) {
     `,
     columns.map((column) => insertPayload[column])
   );
+  return "created";
 }
 
 async function upsertWallet(client, userId) {
@@ -227,7 +228,7 @@ async function upsertWallet(client, userId) {
       `,
       insertColumns.map((column) => payload[column])
     );
-    return;
+    return "created";
   }
 
   const updates = { ...payload };
@@ -241,6 +242,7 @@ async function upsertWallet(client, userId) {
     `,
     [...updateColumns.map((column) => updates[column]), userId]
   );
+  return "updated";
 }
 
 async function upsertInventory(client, userId) {
@@ -364,6 +366,7 @@ async function upsertMonster(client, userId, spec, species) {
   if (existing.rows.length) {
     const updates = { ...payload };
     delete updates.user_id;
+    delete updates.captured_at;
     const updateColumns = Object.keys(updates);
     await client.query(
       `
@@ -563,9 +566,10 @@ async function main() {
 
     await client.query("BEGIN");
 
-    const userId = await upsertQaUser(client, passwordHash);
-    await upsertProfile(client, userId);
-    await upsertWallet(client, userId);
+    const userResult = await upsertQaUser(client, passwordHash);
+    const userId = userResult.userId;
+    const profileAction = await upsertProfile(client, userId);
+    const walletAction = await upsertWallet(client, userId);
     const inventory = await upsertInventory(client, userId);
     const monsters = await upsertMonstersAndTeam(client, userId);
     const quests = await ensurePlayerQuests(client, userId);
@@ -578,8 +582,13 @@ async function main() {
         id: userId,
         email: QA_EMAIL,
         trainerName: QA_TRAINER_NAME,
+        action: userResult.action,
+      },
+      profile: {
+        action: profileAction,
       },
       wallet: QA_WALLET,
+      walletAction,
       inventory: inventory.seededItems,
       missingItems: inventory.missingItems,
       monsters: monsters.seededMonsters.map((monster) => ({
@@ -597,7 +606,16 @@ async function main() {
       warnings,
     };
 
-    console.log("QA user seeded successfully.");
+    console.log(`QA user ${userResult.action}: ${QA_EMAIL}`);
+    console.log(`Profile ${profileAction}: ${QA_TRAINER_NAME}`);
+    console.log(`Wallet OK: ${walletAction}`);
+    console.log(`Inventory OK: ${inventory.seededItems.length} item rows set`);
+    console.log(`Creatures OK: ${monsters.seededMonsters.length} QA creatures set`);
+    console.log("Team OK: 6/6 slots assigned");
+    console.log("Pokedex OK: QA species marked seen/caught");
+    if (warnings.length) {
+      console.warn(`Warnings: ${warnings.join("; ")}`);
+    }
     console.log(JSON.stringify(summary, null, 2));
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {});

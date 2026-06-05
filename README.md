@@ -34,7 +34,18 @@ En PowerShell:
 $env:QA_USER_PASSWORD="elige-una-password-segura"; node scripts/seedQaUser.js
 ```
 
-El script usa `DATABASE_URL` desde el entorno o `.env`, no imprime secretos y falla si `QA_USER_PASSWORD` no existe. La cuenta controlada es:
+En Render Shell:
+
+```bash
+QA_USER_PASSWORD="elige-una-password-segura" node scripts/seedQaUser.js
+```
+
+Variables necesarias:
+
+- `DATABASE_URL`
+- `QA_USER_PASSWORD`
+
+Antes de ejecutar, confirma que `DATABASE_URL` apunta a la base esperada. El script usa `DATABASE_URL` desde el entorno o `.env`, no imprime secretos y falla si `QA_USER_PASSWORD` no existe. La cuenta controlada es:
 
 ```txt
 Email: qa@mastersmon.com
@@ -49,6 +60,8 @@ El seed es idempotente y solo crea/actualiza datos ligados a `qa@mastersmon.com`
 - Coleccion extra: Eevee, Vulpix, Ekans, Pidgey shiny, Caterpie y Abra locked.
 - Pokedex: marca como vistas/capturadas las especies entregadas.
 - Misiones: crea filas faltantes de `player_quests` para quests activas, sin reclamar recompensas ni borrar historial.
+
+El script no borra usuarios, capturas, trades, market listings, subastas, historial ni `wallet_transactions`. Si detecta ofertas/listings/subastas abiertas del usuario QA, solo reporta warning y las deja intactas.
 
 Checklist QA recomendada:
 
