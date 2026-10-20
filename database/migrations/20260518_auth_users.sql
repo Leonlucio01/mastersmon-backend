@@ -1,5 +1,0 @@
-ALTER TABLE game.users
-ADD COLUMN IF NOT EXISTS password_hash TEXT;
-
-ALTER TABLE game.users
-ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ;
