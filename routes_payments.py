@@ -42,6 +42,18 @@ BOOSTER_ITEM_TO_BENEFIT = {
 }
 
 
+# JL: Legacy recovery is intentionally restricted to the known, paid historical order.
+LEGACY_RECOVERY_PURCHASE_ID = 22
+LEGACY_RECOVERY_USER_ID = 1
+LEGACY_RECOVERY_POKEMON_ID = 245  # Suicune, documented in the original checkout
+LEGACY_RECOVERY_AMOUNT = Decimal("0.50")
+LEGACY_RECOVERY_CONFIRMATION = "ENTREGAR SUICUNE COMPRA 22"
+
+
+class AdminRecoveryConfirmation(BaseModel):
+    confirmacion: str
+
+
 class CreatePayPalOrderPayload(BaseModel):
     product_code: str
     quantity: int = 1
@@ -757,6 +769,91 @@ def capturar_orden_paypal(payload: CapturePayPalOrderPayload, usuario=Depends(ge
         release_connection(conn)
 
 
+# JL - Inicio - Reclamo individual sin nuevo cobro. Disponible solo para el dueño.
+@router_payments.post("/payments/compras/{compra_id}/reclamar")
+def reclamar_compra_pagada(compra_id: int, usuario=Depends(get_current_user)):
+    """Reintenta solamente la entrega de una compra capturada por PayPal.
+
+    PostgreSQL serializa los reintentos de la misma compra mediante FOR UPDATE.
+    Incluye una unica excepcion historica estricta para la compra 22.
+    """
+    if compra_id <= 0:
+        raise HTTPException(status_code=400, detail="Identificador de compra inválido")
+    conn = get_connection()
+    cursor = get_cursor(conn)
+    try:
+        cursor.execute("""SELECT * FROM public.usuario_compras
+                          WHERE id=%s AND usuario_id=%s FOR UPDATE""",
+                       (compra_id, int(usuario["id"])))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Compra no encontrada en tu cuenta")
+        compra = dict(row)
+        if compra.get("grant_status") == "entregado" and compra.get("entregado_en") is not None:
+            conn.rollback()
+            return {"ok": True, "estado": "pagado", "grant_status": "entregado",
+                    "ya_entregado": True, "grant_payload": _json_safe(compra.get("grant_payload"))}
+        if str(compra.get("estado")) != "pagado":
+            raise HTTPException(status_code=409, detail="La compra aún no figura pagada")
+        if compra.get("entregado_en") is not None:
+            raise HTTPException(status_code=409, detail="La compra tiene una entrega que requiere revisión")
+        cursor.execute("SELECT * FROM public.monetizacion_productos WHERE id=%s",
+                       (int(compra["producto_id"]),))
+        item = cursor.fetchone()
+        if not item:
+            raise HTTPException(status_code=409, detail="El producto original no existe")
+        producto = dict(item)
+        paypal_order_id = str(compra.get("paypal_order_id") or "")
+        paypal_capture_id = str(compra.get("paypal_capture_id") or "")
+        if not paypal_order_id or not paypal_capture_id:
+            raise HTTPException(status_code=409, detail="Faltan referencias del pago confirmado")
+        orden = _obtener_orden_paypal(paypal_order_id)
+        if str(orden.get("id") or "") != paypal_order_id:
+            raise HTTPException(status_code=409, detail="La referencia PayPal no coincide")
+        _verificar_captura_paypal(orden, compra, paypal_capture_id)
+
+        # La orden histórica 22 no guardó especie. Esta excepción está ligada
+        # únicamente al usuario 1 y al pago de USD 0.50 documentado.
+        metadata = _json_safe(compra.get("metadata"))
+        if producto.get("codigo") == DAILY_PRODUCT_CODE and not metadata.get("daily_shiny"):
+            if not (int(compra_id) == 22 and int(compra["usuario_id"]) == 1
+                    and str(compra.get("grant_status")) == "pendiente_seleccion"
+                    and str(compra.get("moneda")) == "USD"
+                    and Decimal(str(compra.get("monto"))) == Decimal("0.50")):
+                raise HTTPException(status_code=409,
+                                    detail="Compra antigua sin Pokémon reservado: requiere revisión de soporte")
+            cursor.execute("SELECT nombre FROM public.pokemon WHERE id=245")
+            especie = cursor.fetchone()
+            if not especie or "suicune" not in str(especie["nombre"]).lower():
+                raise HTTPException(status_code=409, detail="Suicune no coincide con el catálogo")
+            reserva = {"pokemon_id": 245, "nombre": str(especie["nombre"]),
+                       "fecha": "2026-10-21", "es_shiny": True,
+                       "recuperacion_historica": "compra_22_checkout_suicune"}
+            cursor.execute("""UPDATE public.usuario_compras SET
+                  metadata=COALESCE(metadata,'{}'::jsonb) || %s::jsonb,
+                  actualizado_en=NOW() WHERE id=%s RETURNING *""",
+                  (json.dumps({"daily_shiny": reserva}), compra_id))
+            compra = dict(cursor.fetchone())
+        entrega = _entregar_producto_pagado(cursor, compra, producto)
+        if entrega.get("grant_status") != "entregado":
+            raise HTTPException(status_code=409, detail="No se completó la entrega")
+        conn.commit()
+        return {"ok": True, "compra_id": int(compra_id), "estado": "pagado",
+                "grant_status": "entregado", "cobro_adicional": False,
+                "grant_payload": entrega.get("grant_payload", {})}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as exc:
+        conn.rollback()
+        print("Error al reclamar compra:", type(exc).__name__, str(exc))
+        raise HTTPException(status_code=500, detail="No se pudo completar la entrega. Intenta más tarde")
+    finally:
+        cursor.close()
+        release_connection(conn)
+# JL - Fin - Reclamo individual seguro.
+
+
 @router_payments.post("/payments/booster/usar")
 def usar_booster(payload: UseBoosterPayload, usuario=Depends(get_current_user)):
     conn = get_connection()
@@ -951,3 +1048,135 @@ async def paypal_webhook(request: Request):
     finally:
         cursor.close()
         release_connection(conn)
+
+
+# JL - Inicio - Recovery of one verified legacy purchase; no public item-grant endpoint.
+def _admin_developer(cursor, identity):
+    """Always read the live DB role, never trust a role supplied by the browser/JWT."""
+    uid = int(identity["id"])
+    cursor.execute("SELECT id, rol FROM public.usuarios WHERE id = %s", (uid,))
+    row = cursor.fetchone()
+    if not row or str(row.get("rol") or "") != "desarrollador":
+        raise HTTPException(status_code=403, detail="Acceso exclusivo para desarrollador")
+    return uid
+
+
+def _legacy_purchase_locked(cursor):
+    cursor.execute("SELECT * FROM public.usuario_compras WHERE id=%s FOR UPDATE", (LEGACY_RECOVERY_PURCHASE_ID,))
+    purchase = cursor.fetchone()
+    if not purchase:
+        raise HTTPException(status_code=404, detail="Compra histórica no encontrada")
+    purchase = dict(purchase)
+    if int(purchase["usuario_id"]) != LEGACY_RECOVERY_USER_ID:
+        raise HTTPException(status_code=409, detail="La compra pertenece a otro usuario")
+    cursor.execute("SELECT * FROM public.monetizacion_productos WHERE id=%s", (int(purchase["producto_id"]),))
+    product = cursor.fetchone()
+    if not product or str(product["codigo"]) != DAILY_PRODUCT_CODE:
+        raise HTTPException(status_code=409, detail="El producto no coincide con el exclusivo original")
+    return purchase, dict(product)
+
+
+def _validate_legacy_payment(cursor, purchase):
+    if str(purchase["estado"]) != "pagado":
+        raise HTTPException(status_code=409, detail="La compra no consta pagada")
+    if str(purchase["moneda"]) != "USD" or Decimal(str(purchase["monto"])) != LEGACY_RECOVERY_AMOUNT:
+        raise HTTPException(status_code=409, detail="Importe histórico incorrecto")
+    if purchase.get("grant_status") == "entregado" or purchase.get("entregado_en") is not None:
+        raise HTTPException(status_code=409, detail="Esta compra ya registra una entrega")
+    if str(purchase.get("grant_status") or "") != "pendiente_seleccion":
+        raise HTTPException(status_code=409, detail="La compra no está pendiente de selección")
+    metadata = _json_safe(purchase.get("metadata"))
+    if metadata.get("daily_shiny"):
+        raise HTTPException(status_code=409, detail="Ya existe un Pokémon reservado: requiere revisión")
+    paypal_id = str(purchase.get("paypal_order_id") or "")
+    capture_id = str(purchase.get("paypal_capture_id") or "")
+    if not paypal_id or not capture_id:
+        raise HTTPException(status_code=409, detail="Faltan referencias del pago original")
+    order = _obtener_orden_paypal(paypal_id)
+    if str(order.get("id") or "") != paypal_id:
+        raise HTTPException(status_code=409, detail="PayPal devolvió otra orden")
+    verified_id = _verificar_captura_paypal(order, purchase, capture_id)
+    cursor.execute("SELECT id,nombre FROM public.pokemon WHERE id=%s", (LEGACY_RECOVERY_POKEMON_ID,))
+    pokemon = cursor.fetchone()
+    if not pokemon or "suicune" not in str(pokemon["nombre"]).lower():
+        raise HTTPException(status_code=409, detail="Suicune no está disponible en el catálogo")
+    return dict(pokemon), verified_id
+
+
+@router_payments.get("/payments/admin/recuperacion/22")
+def admin_preview_compra22(usuario=Depends(get_current_user)):
+    """Read-only verification, no delivery. Restricted to current developer role."""
+    conn = get_connection()
+    cursor = get_cursor(conn)
+    try:
+        _admin_developer(cursor, usuario)
+        purchase, _ = _legacy_purchase_locked(cursor)
+        if purchase.get("grant_status") == "entregado" and purchase.get("entregado_en"):
+            result = {"ok": True, "compra_id": 22, "estado": "entregado", "grant_payload": _json_safe(purchase.get("grant_payload"))}
+        else:
+            pokemon, _ = _validate_legacy_payment(cursor, purchase)
+            result = {"ok": True, "compra_id": 22, "estado": "pendiente_seleccion",
+                      "monto": "0.50", "moneda": "USD", "pokemon_id": LEGACY_RECOVERY_POKEMON_ID,
+                      "pokemon_nombre": str(pokemon["nombre"]), "es_shiny": True,
+                      "pago_verificado": True,
+                      "advertencia": "Asociación histórica a Suicune basada en la captura del checkout; la orden antigua no guardó la especie."}
+        conn.rollback()  # GET never changes DB state
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        release_connection(conn)
+
+
+@router_payments.post("/payments/admin/recuperacion/22")
+def admin_deliver_compra22(payload: AdminRecoveryConfirmation, usuario=Depends(get_current_user)):
+    """Exactly-once grant under PostgreSQL row lock, including audit record."""
+    if payload.confirmacion != LEGACY_RECOVERY_CONFIRMATION:
+        raise HTTPException(status_code=400, detail="Frase de confirmación incorrecta")
+    conn = get_connection()
+    cursor = get_cursor(conn)
+    try:
+        actor_id = _admin_developer(cursor, usuario)
+        purchase, product = _legacy_purchase_locked(cursor)
+        pokemon, capture_id = _validate_legacy_payment(cursor, purchase)
+        cursor.execute("""SELECT id FROM public.payment_admin_recoveries
+                          WHERE compra_id=%s FOR UPDATE""", (LEGACY_RECOVERY_PURCHASE_ID,))
+        if cursor.fetchone():
+            raise HTTPException(status_code=409, detail="Compra ya registrada en la auditoría")
+        reservation = {"pokemon_id": LEGACY_RECOVERY_POKEMON_ID,
+                       "nombre": str(pokemon["nombre"]), "fecha": "2026-10-21", "es_shiny": True,
+                       "recuperacion_admin": True, "fuente": "checkout_historico_compra_22"}
+        cursor.execute("""UPDATE public.usuario_compras
+             SET metadata=COALESCE(metadata,'{}'::jsonb) || %s::jsonb,
+                 actualizado_en=NOW() WHERE id=%s RETURNING *""",
+             (json.dumps({"daily_shiny": reservation}), LEGACY_RECOVERY_PURCHASE_ID))
+        updated = cursor.fetchone()
+        result = _entregar_producto_pagado(cursor, dict(updated), product)
+        grant = result.get("grant_payload") or {}
+        if result.get("grant_status") != "entregado" or not grant.get("usuario_pokemon_id"):
+            raise HTTPException(status_code=500, detail="La entrega no confirmó el Pokémon")
+        cursor.execute("""INSERT INTO public.payment_admin_recoveries
+            (compra_id, administrador_id, usuario_id, pokemon_id, usuario_pokemon_id,
+             paypal_order_id, paypal_capture_id, monto, moneda, motivo)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+            (LEGACY_RECOVERY_PURCHASE_ID, actor_id, LEGACY_RECOVERY_USER_ID,
+             LEGACY_RECOVERY_POKEMON_ID, int(grant["usuario_pokemon_id"]),
+             str(purchase["paypal_order_id"]), capture_id,
+             LEGACY_RECOVERY_AMOUNT, "USD", "Recuperación manual verificada - checkout Suicune Shiny 2026-10-21"))
+        conn.commit()
+        return {"ok": True, "compra_id": 22, "estado": "entregado", "grant_status": "entregado",
+                "pokemon_id": LEGACY_RECOVERY_POKEMON_ID,
+                "usuario_pokemon_id": int(grant["usuario_pokemon_id"]), "cobro_adicional": False}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        # Do not expose database or payment details to the client.
+        raise HTTPException(status_code=500, detail="No se pudo finalizar la recuperación. Revisa los logs.")
+    finally:
+        cursor.close()
+        release_connection(conn)
+# JL - Fin - Recover purchase 22.
