@@ -4,7 +4,12 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from database import get_connection, get_cursor, release_connection
 from auth import get_current_user
-from routes_pokemon import calcular_stats, calcular_experiencia_total_base, sincronizar_movimientos_usuario_pokemon
+from routes_pokemon import (
+    calcular_stats,
+    calcular_experiencia_total_base,
+    sincronizar_movimientos_usuario_pokemon,
+    guardar_equipo_usuario,
+)
 
 router_trainer_onboarding = APIRouter(prefix='/trainer-onboarding', tags=['Trainer onboarding V1.4'])
 
@@ -84,6 +89,13 @@ def complete_trainer_setup(data: SetupInput, user=Depends(get_current_user)):
         obtained = cur.fetchone()
         owned_id = int(obtained['id'])
         sincronizar_movimientos_usuario_pokemon(cur, owned_id, int(p['id']), nivel, origen='captura', auto_equipar=True)
+
+        # JL - Inicio - El inicial se asigna a la posicion 1 del equipo en la misma transaccion.
+        # Es una cuenta nueva y se acaba de validar que no tiene ningun Pokemon previo.
+        # Reutiliza la funcion oficial del juego que guarda usuario_pokemon.id (no la especie).
+        equipo_guardado = guardar_equipo_usuario(cur, int(user['id']), [owned_id])
+        # JL - Fin - Equipo inicial por defecto.
+
         code = re.sub(r'[^a-z0-9]+', '-', str(p['nombre']).strip().lower()).strip('-')
         cur.execute('''UPDATE usuarios SET avatar_id=%s,trainer_team_color=%s,
                          trainer_starter_code=%s,trainer_setup_completed=TRUE,
@@ -91,7 +103,8 @@ def complete_trainer_setup(data: SetupInput, user=Depends(get_current_user)):
                     (avatar, team, code, int(user['id'])))
         con.commit()
         return {'ok': True, 'usuario_pokemon_id': owned_id, 'pokemon': {'id': int(p['id']), 'nombre': p['nombre']},
-                'avatar_id': avatar, 'team_color': team, 'setup_completed': True}
+                'avatar_id': avatar, 'team_color': team, 'setup_completed': True,
+                'equipo_ids': equipo_guardado, 'posicion_equipo': 1}
     except HTTPException:
         con.rollback()
         raise
