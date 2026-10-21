@@ -13,7 +13,8 @@ STARTERS = {
   4: (387, 390, 393), 5: (495, 498, 501), 6: (650, 653, 656),
   7: (722, 725, 728), 8: (810, 813, 816), 9: (906, 909, 912),
 }
-ALLOWED_AVATARS = {'steven', 'red', 'leaf', 'brendan', 'may', 'dawn', 'lucas', 'rosa'}
+ALLOWED_AVATARS = {'steven', 'red', 'leaf', 'brendan', 'may', 'dawn', 'lucas', 'rosa',
+                   'batman', 'bryan', 'goku', 'hades', 'jean', 'jhonny', 'leon', 'nathaly'}
 ALLOWED_TEAMS = {'red', 'blue', 'green'}
 
 class SetupInput(BaseModel):
