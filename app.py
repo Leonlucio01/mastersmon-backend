@@ -10,6 +10,7 @@ from database import get_connection, get_cursor, release_connection
 from routes_capturas_v211 import router_capturas_v211
 from routes_lobby_v29 import router_lobby_v29
 from routes_daily_shiny import router_daily_shiny
+from routes_daily_missions import router_daily_missions
 
 BACKEND_MARKER = "mastersmon-backend-2026-03-23-monetization-v1"
 
@@ -44,6 +45,7 @@ app.include_router(router_trainer_onboarding)
 app.include_router(router_capturas_v211)
 app.include_router(router_lobby_v29)
 app.include_router(router_daily_shiny)
+app.include_router(router_daily_missions)
 
 @app.get("/")
 def root():
