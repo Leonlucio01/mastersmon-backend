@@ -1,6 +1,8 @@
 import json
 import os
 import uuid
+from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import requests
@@ -8,6 +10,9 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 
 from auth import get_current_user
+from routes_daily_shiny import PRODUCT_CODE as DAILY_PRODUCT_CODE, configured_ids, stable_choice
+from server_time import server_now
+from routes_pokemon import (calcular_stats, calcular_experiencia_total_base, sincronizar_movimientos_usuario_pokemon)
 from database import get_connection, get_cursor, release_connection
 from monetization_utils import (
     activar_o_extender_beneficio,
@@ -42,6 +47,8 @@ class CreatePayPalOrderPayload(BaseModel):
     quantity: int = 1
     confirmacion_aceptada: bool = False
     version_terminos: str = "v1"
+    daily_pokemon_id: int | None = None
+    daily_offer_date: str | None = None
 
 
 class CapturePayPalOrderPayload(BaseModel):
@@ -142,6 +149,84 @@ def _validar_limite_producto(cursor, usuario_id: int, producto: dict):
         raise HTTPException(status_code=409, detail="Ya alcanzaste el límite de compra para este producto")
 
 
+def _oferta_shiny_actual(cursor):
+    """Fija la misma rotación que GET /payments/legendario-del-dia."""
+    fecha = server_now().date()
+    ids = configured_ids()
+    cursor.execute("SELECT id, nombre FROM pokemon WHERE id = ANY(%s)", (list(ids),))
+    encontrados = {int(x["id"]): x for x in (cursor.fetchall() or [])}
+    disponibles = tuple(i for i in ids if i in encontrados)
+    if not disponibles:
+        raise HTTPException(status_code=503, detail="No hay legendarios Shiny disponibles")
+    elegido = stable_choice(disponibles, fecha)
+    return {"pokemon_id": elegido, "nombre": str(encontrados[elegido]["nombre"]),
+            "fecha": fecha.isoformat(), "es_shiny": True}
+
+
+def _verificar_captura_paypal(orden: dict, compra: dict, capture_id_esperado=None) -> str:
+    """Sólo entrega tras una captura COMPLETED de la orden y del importe registrados."""
+    if str(orden.get("status") or "").upper() != "COMPLETED":
+        raise HTTPException(status_code=409, detail="La orden PayPal aún no está completada")
+    unidades = orden.get("purchase_units") or []
+    if len(unidades) != 1:
+        raise HTTPException(status_code=409, detail="Cantidad de unidades PayPal inválida")
+    unidad = unidades[0]
+    cid = str(compra["id"])
+    if str(unidad.get("custom_id") or "") != cid or str(unidad.get("invoice_id") or "") != f"MSM-{cid}":
+        raise HTTPException(status_code=409, detail="La orden PayPal no corresponde a la compra")
+    capturas = (unidad.get("payments") or {}).get("captures") or []
+    correctas = [x for x in capturas if str(x.get("status") or "").upper() == "COMPLETED"]
+    if len(correctas) != 1:
+        raise HTTPException(status_code=409, detail="PayPal no confirmó una captura válida")
+    captura = correctas[0]
+    importe = captura.get("amount") or {}
+    try:
+        valor = Decimal(str(importe["value"]))
+        esperado = Decimal(str(compra["monto"]))
+    except (InvalidOperation, ValueError, TypeError, KeyError):
+        raise HTTPException(status_code=409, detail="Importe PayPal inválido")
+    if valor != esperado or str(importe.get("currency_code") or "") != str(compra["moneda"]):
+        raise HTTPException(status_code=409, detail="Importe o moneda PayPal no coinciden")
+    captura_id = str(captura.get("id") or "")
+    if not captura_id or (capture_id_esperado and captura_id != str(capture_id_esperado)):
+        raise HTTPException(status_code=409, detail="Identificador de captura incorrecto")
+    return captura_id
+
+
+def _entregar_shiny_reservado(cursor, compra: dict) -> dict:
+    reserva = _json_safe(compra.get("metadata")).get("daily_shiny")
+    if not isinstance(reserva, dict) or not reserva.get("pokemon_id"):
+        # Las compras anteriores a esta versión no fijaban especie: no se adivina.
+        raise HTTPException(status_code=409, detail="Compra anterior sin especie reservada: requiere recuperación supervisada")
+    pokemon_id = int(reserva["pokemon_id"])
+    if pokemon_id not in configured_ids() or reserva.get("es_shiny") is not True:
+        raise HTTPException(status_code=409, detail="Pokémon reservado no autorizado")
+    cursor.execute("""SELECT id, nombre, hp, ataque, defensa, velocidad, ataque_especial, defensa_especial
+                      FROM pokemon WHERE id=%s LIMIT 1""", (pokemon_id,))
+    pokemon = cursor.fetchone()
+    if not pokemon:
+        raise HTTPException(status_code=409, detail="Pokémon reservado no encontrado")
+    nivel = 5
+    stats = calcular_stats(pokemon["hp"], pokemon["ataque"], pokemon["defensa"],
+                           pokemon["velocidad"], nivel, es_shiny=True,
+                           base_ataque_especial=pokemon["ataque_especial"],
+                           base_defensa_especial=pokemon["defensa_especial"])
+    cursor.execute("""INSERT INTO usuario_pokemon
+        (usuario_id,pokemon_id,nivel,experiencia,experiencia_total,es_shiny,
+         hp_actual,hp_max,ataque,defensa,velocidad,ataque_especial,defensa_especial,
+         bonus_hp_renacer,bonus_ataque_renacer,bonus_defensa_renacer,bonus_velocidad_renacer,victorias_total)
+        VALUES (%s,%s,%s,0,%s,TRUE,%s,%s,%s,%s,%s,%s,%s,0,0,0,0,0) RETURNING id""",
+        (int(compra["usuario_id"]), pokemon_id, nivel, calcular_experiencia_total_base(nivel),
+         stats["hp_max"], stats["hp_max"], stats["ataque"], stats["defensa"],
+         stats["velocidad"], stats["ataque_especial"], stats["defensa_especial"]))
+    nuevo_id = int(cursor.fetchone()["id"])
+    sincronizar_movimientos_usuario_pokemon(cursor, nuevo_id, pokemon_id, nivel,
+                                             origen="compra", auto_equipar=True)
+    return {"usuario_pokemon_id": nuevo_id, "pokemon_id": pokemon_id,
+            "nombre": str(pokemon["nombre"]), "es_shiny": True, "nivel": nivel,
+            "fecha_oferta": str(reserva.get("fecha") or "")}
+
+
 def _crear_compra_pendiente(cursor, usuario: dict, producto: dict, payload: CreatePayPalOrderPayload, request: Request):
     monto = float(producto["precio_usd"])
     if int(payload.quantity or 1) != 1:
@@ -177,7 +262,7 @@ def _crear_compra_pendiente(cursor, usuario: dict, producto: dict, payload: Crea
 
 def _crear_orden_paypal(compra: dict, producto: dict):
     token = _paypal_access_token()
-    monto = f"{float(producto['precio_usd']):.2f}"
+    monto = f"{Decimal(str(compra['monto'])):.2f}"
     body = {
         "intent": "CAPTURE",
         "purchase_units": [
@@ -206,7 +291,9 @@ def _crear_orden_paypal(compra: dict, producto: dict):
         timeout=30,
     )
     if response.status_code >= 300:
-        raise HTTPException(status_code=502, detail="No se pudo crear la orden PayPal")
+        # El detalle interno se registra en Render, nunca se expone el token al cliente.
+        print("PayPal create HTTP:", response.status_code, response.text[:900])
+        raise HTTPException(status_code=502, detail="PayPal rechazó la creación de la orden. Revisa el log del backend")
     data = response.json()
     return data
 
@@ -337,10 +424,10 @@ def _entregar_producto_pagado(cursor, compra: dict, producto: dict):
             "cantidad": cantidad,
         }]
 
+    elif producto["tipo"] == "pokemon_exclusivo" and producto["codigo"] == DAILY_PRODUCT_CODE:
+        grant_payload.update(_entregar_shiny_reservado(cursor, compra))
     elif producto["tipo"] == "pokemon_exclusivo":
-        grant_status = "pendiente_seleccion"
-        grant_payload["requires_selection"] = True
-        grant_payload["message"] = "La compra quedó pagada. Falta seleccionar el Pokémon exclusivo para entregarlo."
+        raise HTTPException(status_code=409, detail="El producto exclusivo no tiene entrega habilitada")
 
     else:
         grant_payload["message"] = "Compra registrada sin entrega automática específica"
@@ -472,6 +559,16 @@ def crear_orden_paypal(payload: CreatePayPalOrderPayload, request: Request, usua
 
         _validar_limite_producto(cursor, int(usuario["id"]), producto)
         compra = _crear_compra_pendiente(cursor, usuario, producto, payload, request)
+        if str(producto["codigo"]) == DAILY_PRODUCT_CODE:
+            oferta = _oferta_shiny_actual(cursor)
+            if (payload.daily_pokemon_id is not None and int(payload.daily_pokemon_id) != oferta["pokemon_id"]
+                    or payload.daily_offer_date is not None and str(payload.daily_offer_date) != oferta["fecha"]):
+                raise HTTPException(status_code=409, detail="La oferta Shiny cambió. Actualiza la tienda")
+            cursor.execute("""UPDATE usuario_compras
+                              SET metadata=COALESCE(metadata, '{}'::jsonb) || %s::jsonb
+                              WHERE id=%s RETURNING *""",
+                           (json.dumps({"daily_shiny": oferta}), int(compra["id"])))
+            compra = cursor.fetchone()
         orden = _crear_orden_paypal(compra, producto)
 
         cursor.execute(
@@ -611,37 +708,31 @@ def capturar_orden_paypal(payload: CapturePayPalOrderPayload, usuario=Depends(ge
                 "synced": True,
             }
 
-        captured = None
-        capture_error_detail = None
-
-        try:
-            captured = _capturar_orden_paypal(payload.paypal_order_id)
-        except HTTPException as exc:
-            detail_text = str(exc.detail or "")
-            capture_error_detail = detail_text
-
-            if "ORDER_ALREADY_CAPTURED" not in detail_text:
-                raise
-
-            captured = _obtener_orden_paypal(payload.paypal_order_id)
-
+        # La orden puede estar pagada previamente (retorno duplicado o webhook primero).
+        # GET es la fuente final de verificación; POST capture sólo si no está completada.
+        estado_previo = _obtener_orden_paypal(payload.paypal_order_id)
+        ya_capturada = str(estado_previo.get("status") or "").upper() == "COMPLETED"
+        if not ya_capturada and compra.get("estado") != "pagado":
+            try:
+                _capturar_orden_paypal(payload.paypal_order_id)
+            except HTTPException:
+                # El servidor pudo haber capturado la orden y perdido la respuesta.
+                pass
+        captured = _obtener_orden_paypal(payload.paypal_order_id)
         status_paypal = str(captured.get("status") or "").upper()
-        if status_paypal not in ("COMPLETED", "APPROVED"):
-            raise HTTPException(
-                status_code=409,
-                detail=f"PayPal devolvió un estado no finalizable: {status_paypal}"
-            )
-
-        capture_id = _extraer_capture_id_paypal(captured)
+        capture_id = _verificar_captura_paypal(captured, compra)
+        if compra.get("paypal_capture_id") and str(compra["paypal_capture_id"]) != capture_id:
+            raise HTTPException(status_code=409, detail="La compra registra otra captura PayPal")
 
         compra_actualizada = _marcar_compra_pagada(
-            cursor,
-            int(compra["id"]),
-            payload.paypal_order_id,
-            capture_id,
-            captured,
-        )
-        entrega = _entregar_producto_pagado(cursor, compra_actualizada, producto)
+            cursor, int(compra["id"]), payload.paypal_order_id, capture_id, captured)
+        if (producto["codigo"] == DAILY_PRODUCT_CODE
+                and not _json_safe(compra_actualizada.get("metadata")).get("daily_shiny")):
+            # La compra 22 (y otras antiguas) queda pagada sin inventar qué especie se vendió.
+            entrega = {"ya_entregado": False, "grant_status": "pendiente_seleccion",
+                       "grant_payload": {"message": "Pago confirmado. Falta recuperar la especie histórica de esta orden."}}
+        else:
+            entrega = _entregar_producto_pagado(cursor, compra_actualizada, producto)
         conn.commit()
 
         return {
@@ -651,7 +742,7 @@ def capturar_orden_paypal(payload: CapturePayPalOrderPayload, usuario=Depends(ge
             "paypal_order_id": payload.paypal_order_id,
             "paypal_capture_id": capture_id,
             "paypal_status": status_paypal,
-            "sync_source": "order_lookup_after_already_captured" if capture_error_detail else "capture_api",
+            "sync_source": "order_lookup" if ya_capturada else "capture_api",
             **entrega,
         }
     except HTTPException:
@@ -840,16 +931,16 @@ async def paypal_webhook(request: Request):
                     "metadata": row["producto_metadata"],
                 }
 
+                orden_validada = _obtener_orden_paypal(order_id)
+                valid_capture_id = _verificar_captura_paypal(orden_validada, compra, capture_id)
+                if compra.get("paypal_capture_id") and str(compra["paypal_capture_id"]) != valid_capture_id:
+                    raise HTTPException(status_code=409, detail="Webhook con captura diferente")
                 if compra.get("estado") != "pagado":
                     compra = _marcar_compra_pagada(
-                        cursor,
-                        int(compra["id"]),
-                        order_id,
-                        capture_id,
-                        payload
-                    )
-
-                _entregar_producto_pagado(cursor, compra, producto)
+                        cursor, int(compra["id"]), order_id, valid_capture_id, orden_validada)
+                if not (producto["codigo"] == DAILY_PRODUCT_CODE
+                        and not _json_safe(compra.get("metadata")).get("daily_shiny")):
+                    _entregar_producto_pagado(cursor, compra, producto)
 
         conn.commit()
         return {"ok": True, "event_type": event_type, "verified": verificado}
