@@ -1,4 +1,4 @@
-"""Mastersmon V1.4: alta inicial atomica, sin modificar rutas existentes."""
+"""Mastersmon V2.15.3: registro unico del inicial y equipo previo conservado."""
 import re
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -66,10 +66,11 @@ def complete_trainer_setup(data: SetupInput, user=Depends(get_current_user)):
             raise HTTPException(status_code=404, detail='Jugador no encontrado')
         if usuario['trainer_setup_completed'] or usuario['trainer_setup_completed_at'] is not None or usuario['trainer_starter_code']:
             raise HTTPException(status_code=409, detail='El entrenador ya tiene una configuracion inicial registrada')
-        # Protege especialmente cuentas antiguas: ningun jugador con Pokémon obtiene otro inicial.
-        cur.execute('SELECT 1 FROM usuario_pokemon WHERE usuario_id=%s LIMIT 1', (int(user['id']),))
-        if cur.fetchone():
-            raise HTTPException(status_code=409, detail='La cuenta ya tiene Pokémon y no puede recibir un inicial adicional')
+        # JL - Inicio - Cuentas antiguas sin onboarding completo pueden elegir inicial.
+        # El control de un solo inicial es trainer_setup_completed/at/starter_code,
+        # bloqueado con FOR UPDATE en la fila del usuario.
+        # NUNCA borramos la coleccion anterior.
+        # JL - Fin - Compatibilidad con jugadores anteriores.
         cur.execute('''SELECT id,nombre,generacion,hp,ataque,defensa,velocidad,
                          ataque_especial,defensa_especial FROM pokemon WHERE id=%s''', (data.pokemon_id,))
         p = cur.fetchone()
@@ -90,11 +91,19 @@ def complete_trainer_setup(data: SetupInput, user=Depends(get_current_user)):
         owned_id = int(obtained['id'])
         sincronizar_movimientos_usuario_pokemon(cur, owned_id, int(p['id']), nivel, origen='captura', auto_equipar=True)
 
-        # JL - Inicio - El inicial se asigna a la posicion 1 del equipo en la misma transaccion.
-        # Es una cuenta nueva y se acaba de validar que no tiene ningun Pokemon previo.
-        # Reutiliza la funcion oficial del juego que guarda usuario_pokemon.id (no la especie).
-        equipo_guardado = guardar_equipo_usuario(cur, int(user['id']), [owned_id])
-        # JL - Fin - Equipo inicial por defecto.
+        # JL - Inicio - Equipar el inicial SOLO si el jugador no tiene equipo.
+        # guardar_equipo_usuario borra y vuelve a crear el equipo: no se debe llamar
+        # cuando existen miembros, pues perderiamos la alineacion anterior.
+        cur.execute('''SELECT usuario_pokemon_id FROM equipo_usuario
+                       WHERE usuario_id=%s ORDER BY posicion ASC, id ASC''',
+                    (int(user['id']),))
+        equipo_anterior = [int(fila['usuario_pokemon_id']) for fila in cur.fetchall()]
+        inicial_equipado = not equipo_anterior
+        if inicial_equipado:
+            equipo_guardado = guardar_equipo_usuario(cur, int(user['id']), [owned_id])
+        else:
+            equipo_guardado = equipo_anterior
+        # JL - Fin - Preservar equipo existente.
 
         code = re.sub(r'[^a-z0-9]+', '-', str(p['nombre']).strip().lower()).strip('-')
         cur.execute('''UPDATE usuarios SET avatar_id=%s,trainer_team_color=%s,
@@ -104,7 +113,8 @@ def complete_trainer_setup(data: SetupInput, user=Depends(get_current_user)):
         con.commit()
         return {'ok': True, 'usuario_pokemon_id': owned_id, 'pokemon': {'id': int(p['id']), 'nombre': p['nombre']},
                 'avatar_id': avatar, 'team_color': team, 'setup_completed': True,
-                'equipo_ids': equipo_guardado, 'posicion_equipo': 1}
+                'equipo_ids': equipo_guardado, 'inicial_equipado': inicial_equipado,
+                'posicion_equipo': 1 if inicial_equipado else None}
     except HTTPException:
         con.rollback()
         raise
