@@ -32,7 +32,7 @@ from routes_pokemon import (
 
 router_boss_idle = APIRouter()
 
-SERVER_TIMEZONE = ZoneInfo("America/Lima")
+from server_time import SERVER_TIMEZONE
 BOSS_EVENT_HORA_INICIO = 20
 BOSS_EVENT_DURACION_HORAS = 4
 BOSS_SESSION_TTL_SEGUNDOS = 60 * 45
