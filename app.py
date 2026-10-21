@@ -5,6 +5,7 @@ from routes_pokemon import router
 from routes_boss_idle import router_boss_idle
 from routes_payments import router_payments
 from routes_gyms import router_gyms
+from trainer_onboarding_v14 import router_trainer_onboarding
 from database import get_connection, get_cursor, release_connection
 
 BACKEND_MARKER = "mastersmon-backend-2026-03-23-monetization-v1"
@@ -13,7 +14,6 @@ app = FastAPI(
     title="MastersMon API",
     version="1.0.0"
 )
-
 ALLOWED_ORIGINS = [
     "https://mastersmon.com",
     "https://www.mastersmon.com",
@@ -33,11 +33,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 app.include_router(router)
 app.include_router(router_boss_idle)
 app.include_router(router_payments)
 app.include_router(router_gyms)
+app.include_router(router_trainer_onboarding)
 
 
 @app.get("/")
@@ -46,7 +46,7 @@ def root():
         "status": "ok",
         "message": "MastersMon API running",
         "version_backend": BACKEND_MARKER,
-        "router_loaded": ["routes_pokemon", "routes_boss_idle", "routes_payments", "routes_gyms"]
+        "router_loaded": ["routes_pokemon", "routes_boss_idle", "routes_payments", "routes_gyms", "trainer_onboarding_v14"]
     }
 
 
@@ -54,7 +54,6 @@ def root():
 def health():
     conn = None
     cur = None
-
     try:
         conn = get_connection()
         cur = get_cursor(conn)
@@ -65,7 +64,6 @@ def health():
                 current_schema() AS schema_name
         """)
         result = cur.fetchone()
-
         return {
             "status": "ok",
             "db": result["ok"],
@@ -81,5 +79,3 @@ def health():
             cur.close()
         if conn:
             release_connection(conn)
-
-            
