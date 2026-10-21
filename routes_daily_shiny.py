@@ -78,8 +78,8 @@ def legendary_of_day():
             "producto_codigo": PRODUCT_CODE,
             "precio_usd": float(product["precio_usd"]),
             "moneda": product["moneda"],
-            "compra_habilitada": False,
-            "nota": "Rotación informativa. Canje automático pendiente de implementación."
+            "compra_habilitada": True,
+            "nota": "Se entrega el legendario fijado en la orden una vez confirmada la captura por PayPal."
         }
     finally:
         cur.close()
