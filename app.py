@@ -7,6 +7,8 @@ from routes_payments import router_payments
 from routes_gyms import router_gyms
 from trainer_onboarding_v14 import router_trainer_onboarding
 from database import get_connection, get_cursor, release_connection
+from routes_capturas_v211 import router_capturas_v211
+from routes_lobby_v29 import router_lobby_v29
 
 BACKEND_MARKER = "mastersmon-backend-2026-03-23-monetization-v1"
 
@@ -38,7 +40,8 @@ app.include_router(router_boss_idle)
 app.include_router(router_payments)
 app.include_router(router_gyms)
 app.include_router(router_trainer_onboarding)
-
+app.include_router(router_capturas_v211)
+app.include_router(router_lobby_v29)
 
 @app.get("/")
 def root():
