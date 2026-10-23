@@ -1,7 +1,7 @@
 """PostgreSQL connection pool shared by Mastersmon synchronous FastAPI routes.
 
-V2.19.2: thread-safe connections with bounded waiting under concurrent load.
-Existing API: get_connection(), release_connection(conn), get_cursor(conn).
+V2.19.7: opt-in slow SQL and connection diagnostics without sensitive query text.
+Preserves V2.19.2 pool semantics and get_connection/release_connection/get_cursor API.
 """
 import logging
 import os
@@ -37,11 +37,41 @@ _pool_max = _int_setting("DB_POOL_MAXCONN", 10, 1, 50)
 if _pool_max < _pool_min:
     raise ValueError("DB_POOL_MAXCONN debe ser mayor o igual a DB_POOL_MINCONN")
 
-# Integer milliseconds; 0 means fail fast, never wait indefinitely.
 _wait_ms = _int_setting("DB_POOL_WAIT_MS", 3000, 0, 30000)
 _slow_ms = _int_setting("DB_POOL_SLOW_MS", 250, 1, 30000)
 
-# Each Render worker/process has its own pool: size deployment capacity accordingly.
+# Keep diagnostic opt-in: production logs remain unchanged unless explicitly enabled.
+_perf_enabled = os.getenv("PERF_DIAGNOSTICS_ENABLED", "false").strip().lower() in ("true", "1", "yes")
+_sql_slow_ms = _int_setting("PERF_SQL_SLOW_MS", 250, 1, 60000)
+
+
+class DiagnosticCursor(RealDictCursor):
+    """Time SQL execution only; never log SQL text, arguments or row contents."""
+
+    def execute(self, query, vars=None):
+        if not _perf_enabled:
+            return super().execute(query, vars)
+        started = time.perf_counter()
+        try:
+            return super().execute(query, vars)
+        finally:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            if elapsed_ms >= _sql_slow_ms:
+                logger.warning("PERF slow_sql duration_ms=%.1f", elapsed_ms)
+
+    def executemany(self, query, vars_list):
+        if not _perf_enabled:
+            return super().executemany(query, vars_list)
+        started = time.perf_counter()
+        try:
+            return super().executemany(query, vars_list)
+        finally:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            if elapsed_ms >= _sql_slow_ms:
+                logger.warning("PERF slow_sql_batch duration_ms=%.1f", elapsed_ms)
+
+
+# Each Render worker/process has its own pool.
 db_pool = pool.ThreadedConnectionPool(
     minconn=_pool_min,
     maxconn=_pool_max,
@@ -49,8 +79,6 @@ db_pool = pool.ThreadedConnectionPool(
     sslmode="require",
 )
 
-# Reserve capacity BEFORE asking psycopg2 for a connection. ThreadedConnectionPool
-# itself throws PoolError immediately at capacity, rather than waiting.
 _available_slots = threading.BoundedSemaphore(_pool_max)
 _lease_lock = threading.Lock()
 _leased_ids = set()
@@ -69,13 +97,14 @@ def get_connection():
             _leased_ids.add(id(connection))
         return connection
     except BaseException:
-        # Failed acquisitions must not consume capacity permanently.
         _available_slots.release()
         raise
     finally:
         elapsed_ms = (time.perf_counter() - started) * 1000
         if elapsed_ms >= _slow_ms:
             logger.warning("PostgreSQL connection acquisition took %.1f ms", elapsed_ms)
+        if _perf_enabled and elapsed_ms >= _slow_ms:
+            logger.warning("PERF slow_db_acquire duration_ms=%.1f", elapsed_ms)
 
 
 def release_connection(conn):
@@ -84,15 +113,11 @@ def release_connection(conn):
     with _lease_lock:
         conn_id = id(conn)
         if conn_id not in _leased_ids:
-            # Avoid returning a connection twice or inflating semaphore capacity.
             logger.error("Attempted to release an unleased PostgreSQL connection")
             raise pool.PoolError("PostgreSQL connection already released or not leased")
-        # Keep lease assigned until pool.putconn finishes.
         try:
-            # A failed transaction is rolled back by psycopg2 when put back in pool.
             db_pool.putconn(conn)
         except BaseException:
-            # Do not grant a semaphore slot if pool.putconn did not succeed.
             logger.exception("Failed returning PostgreSQL connection to pool")
             raise
         _leased_ids.remove(conn_id)
@@ -100,4 +125,4 @@ def release_connection(conn):
 
 
 def get_cursor(conn):
-    return conn.cursor(cursor_factory=RealDictCursor)
+    return conn.cursor(cursor_factory=DiagnosticCursor if _perf_enabled else RealDictCursor)

@@ -1,4 +1,8 @@
-from fastapi import FastAPI
+import logging
+import os
+import time
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from routes_pokemon import router
@@ -12,7 +16,7 @@ from routes_lobby_v29 import router_lobby_v29
 from routes_daily_shiny import router_daily_shiny
 from routes_daily_missions import router_daily_missions
 
-BACKEND_MARKER = "mastersmon-backend-2026-03-23-monetization-v1"
+BACKEND_MARKER = "mastersmon-backend-2026-10-23-perf-v2.19.7"
 
 app = FastAPI(
     title="MastersMon API",
@@ -37,6 +41,46 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Only predefined, low-risk paths are logged. No URLs, tokens, user IDs,
+# query strings, headers, request bodies, or response bodies are recorded.
+_perf_logger = logging.getLogger("mastersmon.performance")
+_perf_enabled = os.getenv("PERF_DIAGNOSTICS_ENABLED", "false").strip().lower() in ("true", "1", "yes")
+try:
+    _request_slow_ms = max(1, min(60000, int(os.getenv("PERF_REQUEST_SLOW_MS", "500"))))
+except ValueError:
+    _request_slow_ms = 500
+
+_perf_routes = {
+    "/auth/me", "/usuario/me", "/usuario/me/trainer-setup",
+    "/usuario/me/pokemon", "/usuario/me/equipo",
+    "/battle/gyms/progreso", "/battle/boss/estado",
+    "/payments/catalogo", "/pokemon/capturas-recientes",
+    "/missions/daily/me", "/payments/legendario-del-dia",
+}
+
+if _perf_enabled:
+    @app.middleware("http")
+    async def performance_diagnostics(request: Request, call_next):
+        # Do not include OPTIONS or unknown paths in performance logs.
+        path = request.scope.get("path", "")
+        if request.method != "GET" or path not in _perf_routes:
+            return await call_next(request)
+        started = time.perf_counter()
+        try:
+            response = await call_next(request)
+        except Exception:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            _perf_logger.warning("PERF request_failed endpoint=%s elapsed_ms=%.1f", path, elapsed_ms)
+            raise
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        if elapsed_ms >= _request_slow_ms:
+            _perf_logger.warning(
+                "PERF slow_request endpoint=%s status=%d elapsed_ms=%.1f",
+                path, response.status_code, elapsed_ms,
+            )
+        return response
+
 app.include_router(router)
 app.include_router(router_boss_idle)
 app.include_router(router_payments)
