@@ -354,7 +354,7 @@ def construir_trainer_setup_desde_usuario(usuario: dict | None = None) -> dict:
 
 
 def obtener_trainer_setup_usuario(cursor, usuario_id: int) -> dict:
-    usuario_actual = obtener_usuario_por_id(int(usuario_id)) or {}
+    usuario_actual = obtener_usuario_por_id(int(usuario_id), cursor=cursor) or {}
     data = construir_trainer_setup_desde_usuario(usuario_actual)
     data.update({
         "ok": True,
@@ -1659,9 +1659,18 @@ def obtener_meta_pokedex_global(cursor):
 
 
 
-def obtener_usuario_por_id(usuario_id: int):
-    conn = get_connection()
-    cursor = get_cursor(conn)
+def obtener_usuario_por_id(usuario_id: int, cursor=None):
+    # V2.19.3: caller-owned cursor avoids a second pooled connection in trainer setup.
+    # Other callers retain their original connection lifecycle.
+    owns_connection = cursor is None
+    conn = None
+    if owns_connection:
+        conn = get_connection()
+        try:
+            cursor = get_cursor(conn)
+        except Exception:
+            release_connection(conn)
+            raise
     try:
         columnas = [
             "id",
@@ -1698,8 +1707,9 @@ def obtener_usuario_por_id(usuario_id: int):
         data["trainer_setup_completed"] = bool(data.get("trainer_setup_completed"))
         return data
     finally:
-        cursor.close()
-        release_connection(conn)
+        if owns_connection:
+            cursor.close()
+            release_connection(conn)
 
 
 def serializar_usuario_publico(usuario: dict | None) -> dict | None:
