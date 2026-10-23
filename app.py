@@ -6,6 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from routes_pokemon import router
+from routes_profile_edit import router_profile_edit
 from routes_boss_idle import router_boss_idle
 from routes_payments import router_payments
 from routes_gyms import router_gyms
@@ -82,6 +83,7 @@ if _perf_enabled:
         return response
 
 app.include_router(router)
+app.include_router(router_profile_edit)
 app.include_router(router_boss_idle)
 app.include_router(router_payments)
 app.include_router(router_gyms)
