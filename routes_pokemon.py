@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSo
 from pydantic import BaseModel
 
 from database import get_connection, get_cursor, release_connection
-from auth import verify_google_token, create_access_token, get_current_user, get_current_user_from_token
+from auth import verify_google_token, create_access_token, get_current_user, get_current_user_from_token, get_authenticated_user_id
 from monetization_utils import (
     aplicar_multiplicadores_recompensa_batalla,
     obtener_multiplicadores_recompensa_batalla,
@@ -2901,8 +2901,9 @@ def google_login(payload: GoogleLoginPayload):
 
 
 @router.get("/auth/me")
-def auth_me(usuario=Depends(get_current_user)):
-    usuario_actual = obtener_usuario_por_id(usuario["id"])
+def auth_me(usuario_id: int = Depends(get_authenticated_user_id)):
+    # V2.19.6: one database lookup also confirms the account still exists.
+    usuario_actual = obtener_usuario_por_id(usuario_id)
     if not usuario_actual:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -2920,8 +2921,8 @@ def auth_me(usuario=Depends(get_current_user)):
 # =========================================================
 
 @router.get("/usuario/me")
-def obtener_usuario_me(usuario=Depends(get_current_user)):
-    usuario_actual = obtener_usuario_por_id(usuario["id"])
+def obtener_usuario_me(usuario_id: int = Depends(get_authenticated_user_id)):
+    usuario_actual = obtener_usuario_por_id(usuario_id)
     if not usuario_actual:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

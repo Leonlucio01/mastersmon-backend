@@ -110,6 +110,26 @@ def get_current_user_from_token(token: str) -> dict:
     return obtener_usuario_desde_payload(payload)
 
 
+def get_authenticated_user_id(credentials: HTTPAuthorizationCredentials = Depends(security)) -> int:
+    """V2.19.6: verify JWT without an extra database read.
+
+    Only use this dependency where the route immediately loads the user from
+    PostgreSQL and rejects a missing account. Do NOT use it to grant access
+    without that lookup.
+    """
+    payload = decode_access_token(credentials.credentials)
+    try:
+        user_id = int(payload["sub"])
+        if user_id <= 0:
+            raise ValueError("Invalid user id")
+        return user_id
+    except (KeyError, ValueError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token inválido"
+        )
+
+
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     token = credentials.credentials
     return get_current_user_from_token(token)
