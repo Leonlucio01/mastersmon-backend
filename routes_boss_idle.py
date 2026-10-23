@@ -461,8 +461,7 @@ def obtener_o_crear_evento_boss_hoy(cursor) -> dict:
             (boss_catalogo_id, fecha_evento, estado, hora_inicio, hora_fin, seed, reward_json, creado_en, actualizado_en)
         VALUES
             (%s, %s, %s, %s, %s, %s, %s::jsonb, NOW(), NOW())
-        ON CONFLICT (fecha_evento) DO UPDATE SET
-            actualizado_en = NOW()
+        ON CONFLICT (fecha_evento) DO NOTHING
         RETURNING *
         """,
         (
@@ -475,7 +474,22 @@ def obtener_o_crear_evento_boss_hoy(cursor) -> dict:
             json.dumps(boss.get("reward_json") or {}),
         )
     )
-    return cursor.fetchone()
+    creado = cursor.fetchone()
+    if creado:
+        return creado
+    # V2.19.5: another request created today's event concurrently.
+    # Read the winner instead of performing an unnecessary UPDATE.
+    cursor.execute(
+        "SELECT * FROM boss_eventos WHERE fecha_evento = %s LIMIT 1",
+        (fecha_hoy,)
+    )
+    existente = cursor.fetchone()
+    if existente:
+        return existente
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="No se pudo obtener el evento Boss del día"
+    )
 
 
 def obtener_boss_evento_detalle(cursor, boss_evento_id: int) -> dict | None:
@@ -970,6 +984,8 @@ def obtener_estado_boss(usuario=Depends(get_current_user)):
             (int(evento["id"]), int(usuario["id"]))
         )
         participacion = cursor.fetchone()
+        # V2.19.5: persist the daily event even when its state was already correct.
+        conn.commit()
 
         return {
             "ok": True,

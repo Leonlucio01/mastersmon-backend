@@ -136,6 +136,14 @@ def asegurar_progreso_usuario_gyms(cursor, usuario_id: int):
            AND prev.gym_id = gc.gym_requerido_id
         WHERE gup.usuario_id = %s
           AND gup.gym_id = gc.id
+          -- V2.19.4: avoid writing rows whose unlocked status has not changed.
+          -- Keeps actualizado_en meaningful and reduces needless row locks/WAL.
+          AND gup.desbloqueado IS DISTINCT FROM CASE
+              WHEN gup.completado = TRUE THEN TRUE
+              WHEN gc.desbloqueado_por_defecto = TRUE THEN TRUE
+              WHEN gc.gym_requerido_id IS NOT NULL AND COALESCE(prev.completado, FALSE) = TRUE THEN TRUE
+              ELSE FALSE
+          END
         """,
         (usuario_id, usuario_id),
     )
