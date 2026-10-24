@@ -193,16 +193,53 @@ def _active_index(team, idx):
     return next((i for i,p in enumerate(team) if p["hp"] > 0), None)
 
 
-def _damage(attacker, defender, power, difficulty, rng):
+# V2.41 authoritative matchup table. Types are normalized before lookup.
+TYPE_CHART = {
+ "normal":{"roca":.5,"acero":.5,"fantasma":0},
+ "fuego":{"planta":2,"hielo":2,"bicho":2,"acero":2,"fuego":.5,"agua":.5,"roca":.5,"dragon":.5},
+ "agua":{"fuego":2,"tierra":2,"roca":2,"agua":.5,"planta":.5,"dragon":.5},
+ "planta":{"agua":2,"tierra":2,"roca":2,"fuego":.5,"planta":.5,"veneno":.5,"volador":.5,"bicho":.5,"dragon":.5,"acero":.5},
+ "electrico":{"agua":2,"volador":2,"planta":.5,"electrico":.5,"dragon":.5,"tierra":0},
+ "hielo":{"planta":2,"tierra":2,"volador":2,"dragon":2,"fuego":.5,"agua":.5,"hielo":.5,"acero":.5},
+ "lucha":{"normal":2,"hielo":2,"roca":2,"siniestro":2,"acero":2,"veneno":.5,"volador":.5,"psiquico":.5,"bicho":.5,"hada":.5,"fantasma":0},
+ "veneno":{"planta":2,"hada":2,"veneno":.5,"tierra":.5,"roca":.5,"fantasma":.5,"acero":0},
+ "tierra":{"fuego":2,"electrico":2,"veneno":2,"roca":2,"acero":2,"planta":.5,"bicho":.5,"volador":0},
+ "volador":{"planta":2,"lucha":2,"bicho":2,"electrico":.5,"roca":.5,"acero":.5},
+ "psiquico":{"lucha":2,"veneno":2,"psiquico":.5,"acero":.5,"siniestro":0},
+ "bicho":{"planta":2,"psiquico":2,"siniestro":2,"fuego":.5,"lucha":.5,"veneno":.5,"volador":.5,"fantasma":.5,"acero":.5,"hada":.5},
+ "roca":{"fuego":2,"hielo":2,"volador":2,"bicho":2,"lucha":.5,"tierra":.5,"acero":.5},
+ "fantasma":{"psiquico":2,"fantasma":2,"siniestro":.5,"normal":0},
+ "dragon":{"dragon":2,"acero":.5,"hada":0},
+ "siniestro":{"psiquico":2,"fantasma":2,"lucha":.5,"siniestro":.5,"hada":.5},
+ "acero":{"hielo":2,"roca":2,"hada":2,"fuego":.5,"agua":.5,"electrico":.5,"acero":.5},
+ "hada":{"lucha":2,"dragon":2,"siniestro":2,"fuego":.5,"veneno":.5,"acero":.5},
+}
+TYPE_ALIASES={"fire":"fuego","water":"agua","grass":"planta","electric":"electrico","ice":"hielo","fighting":"lucha","poison":"veneno","ground":"tierra","flying":"volador","psychic":"psiquico","bug":"bicho","rock":"roca","ghost":"fantasma","dark":"siniestro","steel":"acero","fairy":"hada","normal":"normal","dragon":"dragon"}
+def _type_name(value):
+    import unicodedata
+    v=unicodedata.normalize("NFKD",str(value or "normal").lower().strip())
+    v="".join(c for c in v if not unicodedata.combining(c))
+    return TYPE_ALIASES.get(v,v)
+def _type_matchup(attack_type, defender):
+    kind=_type_name(attack_type)
+    row=TYPE_CHART.get(kind,{})
+    import re
+    defensive=[_type_name(t) for t in re.split(r"[,/;]+",str(defender.get("tipo") or "normal")) if t.strip()]
+    value=1.0
+    for item in defensive[:2]:
+        value*=row.get(item,1.0)
+    return value
+
+def _damage(attacker, defender, power, difficulty, rng, effectiveness=1.0):
     # V2.38 baseline. Server-owned, bounded and stat-based; matchup/status
     # tuning follows before activating rewards.
-    level = max(1, _int(attacker["nivel"], 1))
+    if effectiveness == 0:\n        return 0\n    level = max(1, _int(attacker["nivel"], 1))
     attack = max(1, _int(attacker.get("ataque")))
     defense = max(1, _int(defender.get("defensa")))
     raw = (((2 * level / 5 + 2) * max(1, power) * attack / defense) / 50) + 2
     factor = rng.uniform(.85, 1.0)
     factor *= 1 + .04 * difficulty if difficulty else 1.0
-    return max(1, min(_int(defender["hp_max"]), round(raw * factor)))
+    return max(1, min(_int(defender["hp_max"]), round(raw * factor * effectiveness)))
 
 
 def _safe_state(state):
@@ -309,10 +346,12 @@ def battle_ai_action(data: AIBattleAction, user=Depends(get_current_user)):
             power = max(0, min(250, move["potencia"]))
             if power == 0:
                 raise HTTPException(400, "Status moves are not supported in V2.38")
-            dealt = min(enemy["hp"], _damage(p, enemy, power, 0, rng))
+            effectiveness = _type_matchup(move["tipo"], enemy)
+            dealt = min(enemy["hp"], _damage(p, enemy, power, 0, rng, effectiveness))
             enemy["hp"] -= dealt
             events.append({"turn": turn, "event": "attack", "pokemon_id": p["instance_id"],
-                           "move_id": move["id"], "damage": dealt, "target_hp": enemy["hp"]})
+                           "move_id": move["id"], "move_name": move["nombre"], "move_type": move["tipo"],
+                           "effectiveness": effectiveness, "damage": dealt, "target_hp": enemy["hp"]})
         # Fainted foes do not counterattack.
         if enemy["hp"] == 0:
             next_rival = _active_index(rivals, ri)
@@ -328,10 +367,14 @@ def battle_ai_action(data: AIBattleAction, user=Depends(get_current_user)):
             # and damage. Future iteration adds full move-learning and matchup AI.
             rng = random.SystemRandom()
             enemy_power = rng.choice([35, 45, 55, 65]) if state["difficulty"] < 4 else rng.choice([50, 60, 75, 90])
-            hit = min(p["hp"], _damage(enemy, p, enemy_power, state["difficulty"], rng))
+            enemy_type = str(enemy.get("tipo") or "normal").split("/")[0].split(",")[0].strip()
+            enemy_effectiveness = _type_matchup(enemy_type, p)
+            hit = min(p["hp"], _damage(enemy, p, enemy_power, state["difficulty"], rng, enemy_effectiveness))
             p["hp"] -= hit
             events.append({"turn": turn, "event": "rival_attack",
-                           "pokemon_id": enemy["pokemon_id"], "damage": hit, "target_hp": p["hp"]})
+                           "pokemon_id": enemy["pokemon_id"], "move_name": "AI "+enemy_type,
+                           "move_type": enemy_type, "effectiveness": enemy_effectiveness,
+                           "damage": hit, "target_hp": p["hp"]})
             if p["hp"] == 0:
                 next_player = _active_index(players, state["player_active"])
                 if next_player is None:
