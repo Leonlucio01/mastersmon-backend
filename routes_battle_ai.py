@@ -233,7 +233,9 @@ def _type_matchup(attack_type, defender):
 def _damage(attacker, defender, power, difficulty, rng, effectiveness=1.0):
     # V2.38 baseline. Server-owned, bounded and stat-based; matchup/status
     # tuning follows before activating rewards.
-    if effectiveness == 0:\n        return 0\n    level = max(1, _int(attacker["nivel"], 1))
+    if effectiveness == 0:
+        return 0
+    level = max(1, _int(attacker["nivel"], 1))
     attack = max(1, _int(attacker.get("ataque")))
     defense = max(1, _int(defender.get("defensa")))
     raw = (((2 * level / 5 + 2) * max(1, power) * attack / defense) / 50) + 2
