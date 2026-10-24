@@ -2840,12 +2840,11 @@ def google_login(payload: GoogleLoginPayload):
             cursor.execute("""
                 UPDATE usuarios
                 SET google_id = %s,
-                    nombre = %s,
                     correo = %s,
                     foto = %s,
                     avatar_id = COALESCE(NULLIF(TRIM(avatar_id), ''), %s)
                 WHERE id = %s
-            """, (google_id, nombre, correo, foto, avatar_id_default, usuario_id))
+            """, (google_id, correo, foto, avatar_id_default, usuario_id))
 
             if onboarding_tabla_disponible(cursor):
                 asegurar_usuario_onboarding(cursor, usuario_id)
