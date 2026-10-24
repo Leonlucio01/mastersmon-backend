@@ -163,6 +163,7 @@ class BattleIniciarPayload(BaseModel):
 
 class GuardarEquipoPayload(BaseModel):
     usuario_pokemon_ids: list[int]
+    posiciones: list[int] | None = None
 
 
 class ActividadUsuarioPayload(BaseModel):
@@ -1405,9 +1406,15 @@ def validar_ids_pokemon_equipo(cursor, usuario_id: int, usuario_pokemon_ids: lis
     return ids_limpios
 
 
-def guardar_equipo_usuario(cursor, usuario_id: int, usuario_pokemon_ids: list[int]) -> list[int]:
-    ids_limpios = validar_ids_pokemon_equipo(cursor, usuario_id, usuario_pokemon_ids)
+def guardar_equipo_usuario(cursor, usuario_id: int, usuario_pokemon_ids: list[int], posiciones: list[int] | None = None) -> list[int]:
+    ids_limpios = (validar_ids_pokemon_equipo(cursor, usuario_id, usuario_pokemon_ids)
+                   if usuario_pokemon_ids else [])
+    if not ids_limpios and posiciones is None:
+        raise HTTPException(status_code=400, detail='El equipo no puede estar vacío con el formato anterior')
 
+    if posiciones is not None:
+        if len(posiciones) != len(ids_limpios) or any(not isinstance(p, int) or p < 1 or p > 6 for p in posiciones) or len(set(posiciones)) != len(posiciones):
+            raise HTTPException(status_code=400, detail='Las posiciones deben ser únicas y estar entre 1 y 6')
     # Borramos el equipo actual del usuario
     cursor.execute(
         "DELETE FROM equipo_usuario WHERE usuario_id = %s",
@@ -1417,7 +1424,8 @@ def guardar_equipo_usuario(cursor, usuario_id: int, usuario_pokemon_ids: list[in
     tiene_creado_en = existe_columna(cursor, "equipo_usuario", "creado_en")
     tiene_actualizado_en = existe_columna(cursor, "equipo_usuario", "actualizado_en")
 
-    for posicion, usuario_pokemon_id in enumerate(ids_limpios, start=1):
+    for index, usuario_pokemon_id in enumerate(ids_limpios):
+        posicion = posiciones[index] if posiciones is not None else index + 1
         if tiene_creado_en and tiene_actualizado_en:
             cursor.execute(
                 """
@@ -3210,7 +3218,7 @@ def guardar_equipo_me(payload: GuardarEquipoPayload, usuario=Depends(get_current
     cursor = get_cursor(conn)
 
     try:
-        ids_guardados = guardar_equipo_usuario(cursor, usuario["id"], payload.usuario_pokemon_ids)
+        ids_guardados = guardar_equipo_usuario(cursor, usuario["id"], payload.usuario_pokemon_ids, payload.posiciones)
 
         try:
             registrar_actividad_usuario(
