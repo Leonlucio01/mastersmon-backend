@@ -11,6 +11,7 @@ from routes_profile_badges import router_profile_badges
 from routes_boss_idle import router_boss_idle
 from routes_payments import router_payments
 from routes_gyms import router_gyms
+from routes_battle_ai import router_battle_ai
 from trainer_onboarding_v14 import router_trainer_onboarding
 from database import get_connection, get_cursor, release_connection
 from routes_capturas_v211 import router_capturas_v211
@@ -89,6 +90,7 @@ app.include_router(router_profile_badges)
 app.include_router(router_boss_idle)
 app.include_router(router_payments)
 app.include_router(router_gyms)
+app.include_router(router_battle_ai)
 app.include_router(router_trainer_onboarding)
 app.include_router(router_capturas_v211)
 app.include_router(router_lobby_v29)
