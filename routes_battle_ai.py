@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from auth import get_current_user
 from database import get_connection, get_cursor, release_connection
 from routes_pokemon import calcular_stats, obtener_equipo_guardado_ids, obtener_select_stats_especiales
+from battle_ai_rewards import grant_ai_victory
 
 router_battle_ai = APIRouter()
 # Existing preview rival lineups. Preview only: server turn resolution is the next stage.
@@ -250,7 +251,7 @@ def _safe_state(state):
             "status": state["status"], "player": state["player"],
             "rivals": state["rivals"], "player_active": state["player_active"],
             "rival_active": state["rival_active"], "log": state["log"][-20:],
-            "rewards_enabled": False}
+            "rewards_enabled": True, "reward_claimed": bool(state.get("reward_claimed")), "reward": state.get("reward") }
 
 
 def _get_session(cur, user_id, token, lock=False):
@@ -290,7 +291,7 @@ def battle_ai_start(data: AIBattleStart, user=Depends(get_current_user)):
         token = secrets.token_urlsafe(40)
         state = {"difficulty": data.difficulty, "turn": 1, "status": "active",
                  "player": player, "rivals": rivals, "player_active": 0, "rival_active": 0,
-                 "log": [{"turn": 1, "event": "start"}]}
+                 "log": [{"turn": 1, "event": "start"}], "reward_claimed": False}
         cur.execute("""INSERT INTO battle_ai_sessions(usuario_id, token, state)
                        VALUES (%s, %s, %s::jsonb)""", (user_id, token, json.dumps(state)))
         conn.commit()
@@ -359,7 +360,7 @@ def battle_ai_action(data: AIBattleAction, user=Depends(get_current_user)):
             next_rival = _active_index(rivals, ri)
             if next_rival is None:
                 state["status"] = "victory"
-                events.append({"turn": turn, "event": "victory", "rewards_granted": False})
+                events.append({"turn": turn, "event": "victory", "rewards_granted": True})
             else:
                 state["rival_active"] = next_rival
                 events.append({"turn": turn, "event": "rival_switch",
@@ -386,6 +387,8 @@ def battle_ai_action(data: AIBattleAction, user=Depends(get_current_user)):
                     state["player_active"] = next_player
                     events.append({"turn": turn, "event": "player_switch",
                                    "pokemon_id": players[next_player]["instance_id"]})
+        if state["status"] == "victory":
+            grant_ai_victory(cur, int(user["id"]), state)
         state["log"].extend(events)
         state["log"] = state["log"][-60:]
         state["turn"] += 1
