@@ -182,8 +182,35 @@ def _fetch_rival_team(cur, difficulty, player_team):
             base_ataque_especial=p["ataque_especial"],
             base_defensa_especial=p["defensa_especial"]
         )
+        # Use species learnsets instead of fabricated AI attacks. Respect level limits.
+        cur.execute("""
+            SELECT m.id, m.nombre, m.tipo, m.potencia
+            FROM pokemon_movimientos pm
+            JOIN movimientos m ON m.id=pm.movimiento_id
+            WHERE pm.pokemon_id=%s AND pm.activo=TRUE AND m.activo=TRUE
+              AND pm.nivel_requerido<=%s AND COALESCE(m.potencia,0)>0
+            ORDER BY m.potencia DESC, pm.nivel_requerido DESC, m.id
+            LIMIT 12
+        """, (pid, level))
+        pool = [dict(m) for m in cur.fetchall()]
+        # Prefer a varied set of offensive moves; only attacks with power > 0.
+        move_list = []
+        seen_types = set()
+        for move in pool:
+            kind = _type_name(move["tipo"])
+            if kind not in seen_types:
+                move_list.append(move)
+                seen_types.add(kind)
+            if len(move_list) == 4:
+                break
+        for move in pool:
+            if len(move_list) >= 4:
+                break
+            if move not in move_list:
+                move_list.append(move)
         rivals.append({"pokemon_id": pid, "nombre": p["nombre"], "tipo": p["tipo"],
-                       "nivel": level, "es_shiny": False, **stats, "hp": stats["hp_max"]})
+                       "nivel": level, "es_shiny": False, **stats, "hp": stats["hp_max"],
+                       "moves": move_list})
     return rivals
 
 
@@ -230,6 +257,47 @@ def _type_matchup(attack_type, defender):
     for item in defensive[:2]:
         value*=row.get(item,1.0)
     return value
+
+def _ai_move_score(move, attacker, target):
+    """Server-side estimate: power, effectiveness and a modest STAB incentive."""
+    eff = _type_matchup(move.get("tipo"), target)
+    own = {_type_name(t) for t in str(attacker.get("tipo") or "").replace("/", ",").split(",")}
+    stab = 1.5 if _type_name(move.get("tipo")) in own else 1.0
+    return max(0, _int(move.get("potencia"))) * eff * stab
+
+
+def _choose_ai_move(enemy, target, difficulty, rng):
+    candidates = [m for m in enemy.get("moves", []) if _int(m.get("potencia")) > 0]
+    if not candidates:
+        # Explicit last-resort attack if the catalog has no offensive learned moves.
+        return {"id": None, "nombre": "Struggle", "tipo": "normal", "potencia": 40}
+    ranked = sorted(candidates, key=lambda m: _ai_move_score(m, enemy, target), reverse=True)
+    chance = {0: 0.15, 2: 0.60, 4: 0.85, 6: 0.97}.get(difficulty, 0.15)
+    return ranked[0] if rng.random() < chance else rng.choice(candidates)
+
+
+def _choose_ai_switch(rivals, active_idx, target, difficulty):
+    """Hard/Master may make a tactical switch; returns None if not worthwhile."""
+    if difficulty < 4:
+        return None
+    current = rivals[active_idx]
+    current_best = max((_ai_move_score(m, current, target) for m in current.get("moves", [])), default=0)
+    own_hp = current["hp"] / max(1, current["hp_max"])
+    # Only switch to address a genuine type disadvantage; avoid endless stalling.
+    options = []
+    for idx, candidate in enumerate(rivals):
+        if idx == active_idx or candidate["hp"] <= 0:
+            continue
+        best = max((_ai_move_score(m, candidate, target) for m in candidate.get("moves", [])), default=0)
+        ratio = candidate["hp"] / max(1, candidate["hp_max"])
+        if ratio >= 0.35 and best > current_best * 1.75 and best > 30:
+            options.append((best * ratio, idx))
+    if not options:
+        return None
+    if current_best > 50 and own_hp > 0.45:
+        return None
+    return max(options)[1]
+
 
 def _damage(attacker, defender, power, difficulty, rng, effectiveness=1.0):
     # V2.38 baseline. Server-owned, bounded and stat-based; matchup/status
@@ -366,18 +434,24 @@ def battle_ai_action(data: AIBattleAction, user=Depends(get_current_user)):
                 events.append({"turn": turn, "event": "rival_switch",
                                "pokemon_id": rivals[next_rival]["pokemon_id"]})
         else:
-            # Server-controlled AI response; difficulty influences move choice
-            # and damage. Future iteration adds full move-learning and matchup AI.
+            # Only the backend chooses AI moves/targets. Switching spends its action.
             rng = random.SystemRandom()
-            enemy_power = rng.choice([35, 45, 55, 65]) if state["difficulty"] < 4 else rng.choice([50, 60, 75, 90])
-            enemy_type = str(enemy.get("tipo") or "normal").split("/")[0].split(",")[0].strip()
-            enemy_effectiveness = _type_matchup(enemy_type, p)
-            hit = min(p["hp"], _damage(enemy, p, enemy_power, state["difficulty"], rng, enemy_effectiveness))
-            p["hp"] -= hit
-            events.append({"turn": turn, "event": "rival_attack",
-                           "pokemon_id": enemy["pokemon_id"], "move_name": "AI "+enemy_type,
-                           "move_type": enemy_type, "effectiveness": enemy_effectiveness,
-                           "damage": hit, "target_hp": p["hp"]})
+            difficulty = int(state["difficulty"])
+            switch_idx = _choose_ai_switch(rivals, ri, p, difficulty)
+            if switch_idx is not None and (difficulty == 6 or rng.random() < 0.65):
+                state["rival_active"] = switch_idx
+                events.append({"turn": turn, "event": "rival_switch",
+                               "pokemon_id": rivals[switch_idx]["pokemon_id"],
+                               "reason": "type_advantage"})
+            else:
+                chosen = _choose_ai_move(enemy, p, difficulty, rng)
+                enemy_effectiveness = _type_matchup(chosen["tipo"], p)
+                hit = min(p["hp"], _damage(enemy, p, _int(chosen["potencia"]), difficulty, rng, enemy_effectiveness))
+                p["hp"] -= hit
+                events.append({"turn": turn, "event": "rival_attack",
+                               "pokemon_id": enemy["pokemon_id"], "move_id": chosen.get("id"),
+                               "move_name": chosen["nombre"], "move_type": chosen["tipo"],
+                               "effectiveness": enemy_effectiveness, "damage": hit, "target_hp": p["hp"]})
             if p["hp"] == 0:
                 next_player = _active_index(players, state["player_active"])
                 if next_player is None:
