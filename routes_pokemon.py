@@ -35,10 +35,10 @@ BATTLE_SESSION_MINIMA_SEGUNDOS = 8
 BATTLE_RECOMPENSA_COOLDOWN_SEGUNDOS = 12
 BATTLE_RECOMPENSA_ULTIMO_USO = {}
 RECOMPENSAS_ARENA_PERMITIDAS = {
-    (3000, 3500): {"codigo": "normal", "exp": 3000, "pokedolares": 3500, "bonus_nivel_rival": 0},
-    (4000, 4500): {"codigo": "challenge", "exp": 4000, "pokedolares": 4500, "bonus_nivel_rival": 2},
-    (5000, 5500): {"codigo": "expert", "exp": 5000, "pokedolares": 5500, "bonus_nivel_rival": 4},
-    (6000, 6500): {"codigo": "master", "exp": 6000, "pokedolares": 6500, "bonus_nivel_rival": 6},
+    (4000, 3500): {"codigo": "normal", "exp": 3500, "pokedolares": 4000, "bonus_nivel_rival": 0},
+    (5000, 4500): {"codigo": "challenge", "exp": 4500, "pokedolares": 5000, "bonus_nivel_rival": 2},
+    (6000, 5500): {"codigo": "expert", "exp": 5500, "pokedolares": 6000, "bonus_nivel_rival": 4},
+    (7000, 6500): {"codigo": "master", "exp": 6500, "pokedolares": 7000, "bonus_nivel_rival": 6},
 }
 RECOMPENSAS_ARENA_POR_CODIGO = {
     valor["codigo"]: dict(valor)
