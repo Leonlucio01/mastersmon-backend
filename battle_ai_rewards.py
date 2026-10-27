@@ -8,7 +8,7 @@ from routes_pokemon import (
 )
 from monetization_utils import aplicar_multiplicadores_recompensa_batalla
 
-BASE_AI_REWARDS = {0: (2500, 2000), 2: (3000, 2500), 4: (3500, 3000), 6: (4000, 3500)}
+BASE_AI_REWARDS = {0: (4000, 3500), 2: (5000, 4500), 4: (6000, 5500), 6: (7000, 6500)}
 
 def grant_ai_victory(cursor, user_id, state):
     """Called ONCE while the winning battle session row is FOR UPDATE locked.
