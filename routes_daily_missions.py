@@ -30,7 +30,18 @@ def _progress(cursor, user_id, start_utc, end_utc):
     cursor.execute("""SELECT COUNT(*) AS n FROM battle_sesiones
         WHERE usuario_id=%s AND resultado='reclamada' AND finalizado_en >= %s AND finalizado_en < %s""",
         (user_id, start_utc, end_utc))
-    battles = int((cursor.fetchone() or {}).get("n") or 0)
+    legacy_battles = int((cursor.fetchone() or {}).get("n") or 0)
+    # Current Battle IA records the completed server-validated victory in battle_ai_sessions.
+    # updated_at is TIMESTAMPTZ; convert UTC-naive daily bounds to aware UTC datetimes.
+    begin_aware = start_utc.replace(tzinfo=timezone.utc)
+    end_aware = end_utc.replace(tzinfo=timezone.utc)
+    cursor.execute("""SELECT COUNT(*) AS n FROM battle_ai_sessions
+        WHERE usuario_id=%s AND status='victory'
+          AND state->>'reward_claimed'='true'
+          AND updated_at >= %s AND updated_at < %s""",
+        (user_id, begin_aware, end_aware))
+    ai_battles = int((cursor.fetchone() or {}).get("n") or 0)
+    battles = legacy_battles + ai_battles
     return {"capturar_1": captured, "capturar_3": captured, "batalla_1": battles}
 
 def _response(cursor, user_id):
