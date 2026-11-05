@@ -21,8 +21,9 @@ from routes_daily_missions import router_daily_missions
 from routes_ranking_v1 import router_ranking_v1
 from routes_ranking_v2 import router_ranking_v2
 from boss_server_engine import router_boss_combat
+from boss_rewards_secure import router_boss_rewards_secure
 
-BACKEND_MARKER = "mastersmon-backend-2026-10-23-perf-v2.19.7"
+BACKEND_MARKER = "mastersmon-backend-2026-11-05-boss-secure-reward-v1"
 
 app = FastAPI(
     title="MastersMon API",
@@ -68,7 +69,6 @@ _perf_routes = {
 if _perf_enabled:
     @app.middleware("http")
     async def performance_diagnostics(request: Request, call_next):
-        # Do not include OPTIONS or unknown paths in performance logs.
         path = request.scope.get("path", "")
         if request.method != "GET" or path not in _perf_routes:
             return await call_next(request)
@@ -90,7 +90,6 @@ if _perf_enabled:
 app.include_router(router)
 app.include_router(router_profile_edit)
 app.include_router(router_profile_badges)
-app.include_router(router_boss_idle)
 app.include_router(router_payments)
 app.include_router(router_gyms)
 app.include_router(router_battle_ai)
@@ -101,7 +100,9 @@ app.include_router(router_daily_shiny)
 app.include_router(router_daily_missions)
 app.include_router(router_ranking_v1)
 app.include_router(router_ranking_v2)
+# The secure rewards route must be registered before the legacy Boss router.
 app.include_router(router_boss_combat)
+app.include_router(router_boss_rewards_secure)
 app.include_router(router_boss_idle)
 
 @app.get("/")
@@ -110,7 +111,7 @@ def root():
         "status": "ok",
         "message": "MastersMon API running",
         "version_backend": BACKEND_MARKER,
-        "router_loaded": ["routes_pokemon", "routes_boss_idle", "routes_payments", "routes_gyms", "trainer_onboarding_v14"]
+        "router_loaded": ["routes_pokemon", "routes_boss_idle", "routes_payments", "routes_gyms", "trainer_onboarding_v14", "boss_server_engine", "boss_rewards_secure"]
     }
 
 
