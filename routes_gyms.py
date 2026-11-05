@@ -866,8 +866,17 @@ def reclamar_recompensa_gym(payload: GymRecompensaPayload, usuario=Depends(get_c
         if creado_en and (datetime.now() - creado_en).total_seconds() < GYM_SESSION_MINIMA_SEGUNDOS:
             raise HTTPException(status_code=429, detail="La sesión del Gym todavía es demasiado reciente para cerrar")
 
-        victoria = bool(payload.victoria)
-        turnos = max(0, int(payload.turnos or 0))
+        # V32: el resultado se verifica usando el estado autoritativo del servidor.
+        guardado = sesion.get("resultado_json") or {}
+        if isinstance(guardado, str):
+            guardado = json.loads(guardado)
+        combate = guardado.get("combat") if isinstance(guardado, dict) else None
+        if not isinstance(combate, dict) or combate.get("status") not in ("victory", "defeat"):
+            raise HTTPException(status_code=409, detail="El combate Gym aun no termino en el servidor")
+        victoria = combate["status"] == "victory"
+        if bool(payload.victoria) != victoria:
+            raise HTTPException(status_code=409, detail="El resultado enviado no coincide con el servidor")
+        turnos = max(0, int(combate.get("turn") or 1) - 1)
         ids_limpios = validar_ids_pokemon_equipo(cursor, usuario_id, normalizar_equipo_ids_json(sesion.get("equipo_usuario_pokemon_ids")))
 
         exp_ganada = 0
@@ -1028,3 +1037,7 @@ def cancelar_sesion_gym(payload: GymCancelarPayload, usuario=Depends(get_current
     finally:
         cursor.close()
         release_connection(conn)
+
+# V32: motor de turnos Gym validado por el servidor.
+from gym_server_engine import router_gym_combat
+router_gyms.include_router(router_gym_combat)
