@@ -20,6 +20,7 @@ from routes_daily_shiny import router_daily_shiny
 from routes_daily_missions import router_daily_missions
 from routes_ranking_v1 import router_ranking_v1
 from routes_ranking_v2 import router_ranking_v2
+from boss_server_engine import router_boss_combat
 
 BACKEND_MARKER = "mastersmon-backend-2026-10-23-perf-v2.19.7"
 
@@ -100,6 +101,8 @@ app.include_router(router_daily_shiny)
 app.include_router(router_daily_missions)
 app.include_router(router_ranking_v1)
 app.include_router(router_ranking_v2)
+app.include_router(router_boss_combat)
+app.include_router(router_boss_idle)
 
 @app.get("/")
 def root():
