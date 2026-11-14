@@ -5,6 +5,7 @@ Only approved simple level/item rules are supported. Special methods and non-nul
 forms fail closed until their game policy is approved.
 """
 from psycopg2 import errors, sql
+import hashlib
 
 
 class EvolutionError(Exception):
@@ -14,9 +15,27 @@ class EvolutionError(Exception):
         self.message = message
 
 
-def load_rules(cursor, pokemon_id=None, *, lock=False):
+def wurmple_seed(capture):
+    """Stable across requests. Backfill uses the same MD5 bytes in Tarea 05 SQL."""
+    existing = capture.get("semilla_evolutiva")
+    if existing is not None:
+        return int(existing)
+    return int(hashlib.md5(
+        ("mastersmon-wurmple-v1:" + str(capture["id"])).encode("utf-8")
+    ).hexdigest()[:8], 16)
+
+
+def filter_wurmple_branch(rules, capture):
+    if int(capture["pokemon_id"]) != 265:
+        return rules
+    branch = wurmple_seed(capture) % 2
+    wanted = 266 if branch == 0 else 268
+    return [rule for rule in rules if int(rule["evolucion_id"]) == wanted]
+
+
+def load_rules(cursor, pokemon_id=None, *, lock=False, include_inactive=False):
     where = " AND er.pokemon_id = %s" if pokemon_id is not None else ""
-    params = (pokemon_id,) if pokemon_id is not None else ()
+    params = (bool(include_inactive),) + ((pokemon_id,) if pokemon_id is not None else ())
     cursor.execute("""
         SELECT er.id, er.pokemon_id, p1.nombre AS pokemon_nombre,
                er.evoluciona_a AS evolucion_id, p2.nombre AS evolucion_nombre,
@@ -26,7 +45,7 @@ def load_rules(cursor, pokemon_id=None, *, lock=False):
         JOIN public.pokemon p1 ON p1.id = er.pokemon_id
         JOIN public.pokemon p2 ON p2.id = er.evoluciona_a
         LEFT JOIN public.items i ON i.id = er.item_id
-        WHERE er.activo = TRUE
+        WHERE (%s = TRUE OR er.activo = TRUE)
           AND ((er.metodo = 'nivel' AND er.nivel_requerido > 0 AND er.item_id IS NULL)
             OR (er.metodo = 'item' AND er.item_id IS NOT NULL
                 AND er.nivel_requerido IS NULL AND i.id IS NOT NULL))
@@ -61,7 +80,7 @@ def inspect_capture(cursor, capture_id, user_id):
     if capture.get("forma_id") is not None:
         return dict(common, puede_evolucionar=False, listo_ahora=False, opciones=[],
                     motivo="La evolución de formas alternativas aún no está habilitada")
-    rules = load_rules(cursor, capture["pokemon_id"])
+    rules = filter_wurmple_branch(load_rules(cursor, capture["pokemon_id"]), capture)
     cursor.execute("SELECT item_id, cantidad FROM public.usuario_items WHERE usuario_id = %s", (user_id,))
     inventory = {r["item_id"]: max(0, int(r["cantidad"] or 0)) for r in cursor.fetchall()}
     options = []
@@ -96,7 +115,9 @@ def evolve_capture(cursor, *, user_id, capture_id, method, item_id=None, target_
             raise EvolutionError(409, "El Pokémon cambió; vuelve a comprobar la evolución")
         if capture.get("forma_id") is not None:
             raise EvolutionError(409, "La evolución de formas alternativas aún no está habilitada")
-        rules = [r for r in load_rules(cursor, capture["pokemon_id"], lock=True) if r["metodo"] == method]
+        rules = [r for r in filter_wurmple_branch(
+            load_rules(cursor, capture["pokemon_id"], lock=True), capture
+        ) if r["metodo"] == method]
         if method == "item":
             rules = [r for r in rules if r["item_id"] == item_id]
         if target_id is not None:
@@ -142,6 +163,10 @@ def evolve_capture(cursor, *, user_id, capture_id, method, item_id=None, target_
         changes = {"pokemon_id": rule["evolucion_id"], "hp_actual": stats["hp_max"],
                    "hp_max": stats["hp_max"], "ataque": stats["ataque"],
                    "defensa": stats["defensa"], "velocidad": stats["velocidad"]}
+        # Persist the deterministic branch when a newly captured Wurmple evolves.
+        # Does not alter older persisted seeds or other species.
+        if int(capture["pokemon_id"]) == 265 and capture.get("semilla_evolutiva") is None:
+            changes["semilla_evolutiva"] = wurmple_seed(capture)
         for field in ("ataque_especial", "defensa_especial"):
             if field in capture:
                 changes[field] = stats[field]

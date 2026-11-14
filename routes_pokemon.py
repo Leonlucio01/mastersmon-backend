@@ -5151,7 +5151,9 @@ def obtener_evoluciones_cache():
     try:
         cursor.execute("SELECT id FROM public.pokemon ORDER BY id")
         result = {str(r["id"]): [] for r in cursor.fetchall()}
-        for rule in load_evolution_rules(cursor):
+        # The Pokedex shows recorded evolution chains even if a special
+        # evolution is not yet executable (e.g. Shedinja's extra capture).
+        for rule in load_evolution_rules(cursor, include_inactive=True):
             result[str(rule["pokemon_id"])].append(catalog_option(rule))
         return result
     finally:
