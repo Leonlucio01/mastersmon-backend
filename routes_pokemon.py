@@ -8,13 +8,18 @@ from collections import deque
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from database import get_connection, get_cursor, release_connection
 from auth import verify_google_token, create_access_token, get_current_user, get_current_user_from_token, get_authenticated_user_id
 from monetization_utils import (
     aplicar_multiplicadores_recompensa_batalla,
     obtener_multiplicadores_recompensa_batalla,
+)
+
+from evolution_service import (
+    EvolutionError, load_rules as load_evolution_rules, catalog_option,
+    inspect_capture as inspect_evolution_capture, evolve_capture,
 )
 
 router = APIRouter()
@@ -184,6 +189,9 @@ class EvolucionItemPayload(BaseModel):
     usuario_pokemon_id: int
     item_id: int
     usuario_id: int | None = None
+    evolucion_id: int | None = Field(default=None, gt=0)
+    pokemon_origen_id: int | None = Field(default=None, gt=0)
+    estado_evolucion: str | None = Field(default=None, min_length=1, max_length=32)
 
 
 class SoltarPokemonPayload(BaseModel):
@@ -194,6 +202,9 @@ class SoltarPokemonPayload(BaseModel):
 class EvolucionNivelPayload(BaseModel):
     usuario_pokemon_id: int
     usuario_id: int | None = None
+    evolucion_id: int | None = Field(default=None, gt=0)
+    pokemon_origen_id: int | None = Field(default=None, gt=0)
+    estado_evolucion: str | None = Field(default=None, min_length=1, max_length=32)
 
 
 class ActualizarAvatarPayload(BaseModel):
@@ -3397,116 +3408,24 @@ def obtener_evoluciones(pokemon_id: int):
     conn = get_connection()
     cursor = get_cursor(conn)
     try:
-        cursor.execute("""
-            SELECT 
-                p1.id,
-                p1.nombre,
-                e.nivel,
-                p2.id AS evolucion_id,
-                p2.nombre AS evolucion_nombre
-            FROM evoluciones e
-            JOIN pokemon p1 ON p1.id = e.pokemon_id
-            JOIN pokemon p2 ON p2.id = e.evoluciona_a
-            WHERE p1.id = %s
-        """, (pokemon_id,))
-        rows = cursor.fetchall()
-
-        return [
-            {
-                "id": r["id"],
-                "nombre": r["nombre"],
-                "nivel": r["nivel"],
-                "evolucion_id": r["evolucion_id"],
-                "evolucion_nombre": r["evolucion_nombre"]
-            }
-            for r in rows
-        ]
+        return [dict(catalog_option(r), id=r["pokemon_id"], nombre=r["pokemon_nombre"], regla_id=r["id"])
+                for r in load_evolution_rules(cursor, pokemon_id)]
     finally:
         cursor.close()
         release_connection(conn)
+
 
 
 @router.get("/pokemon/{pokemon_id}/detalle-evolucion")
 def obtener_detalle_evolucion(pokemon_id: int):
     conn = get_connection()
     cursor = get_cursor(conn)
-
     try:
-        cursor.execute("""
-            SELECT
-                er.id,
-                er.metodo,
-                er.nivel_requerido,
-                er.item_id,
-                er.prioridad,
-                er.activo,
-                p2.id AS evolucion_id,
-                p2.nombre AS evolucion_nombre,
-                i.nombre AS item_nombre
-            FROM evolucion_reglas er
-            JOIN pokemon p2 ON p2.id = er.evoluciona_a
-            LEFT JOIN items i ON i.id = er.item_id
-            WHERE er.pokemon_id = %s
-              AND er.activo = TRUE
-              AND er.metodo = 'item'
-            ORDER BY er.prioridad ASC, p2.nombre ASC
-        """, (pokemon_id,))
-        rows_item = cursor.fetchall()
-
-        if rows_item:
-            return [
-                {
-                    "id": row["id"],
-                    "tipo_metodo": row["metodo"],
-                    "evolucion_id": row["evolucion_id"],
-                    "evolucion_nombre": row["evolucion_nombre"],
-                    "nivel": row["nivel_requerido"],
-                    "item_id": row["item_id"],
-                    "item_nombre": row["item_nombre"],
-                    "prioridad": row["prioridad"],
-                    "activo": bool(row["activo"]),
-                }
-                for row in rows_item
-            ]
-
-        cursor.execute("""
-            SELECT
-                er.id,
-                er.metodo,
-                er.nivel_requerido,
-                er.item_id,
-                er.prioridad,
-                er.activo,
-                p2.id AS evolucion_id,
-                p2.nombre AS evolucion_nombre,
-                i.nombre AS item_nombre
-            FROM evolucion_reglas er
-            JOIN pokemon p2 ON p2.id = er.evoluciona_a
-            LEFT JOIN items i ON i.id = er.item_id
-            WHERE er.pokemon_id = %s
-              AND er.activo = TRUE
-              AND er.metodo = 'nivel'
-            ORDER BY er.prioridad ASC, p2.nombre ASC
-        """, (pokemon_id,))
-        rows_nivel = cursor.fetchall()
-
-        return [
-            {
-                "id": row["id"],
-                "tipo_metodo": row["metodo"],
-                "evolucion_id": row["evolucion_id"],
-                "evolucion_nombre": row["evolucion_nombre"],
-                "nivel": row["nivel_requerido"],
-                "item_id": row["item_id"],
-                "item_nombre": row["item_nombre"],
-                "prioridad": row["prioridad"],
-                "activo": bool(row["activo"]),
-            }
-            for row in rows_nivel
-        ]
+        return [catalog_option(r) for r in load_evolution_rules(cursor, pokemon_id)]
     finally:
         cursor.close()
         release_connection(conn)
+
 
 
 # =========================================================
@@ -5100,436 +5019,73 @@ def comprar_item(payload: CompraItemPayload, usuario=Depends(get_current_user)):
 # EVOLUCIONES
 # =========================================================
 
-@router.post("/pokemon/evolucionar-item")
-def evolucionar_con_item(payload: EvolucionItemPayload, usuario=Depends(get_current_user)):
+def _registrar_actividad_evolucion(cursor, usuario_id, metodo, destino):
+    # Evolution must not run the shared helper's unrelated global cleanup.
+    if not existe_tabla(cursor, "usuario_actividad"):
+        return
+    cursor.execute("""
+        INSERT INTO public.usuario_actividad
+            (usuario_id, pagina, accion, detalle, sesion_token, online,
+             ultima_actividad, creado_en, actualizado_en)
+        VALUES (%s, 'mypokemon', 'evolution', %s, 'fallback:mypokemon', TRUE, NOW(), NOW(), NOW())
+        ON CONFLICT (usuario_id, sesion_token) DO UPDATE SET
+            pagina = EXCLUDED.pagina, accion = EXCLUDED.accion,
+            detalle = EXCLUDED.detalle, online = TRUE,
+            ultima_actividad = NOW(), actualizado_en = NOW()
+    """, (usuario_id, f"{metodo}:{destino}"))
+
+
+def _ejecutar_evolucion_unificada(payload, usuario, metodo):
     conn = get_connection()
     cursor = get_cursor(conn)
-
     try:
         validar_usuario_payload(payload.usuario_id, usuario["id"])
-
-        bonus_atk_sp_sql, bonus_def_sp_sql = obtener_select_bonus_renacer_especiales(cursor, "up")
-        cursor.execute(f"""
-            SELECT
-                up.pokemon_id,
-                up.nivel,
-                up.experiencia,
-                up.es_shiny,
-                up.bonus_hp_renacer,
-                up.bonus_ataque_renacer,
-                up.bonus_defensa_renacer,
-                up.bonus_velocidad_renacer,
-                {bonus_atk_sp_sql},
-                {bonus_def_sp_sql}
-            FROM usuario_pokemon up
-            WHERE up.id = %s AND up.usuario_id = %s
-        """, (payload.usuario_pokemon_id, usuario["id"]))
-        poke = cursor.fetchone()
-
-        if not poke:
-            return {"ok": False, "mensaje": "Pokémon del usuario no encontrado"}
-
-        cursor.execute("""
-            SELECT evoluciona_a
-            FROM evoluciones_item
-            WHERE pokemon_id = %s AND item_id = %s
-        """, (poke["pokemon_id"], payload.item_id))
-        evo = cursor.fetchone()
-
-        if not evo:
-            return {"ok": False, "mensaje": "Ese Pokémon no evoluciona con este item"}
-
-        cursor.execute("""
-            SELECT id, cantidad
-            FROM usuario_items
-            WHERE usuario_id = %s AND item_id = %s
-        """, (usuario["id"], payload.item_id))
-        item_user = cursor.fetchone()
-
-        if not item_user or int(item_user["cantidad"] or 0) <= 0:
-            return {"ok": False, "mensaje": "No tienes ese item"}
-
-        cursor.execute("""
-            UPDATE usuario_items
-            SET cantidad = cantidad - 1
-            WHERE id = %s
-        """, (item_user["id"],))
-
-        p_atk_sp_sql, p_def_sp_sql = obtener_select_stats_especiales(cursor, "pokemon", "p")
-        cursor.execute(f"""
-            SELECT hp, ataque, defensa, velocidad, nombre, {p_atk_sp_sql}, {p_def_sp_sql}
-            FROM pokemon p
-            WHERE id = %s
-        """, (evo["evoluciona_a"],))
-        base = cursor.fetchone()
-
-        if not base:
-            return {"ok": False, "mensaje": "La evolución configurada no existe"}
-
-        stats = calcular_stats(
-            base["hp"],
-            base["ataque"],
-            base["defensa"],
-            base["velocidad"],
-            poke["nivel"],
-            bool(poke["es_shiny"]),
-            poke["bonus_hp_renacer"],
-            poke["bonus_ataque_renacer"],
-            poke["bonus_defensa_renacer"],
-            poke["bonus_velocidad_renacer"],
-            base.get("ataque_especial", base["ataque"]),
-            base.get("defensa_especial", base["defensa"]),
-            poke.get("bonus_ataque_especial_renacer"),
-            poke.get("bonus_defensa_especial_renacer"),
-        )
-
-        if stats_especiales_habilitados(cursor, "usuario_pokemon"):
-            cursor.execute("""
-                UPDATE usuario_pokemon
-                SET pokemon_id = %s,
-                    hp_actual = %s,
-                    hp_max = %s,
-                    ataque = %s,
-                    defensa = %s,
-                    velocidad = %s,
-                    ataque_especial = %s,
-                    defensa_especial = %s
-                WHERE id = %s AND usuario_id = %s
-            """, (
-                evo["evoluciona_a"],
-                stats["hp_max"],
-                stats["hp_max"],
-                stats["ataque"],
-                stats["defensa"],
-                stats["velocidad"],
-                stats["ataque_especial"],
-                stats["defensa_especial"],
-                payload.usuario_pokemon_id,
-                usuario["id"]
-            ))
-        else:
-            cursor.execute("""
-                UPDATE usuario_pokemon
-                SET pokemon_id = %s,
-                    hp_actual = %s,
-                    hp_max = %s,
-                    ataque = %s,
-                    defensa = %s,
-                    velocidad = %s
-                WHERE id = %s AND usuario_id = %s
-            """, (
-                evo["evoluciona_a"],
-                stats["hp_max"],
-                stats["hp_max"],
-                stats["ataque"],
-                stats["defensa"],
-                stats["velocidad"],
-                payload.usuario_pokemon_id,
-                usuario["id"]
-            ))
-
-        sincronizar_movimientos_usuario_pokemon(
-            cursor,
-            payload.usuario_pokemon_id,
-            int(evo["evoluciona_a"]),
-            int(poke["nivel"] or 1),
-            origen="nivel",
-            auto_equipar=True,
-        )
-
-        registrar_actividad_usuario(
-            cursor,
-            usuario["id"],
-            pagina="mypokemon",
-            accion="evolution",
-            detalle=f"item:{evo['evoluciona_a']}"
+        result = evolve_capture(
+            cursor, user_id=usuario["id"], capture_id=payload.usuario_pokemon_id,
+            method=metodo, item_id=getattr(payload, "item_id", None),
+            target_id=payload.evolucion_id, expected_species=payload.pokemon_origen_id,
+            expected_state=payload.estado_evolucion, calculate_stats=calcular_stats,
+            sync_moves=sincronizar_movimientos_usuario_pokemon,
+            record_activity=_registrar_actividad_evolucion,
         )
         conn.commit()
-        return {
-            "ok": True,
-            "mensaje": "¡Tu Pokémon evolucionó con éxito!",
-            "usuario_pokemon_id": payload.usuario_pokemon_id,
-            "pokemon_id": evo["evoluciona_a"],
-            "pokemon_nombre": base["nombre"]
-        }
+        return result
+    except EvolutionError as error:
+        conn.rollback()
+        raise HTTPException(status_code=error.status_code, detail=error.message) from None
     except HTTPException:
         conn.rollback()
         raise
-    except Exception as error:
+    except Exception:
         conn.rollback()
-        print("Error en /pokemon/evolucionar-item:", error)
-        return {"ok": False, "mensaje": "No se pudo evolucionar el Pokémon con item"}
+        raise HTTPException(status_code=500, detail="No se pudo completar la evolución") from None
     finally:
         cursor.close()
         release_connection(conn)
+
+
+@router.post("/pokemon/evolucionar-item")
+def evolucionar_con_item(payload: EvolucionItemPayload, usuario=Depends(get_current_user)):
+    return _ejecutar_evolucion_unificada(payload, usuario, "item")
+
 
 
 @router.get("/usuario/pokemon/{usuario_pokemon_id}/evolucion")
 def revisar_evolucion(usuario_pokemon_id: int, usuario=Depends(get_current_user)):
     conn = get_connection()
     cursor = get_cursor(conn)
-
     try:
-        cursor.execute("""
-            SELECT 
-                up.id,
-                up.usuario_id,
-                up.pokemon_id,
-                up.nivel,
-                p.nombre
-            FROM usuario_pokemon up
-            JOIN pokemon p ON p.id = up.pokemon_id
-            WHERE up.id = %s AND up.usuario_id = %s
-        """, (usuario_pokemon_id, usuario["id"]))
-        poke = cursor.fetchone()
-
-        if not poke:
-            return {
-                "puede_evolucionar": False,
-                "listo_ahora": False,
-                "motivo": "Pokémon no encontrado"
-            }
-
-        cursor.execute("""
-            SELECT
-                er.id,
-                er.metodo,
-                er.nivel_requerido,
-                er.item_id,
-                er.prioridad,
-                p2.id AS evolucion_id,
-                p2.nombre AS evolucion_nombre,
-                i.nombre AS item_nombre
-            FROM evolucion_reglas er
-            JOIN pokemon p2 ON p2.id = er.evoluciona_a
-            LEFT JOIN items i ON i.id = er.item_id
-            WHERE er.pokemon_id = %s AND er.activo = TRUE
-            ORDER BY er.prioridad ASC
-        """, (poke["pokemon_id"],))
-        reglas = cursor.fetchall()
-
-        if not reglas:
-            return {
-                "puede_evolucionar": False,
-                "listo_ahora": False,
-                "motivo": "Este Pokémon no tiene evolución registrada"
-            }
-
-        opciones = []
-        listo_ahora = False
-        tipo_principal = None
-
-        for regla in reglas:
-            if regla["metodo"] == "nivel":
-                puede = poke["nivel"] >= (regla["nivel_requerido"] or 999)
-
-                if puede:
-                    listo_ahora = True
-
-                opciones.append({
-                    "tipo": "nivel",
-                    "evolucion_id": regla["evolucion_id"],
-                    "evoluciona_a": regla["evolucion_id"],
-                    "evolucion_nombre": regla["evolucion_nombre"],
-                    "nivel_requerido": regla["nivel_requerido"],
-                    "item_id": None,
-                    "item_nombre": None,
-                    "tiene_item": False,
-                    "cantidad": 0,
-                    "listo": puede
-                })
-
-                if tipo_principal is None:
-                    tipo_principal = "nivel"
-
-            elif regla["metodo"] == "item":
-                cursor.execute("""
-                    SELECT cantidad
-                    FROM usuario_items
-                    WHERE usuario_id = %s AND item_id = %s
-                """, (poke["usuario_id"], regla["item_id"]))
-                inv = cursor.fetchone()
-
-                cantidad = inv["cantidad"] if inv else 0
-                tiene_item = cantidad > 0
-
-                if tiene_item:
-                    listo_ahora = True
-
-                opciones.append({
-                    "tipo": "item",
-                    "evoluciona_a": regla["evolucion_id"],
-                    "evolucion_nombre": regla["evolucion_nombre"],
-                    "nivel_requerido": None,
-                    "item_id": regla["item_id"],
-                    "item_nombre": regla["item_nombre"],
-                    "tiene_item": tiene_item,
-                    "cantidad": cantidad,
-                    "listo": tiene_item
-                })
-
-                if tipo_principal is None:
-                    tipo_principal = "item"
-
-        return {
-            "puede_evolucionar": True,
-            "listo_ahora": listo_ahora,
-            "tipo": tipo_principal,
-            "pokemon_actual": poke["nombre"],
-            "pokemon_id": poke["pokemon_id"],
-            "nivel_actual": poke["nivel"],
-            "opciones": opciones
-        }
+        return inspect_evolution_capture(cursor, usuario_pokemon_id, usuario["id"])
     finally:
         cursor.close()
         release_connection(conn)
+
 
 
 @router.post("/pokemon/evolucionar-nivel")
 def evolucionar_por_nivel(payload: EvolucionNivelPayload, usuario=Depends(get_current_user)):
-    conn = get_connection()
-    cursor = get_cursor(conn)
+    return _ejecutar_evolucion_unificada(payload, usuario, "nivel")
 
-    try:
-        validar_usuario_payload(payload.usuario_id, usuario["id"])
-
-        cursor.execute("""
-            SELECT
-                up.id,
-                up.pokemon_id,
-                up.nivel,
-                up.es_shiny,
-                up.bonus_hp_renacer,
-                up.bonus_ataque_renacer,
-                up.bonus_defensa_renacer,
-                up.bonus_velocidad_renacer
-            FROM usuario_pokemon up
-            WHERE up.id = %s AND up.usuario_id = %s
-        """, (payload.usuario_pokemon_id, usuario["id"]))
-        poke = cursor.fetchone()
-
-        if not poke:
-            return {"ok": False, "mensaje": "Pokémon no encontrado"}
-
-        cursor.execute("""
-            SELECT e.evoluciona_a
-            FROM evoluciones e
-            WHERE e.pokemon_id = %s AND e.nivel <= %s
-            ORDER BY e.nivel DESC
-            LIMIT 1
-        """, (poke["pokemon_id"], poke["nivel"]))
-        evo = cursor.fetchone()
-
-        if not evo:
-            return {"ok": False, "mensaje": "Este Pokémon aún no puede evolucionar por nivel"}
-
-        p_atk_sp_sql, p_def_sp_sql = obtener_select_stats_especiales(cursor, "pokemon", "p")
-        cursor.execute(f"""
-            SELECT hp, ataque, defensa, velocidad, nombre, {p_atk_sp_sql}, {p_def_sp_sql}
-            FROM pokemon p
-            WHERE id = %s
-        """, (evo["evoluciona_a"],))
-        base = cursor.fetchone()
-
-        if not base:
-            return {"ok": False, "mensaje": "La evolución configurada no existe"}
-
-        stats = calcular_stats(
-            base["hp"],
-            base["ataque"],
-            base["defensa"],
-            base["velocidad"],
-            poke["nivel"],
-            bool(poke["es_shiny"]),
-            poke["bonus_hp_renacer"],
-            poke["bonus_ataque_renacer"],
-            poke["bonus_defensa_renacer"],
-            poke["bonus_velocidad_renacer"],
-            base.get("ataque_especial", base["ataque"]),
-            base.get("defensa_especial", base["defensa"]),
-            poke.get("bonus_ataque_especial_renacer"),
-            poke.get("bonus_defensa_especial_renacer"),
-        )
-
-        if stats_especiales_habilitados(cursor, "usuario_pokemon"):
-            cursor.execute("""
-                UPDATE usuario_pokemon
-                SET pokemon_id = %s,
-                    hp_actual = %s,
-                    hp_max = %s,
-                    ataque = %s,
-                    defensa = %s,
-                    velocidad = %s,
-                    ataque_especial = %s,
-                    defensa_especial = %s
-                WHERE id = %s AND usuario_id = %s
-            """, (
-                evo["evoluciona_a"],
-                stats["hp_max"],
-                stats["hp_max"],
-                stats["ataque"],
-                stats["defensa"],
-                stats["velocidad"],
-                stats["ataque_especial"],
-                stats["defensa_especial"],
-                payload.usuario_pokemon_id,
-                usuario["id"]
-            ))
-        else:
-            cursor.execute("""
-                UPDATE usuario_pokemon
-                SET pokemon_id = %s,
-                    hp_actual = %s,
-                    hp_max = %s,
-                    ataque = %s,
-                    defensa = %s,
-                    velocidad = %s
-                WHERE id = %s AND usuario_id = %s
-            """, (
-                evo["evoluciona_a"],
-                stats["hp_max"],
-                stats["hp_max"],
-                stats["ataque"],
-                stats["defensa"],
-                stats["velocidad"],
-                payload.usuario_pokemon_id,
-                usuario["id"]
-            ))
-
-        sincronizar_movimientos_usuario_pokemon(
-            cursor,
-            payload.usuario_pokemon_id,
-            int(evo["evoluciona_a"]),
-            int(poke["nivel"] or 1),
-            origen="nivel",
-            auto_equipar=True,
-        )
-
-        registrar_actividad_usuario(
-            cursor,
-            usuario["id"],
-            pagina="mypokemon",
-            accion="evolution",
-            detalle=f"nivel:{evo['evoluciona_a']}"
-        )
-        conn.commit()
-        return {
-            "ok": True,
-            "mensaje": "¡Tu Pokémon evolucionó por nivel!",
-            "usuario_pokemon_id": payload.usuario_pokemon_id,
-            "pokemon_id": evo["evoluciona_a"],
-            "pokemon_nombre": base["nombre"]
-        }
-    except HTTPException:
-        conn.rollback()
-        raise
-    except Exception as error:
-        conn.rollback()
-        print("Error en /pokemon/evolucionar-nivel:", error)
-        return {"ok": False, "mensaje": "No se pudo evolucionar el Pokémon por nivel"}
-    finally:
-        cursor.close()
-        release_connection(conn)
 
 
 # =========================================================
@@ -5592,53 +5148,12 @@ def resumen_pokedex(usuario_id: int):
 def obtener_evoluciones_cache():
     conn = get_connection()
     cursor = get_cursor(conn)
-
     try:
-        cursor.execute("""
-            SELECT id
-            FROM pokemon
-            ORDER BY id
-        """)
-        todos = cursor.fetchall()
-
-        resultado = {str(row["id"]): [] for row in todos}
-
-        cursor.execute("""
-            SELECT
-                er.pokemon_id,
-                er.id,
-                er.metodo,
-                er.nivel_requerido,
-                er.item_id,
-                er.prioridad,
-                er.activo,
-                p2.id AS evolucion_id,
-                p2.nombre AS evolucion_nombre,
-                i.nombre AS item_nombre
-            FROM evolucion_reglas er
-            JOIN pokemon p2 ON p2.id = er.evoluciona_a
-            LEFT JOIN items i ON i.id = er.item_id
-            WHERE er.activo = TRUE
-            ORDER BY er.pokemon_id ASC, er.prioridad ASC, p2.nombre ASC
-        """)
-        rows = cursor.fetchall()
-
-        for row in rows:
-            pokemon_id = str(row["pokemon_id"])
-
-            resultado[pokemon_id].append({
-                "id": row["id"],
-                "tipo_metodo": row["metodo"],
-                "evolucion_id": row["evolucion_id"],
-                "evolucion_nombre": row["evolucion_nombre"],
-                "nivel": row["nivel_requerido"],
-                "item_id": row["item_id"],
-                "item_nombre": row["item_nombre"],
-                "prioridad": row["prioridad"],
-                "activo": bool(row["activo"]),
-            })
-
-        return resultado
+        cursor.execute("SELECT id FROM public.pokemon ORDER BY id")
+        result = {str(r["id"]): [] for r in cursor.fetchall()}
+        for rule in load_evolution_rules(cursor):
+            result[str(rule["pokemon_id"])].append(catalog_option(rule))
+        return result
     finally:
         cursor.close()
         release_connection(conn)
