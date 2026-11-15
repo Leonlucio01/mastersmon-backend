@@ -19,7 +19,7 @@ from monetization_utils import (
 
 from evolution_service import (
     EvolutionError, load_rules as load_evolution_rules, catalog_option,
-    inspect_capture as inspect_evolution_capture, evolve_capture,
+    inspect_capture as inspect_evolution_capture, evolve_capture, wurmple_seed,
 )
 
 router = APIRouter()
@@ -4811,6 +4811,20 @@ def intentar_captura(request: Request, payload: IntentoCapturaPayload, usuario=D
             )
             usuario_pokemon_insertado = cursor.fetchone()
             usuario_pokemon_id = int(usuario_pokemon_insertado["id"]) if usuario_pokemon_insertado else None
+
+            # Asignar la semilla persistente en la misma transaccion de captura.
+            # La funcion compartida con evoluciones garantiza el mismo destino
+            # para cada Wurmple. Ninguna otra especie necesita este valor.
+            if usuario_pokemon_id and int(encuentro["pokemon_id"]) == 265:
+                semilla = wurmple_seed({"id": usuario_pokemon_id, "semilla_evolutiva": None})
+                cursor.execute("""
+                    UPDATE public.usuario_pokemon
+                    SET semilla_evolutiva = %s
+                    WHERE id = %s AND usuario_id = %s AND pokemon_id = 265
+                      AND semilla_evolutiva IS NULL
+                """, (semilla, usuario_pokemon_id, usuario["id"]))
+                if cursor.rowcount != 1:
+                    raise RuntimeError("No se pudo guardar la semilla de Wurmple")
 
             if usuario_pokemon_id:
                 sincronizar_movimientos_usuario_pokemon(
