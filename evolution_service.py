@@ -51,7 +51,13 @@ def load_rules(cursor, pokemon_id=None, *, lock=False, include_inactive=False):
                 AND er.nivel_requerido IS NULL AND i.id IS NOT NULL))
     """ + where + " ORDER BY er.prioridad, er.id, er.evoluciona_a"
         + (" FOR SHARE OF er" if lock else ""), params)
-    return list(cursor.fetchall())
+    rules = list(cursor.fetchall())
+    if not include_inactive:
+        # Shedinja is a secondary capture, never the primary evolution target.
+        rules = [rule for rule in rules if not (
+            int(rule["pokemon_id"]) == 290 and int(rule["evolucion_id"]) == 292
+        )]
+    return rules
 
 
 def catalog_option(rule):
@@ -94,6 +100,135 @@ def inspect_capture(cursor, capture_id, user_id):
     return dict(common, puede_evolucionar=bool(options), listo_ahora=any(r["listo"] for r in options),
                 tipo=options[0]["tipo"] if options else None, opciones=options,
                 motivo=None if options else "Este Pokémon no tiene evolución habilitada")
+
+
+
+def _create_shedinja_bonus(cursor, *, user_id, capture, calculate_stats):
+    """Secondary Nincada reward, in caller's transaction. No separate commit.
+
+    The origin is locked by evolve_capture. A second request cannot evolve it
+    again because the original species changes to Ninjask in this transaction.
+    """
+    cursor.execute("""
+        SELECT er.id
+        FROM public.evolucion_reglas er
+        WHERE er.pokemon_id = 290 AND er.evoluciona_a = 292
+          AND er.metodo = 'nivel' AND er.nivel_requerido = 20
+          AND er.item_id IS NULL AND er.activo IS TRUE
+          AND er.condiciones->>'adaptacion' = 'captura_adicional'
+        FOR SHARE OF er
+    """)
+    if not cursor.fetchone():
+        return None  # Bonus disabled by database; Ninjask still evolves.
+
+    # Standard Poké Ball only. Row-lock the actual inventory for the owner.
+    cursor.execute("""
+        SELECT ui.id, ui.cantidad
+        FROM public.usuario_items ui JOIN public.items i ON i.id = ui.item_id
+        WHERE ui.usuario_id = %s AND i.id = 1 AND i.tipo = 'captura'
+          AND LOWER(i.codigo) = 'poke_ball'
+        FOR UPDATE OF ui NOWAIT
+    """, (user_id,))
+    ball = cursor.fetchone()
+    if not ball or int(ball['cantidad'] or 0) < 1:
+        return None
+
+    cursor.execute("SELECT * FROM public.pokemon WHERE id = 292 FOR SHARE")
+    base = cursor.fetchone()
+    if not base:
+        raise EvolutionError(409, 'Shedinja #292 no existe en el catalogo')
+
+    # Preserve level, shiny status, EXP and rebirth progress. Shedinja's HP
+    # remains one regardless of shiny/level bonuses in the generic formula.
+    level = int(capture['nivel'])
+    shiny = bool(capture['es_shiny'])
+    stats = calculate_stats(
+        base['hp'], base['ataque'], base['defensa'], base['velocidad'], level,
+        shiny, capture.get('bonus_hp_renacer', 0),
+        capture.get('bonus_ataque_renacer', 0),
+        capture.get('bonus_defensa_renacer', 0),
+        capture.get('bonus_velocidad_renacer', 0),
+        base.get('ataque_especial', base['ataque']),
+        base.get('defensa_especial', base['defensa']),
+        capture.get('bonus_ataque_especial_renacer', 0),
+        capture.get('bonus_defensa_especial_renacer', 0),
+    )
+    cursor.execute("""
+        UPDATE public.usuario_items
+        SET cantidad = cantidad - 1
+        WHERE id = %s AND usuario_id = %s AND item_id = 1 AND cantidad > 0
+        RETURNING cantidad
+    """, (ball['id'], user_id))
+    if cursor.fetchone() is None:
+        raise EvolutionError(409, 'El inventario cambio durante la evolucion')
+
+    cursor.execute("""
+        INSERT INTO public.usuario_pokemon (
+            usuario_id, pokemon_id, nivel, experiencia, experiencia_total,
+            es_shiny, hp_actual, hp_max, ataque, defensa, velocidad,
+            ataque_especial, defensa_especial, renacimientos,
+            puntos_renacer_disponibles,
+            bonus_hp_renacer, bonus_ataque_renacer, bonus_defensa_renacer,
+            bonus_velocidad_renacer, bonus_ataque_especial_renacer,
+            bonus_defensa_especial_renacer, victorias_total, forma_id
+        ) VALUES (
+            %s, 292, %s, %s, %s, %s,
+            1, 1, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, 0, NULL
+        ) RETURNING id
+    """, (
+        user_id, level, int(capture.get('experiencia') or 0),
+        int(capture.get('experiencia_total') or 0), shiny,
+        stats['ataque'], stats['defensa'], stats['velocidad'],
+        stats['ataque_especial'], stats['defensa_especial'],
+        int(capture.get('renacimientos') or 0),
+        int(capture.get('puntos_renacer_disponibles') or 0),
+        int(capture.get('bonus_hp_renacer') or 0),
+        int(capture.get('bonus_ataque_renacer') or 0),
+        int(capture.get('bonus_defensa_renacer') or 0),
+        int(capture.get('bonus_velocidad_renacer') or 0),
+        int(capture.get('bonus_ataque_especial_renacer') or 0),
+        int(capture.get('bonus_defensa_especial_renacer') or 0),
+    ))
+    new_id = cursor.fetchone()['id']
+
+    # No learnsets for Nincada/Ninjask/Shedinja in production (Codex audit).
+    # Copy actual learned moves from the Nincada capture, with NEW movement
+    # row IDs and per-capture equipment IDs, without reusing foreign keys.
+    cursor.execute("""
+        SELECT m.id, m.movimiento_id, m.desbloqueado_por,
+               m.nivel_desbloqueado, m.activo,
+               eq.slot
+        FROM public.usuario_pokemon_movimientos m
+        LEFT JOIN public.usuario_pokemon_movimientos_equipo eq
+          ON eq.usuario_pokemon_movimiento_id = m.id
+         AND eq.usuario_pokemon_id = m.usuario_pokemon_id
+        WHERE m.usuario_pokemon_id = %s
+        ORDER BY m.id
+    """, (capture['id'],))
+    for move in cursor.fetchall():
+        cursor.execute("""
+            INSERT INTO public.usuario_pokemon_movimientos
+                (usuario_pokemon_id, movimiento_id, desbloqueado_por,
+                 nivel_desbloqueado, activo)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (usuario_pokemon_id, movimiento_id) DO UPDATE SET
+                activo = EXCLUDED.activo
+            RETURNING id
+        """, (new_id, move['movimiento_id'], move['desbloqueado_por'],
+              move['nivel_desbloqueado'], move['activo']))
+        new_move_id = cursor.fetchone()['id']
+        if move['slot'] is not None:
+            cursor.execute("""
+                INSERT INTO public.usuario_pokemon_movimientos_equipo
+                    (usuario_pokemon_id, usuario_pokemon_movimiento_id, slot)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (usuario_pokemon_id, slot) DO NOTHING
+            """, (new_id, new_move_id, move['slot']))
+
+    # Do not insert into equipo_usuario: Shedinja enters the collection only.
+    return {'pokemon_id': 292, 'usuario_pokemon_id': new_id,
+            'nombre': base['nombre'], 'pokeball_consumida': 1}
 
 
 def evolve_capture(cursor, *, user_id, capture_id, method, item_id=None, target_id=None,
@@ -180,9 +315,16 @@ def evolve_capture(cursor, *, user_id, capture_id, method, item_id=None, target_
         if not cursor.fetchone():
             raise EvolutionError(409, "El Pokémon cambió; vuelve a comprobar la evolución")
         sync_moves(cursor, capture_id, rule["evolucion_id"], capture["nivel"], origen="nivel", auto_equipar=True)
+        bonus = None
+        if int(capture['pokemon_id']) == 290 and int(rule['evolucion_id']) == 291:
+            bonus = _create_shedinja_bonus(
+                cursor, user_id=user_id, capture=capture,
+                calculate_stats=calculate_stats,
+            )
         record_activity(cursor, user_id, method, rule["evolucion_id"])
         return {"ok": True, "mensaje": "¡Tu Pokémon evolucionó con éxito!",
                 "usuario_pokemon_id": capture_id, "pokemon_id": rule["evolucion_id"],
-                "pokemon_nombre": base["nombre"]}
+                "pokemon_nombre": base["nombre"],
+                "shedinja_adicional": bonus}
     except errors.LockNotAvailable as exc:
         raise EvolutionError(409, "Ya hay una evolución o cambio de inventario en curso; vuelve a comprobar") from exc
