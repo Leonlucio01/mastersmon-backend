@@ -7,6 +7,7 @@ import time
 from collections import deque
 from datetime import datetime, timezone
 
+from alola_v2_service import choose_vulpix_alola, capture_form_id, stat_bases
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 from pydantic import BaseModel, Field
 
@@ -1400,6 +1401,7 @@ def validar_ids_pokemon_equipo(cursor, usuario_id: int, usuario_pokemon_ids: lis
         FROM usuario_pokemon
         WHERE usuario_id = %s
           AND id = ANY(%s)
+          AND forma_id IS NULL  -- regional battle/team support pending
         ORDER BY id ASC
         """,
         (usuario_id, ids_limpios)
@@ -1801,9 +1803,12 @@ def obtener_pokemon_usuario_data(usuario_id: int):
             SELECT
                 up.id,
                 p.id AS pokemon_id,
-                p.nombre,
-                p.tipo,
-                p.imagen,
+                up.forma_id,
+                CASE WHEN up.forma_id = 10205 THEN 'Vulpix (Alola)' ELSE p.nombre END AS nombre,
+                CASE WHEN up.forma_id = 10205 THEN 'Ice' ELSE p.tipo END AS tipo,
+                CASE WHEN up.forma_id = 10205 THEN
+                  CASE WHEN up.es_shiny THEN a.sprite_shiny ELSE a.sprite_normal END
+                ELSE p.imagen END AS imagen,
                 p.rareza,
                 p.generacion,
                 p.tiene_mega,
@@ -1828,6 +1833,7 @@ def obtener_pokemon_usuario_data(usuario_id: int):
                 up.fecha_captura
             FROM usuario_pokemon up
             JOIN pokemon p ON p.id = up.pokemon_id
+            LEFT JOIN public.mm30_p8_form_assets a ON a.form_id = up.forma_id
             WHERE up.usuario_id = %s
             ORDER BY up.fecha_captura DESC, up.id DESC
         """, (usuario_id,))
@@ -1838,6 +1844,8 @@ def obtener_pokemon_usuario_data(usuario_id: int):
             resultado.append({
                 "id": row["id"],
                 "pokemon_id": row["pokemon_id"],
+                "forma_id": row["forma_id"],
+                "region": "alola" if row["forma_id"] == 10205 else None,
                 "nombre": row["nombre"],
                 "tipo": row["tipo"],
                 "imagen": row["imagen"],
@@ -4462,6 +4470,14 @@ def generar_encuentro(request: Request, payload: EncuentroPayload, usuario=Depen
         pesos = [float(r["probabilidad"] or 0) for r in rows]
         elegido = random.choices(rows, weights=pesos, k=1)[0] if sum(pesos) > 0 else rows[0]
 
+        # ALOLA_V2A_ENCOUNTER_PATCH: form decided on server, never by client.
+        # SNOW_SUMMIT_ALOLA_V3: form only for this server-validated zone
+        alola_form = choose_vulpix_alola(cursor, elegido["pokemon_id"], payload.zona_id)
+        if alola_form:
+            elegido = dict(elegido)
+            elegido.update(stat_bases(alola_form))
+            elegido["tipo"] = "Ice"  # Vulpix Alola, frontend translations may localize
+            elegido["imagen"] = alola_form["sprite_normal"]
         nivel_min = int(elegido["nivel_min"] or 1)
         nivel_max = int(elegido["nivel_max"] or nivel_min)
         nivel = random.randint(nivel_min, nivel_max)
@@ -4486,10 +4502,10 @@ def generar_encuentro(request: Request, payload: EncuentroPayload, usuario=Depen
         cursor.execute(
             """
             INSERT INTO mapa_encuentros
-                (token, usuario_id, zona_id, pokemon_id, nivel, es_shiny, hp_max, ataque, defensa, velocidad,
-                 activo, creado_en, expira_en)
+                (token, usuario_id, zona_id, pokemon_id, forma_id, nivel, es_shiny, hp_max, ataque, defensa, velocidad,
+                 ataque_especial, defensa_especial, activo, creado_en, expira_en)
             VALUES
-                (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, NOW(), NOW() + (%s * INTERVAL '1 second'))
+                (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, NOW(), NOW() + (%s * INTERVAL '1 second'))
             RETURNING id, creado_en, expira_en
             """,
             (
@@ -4497,12 +4513,15 @@ def generar_encuentro(request: Request, payload: EncuentroPayload, usuario=Depen
                 usuario["id"],
                 int(payload.zona_id),
                 int(elegido["pokemon_id"]),
+                int(alola_form["form_id"]) if alola_form else None,
                 int(nivel),
                 bool(es_shiny),
                 int(stats["hp_max"]),
                 int(stats["ataque"]),
                 int(stats["defensa"]),
                 int(stats["velocidad"]),
+                int(stats["ataque_especial"]),
+                int(stats["defensa_especial"]),
                 int(ENCUENTRO_TOKEN_TTL_SEGUNDOS),
             )
         )
@@ -4522,9 +4541,11 @@ def generar_encuentro(request: Request, payload: EncuentroPayload, usuario=Depen
 
         return {
             "pokemon_id": int(elegido["pokemon_id"]),
-            "nombre": elegido["nombre"],
+            "forma_id": int(alola_form["form_id"]) if alola_form else None,
+            "region": "alola" if alola_form else None,
+            "nombre": "Vulpix (Alola)" if alola_form else elegido["nombre"],
             "tipo": elegido["tipo"],
-            "imagen": elegido["imagen"],
+            "imagen": (alola_form["sprite_shiny"] if es_shiny else alola_form["sprite_normal"]) if alola_form else elegido["imagen"],
             "rareza": elegido["rareza"],
             "generacion": elegido["generacion"],
             "tiene_mega": bool(elegido["tiene_mega"]),
@@ -4780,23 +4801,26 @@ def intentar_captura(request: Request, payload: IntentoCapturaPayload, usuario=D
                 (int(encuentro["pokemon_id"]),)
             )
             pokemon_db = cursor.fetchone()
-            nombre_pokemon = pokemon_db["nombre"] if pokemon_db and pokemon_db.get("nombre") else f"Pokémon #{int(encuentro['pokemon_id'])}"
+            forma_capturada = capture_form_id(encuentro)
+            nombre_pokemon = ("Vulpix (Alola)" if forma_capturada else
+                (pokemon_db["nombre"] if pokemon_db and pokemon_db.get("nombre") else f"Pokémon #{int(encuentro['pokemon_id'])}"))
 
             cursor.execute(
                 """
                 INSERT INTO usuario_pokemon (
-                    usuario_id, pokemon_id, nivel, experiencia, experiencia_total, es_shiny,
+                    usuario_id, pokemon_id, forma_id, nivel, experiencia, experiencia_total, es_shiny,
                     hp_actual, hp_max, ataque, defensa, velocidad,
                     ataque_especial, defensa_especial,
                     bonus_hp_renacer, bonus_ataque_renacer, bonus_defensa_renacer, bonus_velocidad_renacer,
                     victorias_total
                 )
-                VALUES (%s, %s, %s, 0, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0, 0, 0, 0, 0)
+                VALUES (%s, %s, %s, %s, 0, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0, 0, 0, 0, 0)
                 RETURNING id
                 """,
                 (
                     usuario["id"],
                     int(encuentro["pokemon_id"]),
+                    forma_capturada,
                     int(encuentro["nivel"]),
                     calcular_experiencia_total_base(int(encuentro["nivel"]), 0),
                     bool(encuentro["es_shiny"]),
@@ -4867,6 +4891,7 @@ def intentar_captura(request: Request, payload: IntentoCapturaPayload, usuario=D
                 "mensaje": f"¡Has capturado a {nombre_pokemon} con {nombre_item}!",
                 "probabilidad": probabilidad,
                 "usuario_pokemon_id": usuario_pokemon_id,
+                "forma_id": forma_capturada,
                 "item_id": int(payload.item_id),
                 "onboarding": onboarding,
             }
