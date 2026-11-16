@@ -4009,6 +4009,23 @@ def obtener_zonas():
         """)
         rows = cursor.fetchall() or []
 
+        # SNOW_V3B: show the actual regional identity in zone thumbnails.
+        # The SQL encounter row is species #37; its regional identity is metadata.
+        from alola_v2_service import feature_enabled
+        regional_preview = feature_enabled()
+        if regional_preview and any(
+            row.get("zona_codigo") == "frontier_snow_summit" and row.get("pokemon_id") == 37
+            for row in rows
+        ):
+            cursor.execute("""
+                SELECT EXISTS (
+                    SELECT 1 FROM public.mm30_p6_form_registry
+                    WHERE species_id=37 AND form_id=10205
+                      AND region='alola' AND capturable=TRUE
+                ) AS enabled
+            """)
+            regional_preview = bool(cursor.fetchone()["enabled"])
+
         zonas_map = {}
 
         for row in rows:
@@ -4035,10 +4052,18 @@ def obtener_zonas():
                 }
 
             if row["pokemon_id"] is not None:
+                es_vulpix_alola = (
+                    regional_preview
+                    and row.get("zona_codigo") == "frontier_snow_summit"
+                    and int(row["pokemon_id"]) == 37
+                )
                 zonas_map[zona_id]["pokemones"].append({
                     "pokemon_id": row["pokemon_id"],
-                    "nombre": row["pokemon_nombre"],
-                    "tipo": row.get("pokemon_tipo"),
+                    "forma_id": 10205 if es_vulpix_alola else None,
+                    "region": "alola" if es_vulpix_alola else None,
+                    "variant_suffix": "a" if es_vulpix_alola else "",
+                    "nombre": "Vulpix (Alola)" if es_vulpix_alola else row["pokemon_nombre"],
+                    "tipo": "Ice" if es_vulpix_alola else row.get("pokemon_tipo"),
                     "generacion": int(row["pokemon_generacion"]) if row.get("pokemon_generacion") is not None else None,
                     "probabilidad": float(row["probabilidad"]),
                     "nivel_min": row["pokemon_nivel_min"],
@@ -4059,6 +4084,41 @@ def obtener_zonas():
             status_code=500,
             detail="No se pudieron obtener las zonas"
         )
+    finally:
+        cursor.close()
+        release_connection(conn)
+
+
+@router.get("/maps/alola-frontier/status")
+def alola_frontier_status():
+    """Safe read-only status for the Frontier Snow Summit Alola pilot."""
+    from alola_v2_service import feature_enabled
+    conn = get_connection()
+    cursor = get_cursor(conn)
+    try:
+        cursor.execute("""
+            SELECT z.id AS zona_id,
+                   EXISTS (SELECT 1 FROM public.zona_pokemon zp
+                           WHERE zp.zona_id=z.id AND zp.pokemon_id=37) AS en_mapa,
+                   (SELECT zp.probabilidad FROM public.zona_pokemon zp
+                    WHERE zp.zona_id=z.id AND zp.pokemon_id=37 LIMIT 1) AS peso,
+                   (SELECT SUM(zp.probabilidad) FROM public.zona_pokemon zp
+                    WHERE zp.zona_id=z.id) AS peso_total,
+                   EXISTS (SELECT 1 FROM public.mm30_p6_form_registry r
+                           WHERE r.species_id=37 AND r.form_id=10205
+                             AND r.region='alola' AND r.capturable=TRUE) AS capturable
+              FROM public.zonas z WHERE z.codigo='frontier_snow_summit' LIMIT 1
+        """)
+        row = cursor.fetchone()
+        return {
+            "ok": bool(row), "zona": "frontier_snow_summit",
+            "piloto_activo": feature_enabled(),
+            "pokemon_en_mapa": bool(row and row["en_mapa"]),
+            "forma_capturable": bool(row and row["capturable"]),
+            "peso_vulpix": float(row["peso"]) if row and row["peso"] is not None else None,
+            "peso_total_mapa": float(row["peso_total"]) if row and row["peso_total"] is not None else None,
+            "nota": "Para aparecer como Alola deben ser true los tres indicadores."
+        }
     finally:
         cursor.close()
         release_connection(conn)
@@ -4468,6 +4528,22 @@ def generar_encuentro(request: Request, payload: EncuentroPayload, usuario=Depen
             }
 
         pesos = [float(r["probabilidad"] or 0) for r in rows]
+        # SNOW_V3B: during the Alola pilot, make Vulpix easier to find.
+        # Weighted encounter boost is configurable; no zona_pokemon SQL changes.
+        # This does NOT force encounters: MAPS_STEP_ENCOUNTER_CHANCE is unchanged.
+        from alola_v2_service import feature_enabled
+        if feature_enabled() and any(int(row["pokemon_id"]) == 37 for row in rows):
+            cursor.execute("SELECT codigo FROM public.zonas WHERE id=%s", (int(payload.zona_id),))
+            zona_encuentro = cursor.fetchone()
+            if zona_encuentro and zona_encuentro["codigo"] == "frontier_snow_summit":
+                import os
+                try:
+                    bonus = float(os.getenv("MASTERSMON_ALOLA_SNOW_SPAWN_BOOST", "3.0"))
+                except (ValueError, TypeError):
+                    bonus = 1.0
+                bonus = max(1.0, min(5.0, bonus))
+                pesos = [w * bonus if int(row["pokemon_id"]) == 37 else w
+                         for w, row in zip(pesos, rows)]
         elegido = random.choices(rows, weights=pesos, k=1)[0] if sum(pesos) > 0 else rows[0]
 
         # ALOLA_V2A_ENCOUNTER_PATCH: form decided on server, never by client.
