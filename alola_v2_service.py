@@ -1,18 +1,16 @@
 """MastersMon Alola Frontier pilot: server-decided identity limited to one map.
 
-Only Frontier Snow Summit may yield form 10205, and only when explicitly enabled.
+Only Frontier Snow Summit may yield form 10205 when the region is marked capturable in PostgreSQL.
 Never infer capture form from a browser-submitted field.
 """
-import os
-import random
-
 ALOLA_VULPIX_SPECIES_ID = 37
 ALOLA_VULPIX_FORM_ID = 10205
 FRONTIER_SNOW_SUMMIT = 'frontier_snow_summit'
 
 
 def feature_enabled():
-    return os.getenv('MASTERSMON_ALOLA_V2_ENABLED', 'false').strip().lower() in ('1', 'true', 'yes')
+    """Automatic pilot: controlled by map presence and DB capturable flag, not Render env."""
+    return True
 
 
 def choose_vulpix_alola(cursor, species_id, zone_id):
@@ -21,7 +19,7 @@ def choose_vulpix_alola(cursor, species_id, zone_id):
     The probability is conditional on Vulpix being picked from zona_pokemon;
     it is not the probability of a random map encounter.
     """
-    if not feature_enabled() or int(species_id) != ALOLA_VULPIX_SPECIES_ID:
+    if int(species_id) != ALOLA_VULPIX_SPECIES_ID:
         return None
     cursor.execute('''
         SELECT 1
@@ -31,13 +29,8 @@ def choose_vulpix_alola(cursor, species_id, zone_id):
     ''', (int(zone_id), FRONTIER_SNOW_SUMMIT))
     if cursor.fetchone() is None:
         return None
-    try:
-        chance = float(os.getenv('MASTERSMON_ALOLA_SNOW_RATE', '1.0'))
-    except (ValueError, TypeError):
-        chance = 0.0
-    if not 0 < chance <= 1 or random.random() >= chance:
-        return None
-
+    # All selected Vulpix encounters in this map use Alola form,
+    # provided the canonical form is capturable and has valid assets/stats.
     cursor.execute('''
         SELECT r.form_id, r.pokemon_entity_id, r.region,
                a.sprite_normal, a.sprite_shiny,
