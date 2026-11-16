@@ -1,31 +1,43 @@
-"""MastersMon Alola V2A: gated, server-authoritative encounter identity.
+"""MastersMon Alola Frontier pilot: server-decided identity limited to one map.
 
-Does not modify species, old captures, or evolution rules.
+Only Frontier Snow Summit may yield form 10205, and only when explicitly enabled.
+Never infer capture form from a browser-submitted field.
 """
 import os
 import random
 
 ALOLA_VULPIX_SPECIES_ID = 37
 ALOLA_VULPIX_FORM_ID = 10205
+FRONTIER_SNOW_SUMMIT = 'frontier_snow_summit'
 
 
 def feature_enabled():
     return os.getenv('MASTERSMON_ALOLA_V2_ENABLED', 'false').strip().lower() in ('1', 'true', 'yes')
 
 
-def choose_vulpix_alola(cursor, species_id):
-    """Only when explicitly enabled; region must be capturable in registry.
+def choose_vulpix_alola(cursor, species_id, zone_id):
+    """Return the validated regional form only in Frontier Snow Summit.
 
-    One regional encounter among existing Vulpix encounters, never grants one.
+    The probability is conditional on Vulpix being picked from zona_pokemon;
+    it is not the probability of a random map encounter.
     """
     if not feature_enabled() or int(species_id) != ALOLA_VULPIX_SPECIES_ID:
         return None
-    try:
-        rate = float(os.getenv('MASTERSMON_ALOLA_V2_RATE', '0.15'))
-    except ValueError:
-        rate = 0.0
-    if not 0 < rate <= 1 or random.random() >= rate:
+    cursor.execute('''
+        SELECT 1
+          FROM public.zonas
+         WHERE id = %s AND codigo = %s
+         LIMIT 1
+    ''', (int(zone_id), FRONTIER_SNOW_SUMMIT))
+    if cursor.fetchone() is None:
         return None
+    try:
+        chance = float(os.getenv('MASTERSMON_ALOLA_SNOW_RATE', '1.0'))
+    except (ValueError, TypeError):
+        chance = 0.0
+    if not 0 < chance <= 1 or random.random() >= chance:
+        return None
+
     cursor.execute('''
         SELECT r.form_id, r.pokemon_entity_id, r.region,
                a.sprite_normal, a.sprite_shiny,
@@ -37,18 +49,20 @@ def choose_vulpix_alola(cursor, species_id):
                    FROM public.mm30_p1_effective_form_types ft
                    JOIN public.mm30_p1_types t ON t.id=ft.type_id
                    WHERE ft.form_id=r.form_id), '') AS types
-        FROM public.mm30_p6_form_registry r
-        JOIN public.mm30_p8_form_assets a ON a.form_id=r.form_id
-        WHERE r.species_id=%s AND r.form_id=%s
-          AND r.region='alola' AND r.capturable=TRUE
-        LIMIT 1
+          FROM public.mm30_p6_form_registry r
+          JOIN public.mm30_p8_form_assets a ON a.form_id=r.form_id
+         WHERE r.species_id=%s AND r.form_id=%s
+           AND r.region='alola' AND r.capturable=TRUE
+         LIMIT 1
     ''', (ALOLA_VULPIX_SPECIES_ID, ALOLA_VULPIX_FORM_ID))
     row = cursor.fetchone()
     if not row:
         return None
     stats = row['stats'] or {}
-    expected = ('hp', 'attack', 'defense', 'speed', 'special-attack', 'special-defense')
-    if any(int(stats.get(k) or 0) <= 0 for k in expected):
+    required = ('hp', 'attack', 'defense', 'speed', 'special-attack', 'special-defense')
+    if any(int(stats.get(key) or 0) <= 0 for key in required):
+        return None
+    if not row.get('sprite_normal') or not row.get('sprite_shiny'):
         return None
     return dict(row)
 
@@ -64,7 +78,7 @@ def stat_bases(form):
 
 
 def capture_form_id(encounter):
-    """The client cannot influence identity. Only a persisted encounter can."""
+    """Capture identity comes exclusively from a persisted encounter token."""
     candidate = encounter.get('forma_id')
     if candidate is None:
         return None
