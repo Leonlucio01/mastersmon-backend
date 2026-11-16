@@ -22,6 +22,7 @@ from routes_ranking_v1 import router_ranking_v1
 from routes_ranking_v2 import router_ranking_v2
 from boss_server_engine import router_boss_combat
 from boss_rewards_secure import router_boss_rewards_secure
+from routes_forms_alola_v1 import router_forms_alola_v1
 
 BACKEND_MARKER = "mastersmon-backend-2026-11-05-boss-secure-reward-v1"
 
@@ -104,6 +105,7 @@ app.include_router(router_ranking_v2)
 app.include_router(router_boss_combat)
 app.include_router(router_boss_rewards_secure)
 app.include_router(router_boss_idle)
+app.include_router(router_forms_alola_v1)
 
 @app.get("/")
 def root():
@@ -111,7 +113,7 @@ def root():
         "status": "ok",
         "message": "MastersMon API running",
         "version_backend": BACKEND_MARKER,
-        "router_loaded": ["routes_pokemon", "routes_boss_idle", "routes_payments", "routes_gyms", "trainer_onboarding_v14", "boss_server_engine", "boss_rewards_secure"]
+        "router_loaded": ["routes_pokemon", "routes_boss_idle", "routes_payments", "routes_gyms", "trainer_onboarding_v14", "boss_server_engine", "boss_rewards_secure", "routes_forms_alola_v1"]
     }
 
 
