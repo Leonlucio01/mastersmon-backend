@@ -23,6 +23,7 @@ from routes_ranking_v2 import router_ranking_v2
 from boss_server_engine import router_boss_combat
 from boss_rewards_secure import router_boss_rewards_secure
 from routes_forms_alola_v1 import router_forms_alola_v1
+from routes_alola_evolution_v4 import router_alola_evolution_v4
 
 BACKEND_MARKER = "mastersmon-backend-2026-11-05-boss-secure-reward-v1"
 
@@ -88,6 +89,9 @@ if _perf_enabled:
             )
         return response
 
+# V4: regional handler precedes operational routes; other species delegate
+# to the original evolution service unchanged.
+app.include_router(router_alola_evolution_v4)
 app.include_router(router)
 app.include_router(router_profile_edit)
 app.include_router(router_profile_badges)
