@@ -21,6 +21,29 @@ FLOORS = [
     ["#############", "#S..........#", "#.#########.#", "#.#.......#.#", "#.#.#####.#.#", "#...#...#...#", "###.#.B.#.###", "#.....C.....#", "#############"],
 ]
 FLOOR_INFO = [{'enemy': 'Wild Pidgeotto', 'hp': 30}, {'enemy': 'Wild Gloom', 'hp': 42}, {'enemy': 'Alpha Venusaur', 'hp': 95}]
+# Per-floor packs. All positions are validated against the floor layout below.
+ENEMY_PACKS = [
+    [('Wild Pidgeotto',17,30,(6,7)),('Wild Caterpie',10,24,(4,1)),('Wild Oddish',43,28,(9,3))],
+    [('Wild Gloom',44,42,(5,7)),('Wild Zubat',41,26,(3,3)),('Wild Paras',46,30,(9,3))],
+    [('Alpha Venusaur',3,95,(6,6)),('Wild Bellsprout',69,32,(3,5)),('Wild Tangela',114,40,(9,5))],
+]
+
+def new_pack(floor):
+    return [{'id':f'{floor}-{idx}', 'name':name, 'pokemon_id':species, 'hp':hp,
+             'max_hp':hp, 'pos':list(pos), 'boss':floor==3 and idx==1}
+            for idx,(name,species,hp,pos) in enumerate(ENEMY_PACKS[floor-1],1)]
+
+def normalize_enemies(state, floor):
+    if 'enemies' not in state:
+        legacy=state.get('enemy') or {}
+        species={1:17,2:44,3:3}[floor]
+        state['enemies']=[{**legacy, 'id':f'{floor}-1', 'pokemon_id':species, 'boss':floor==3}]
+    state['enemy']=next((e for e in state['enemies'] if e['hp']>0),state['enemies'][0])
+    return state
+
+def alive(state):
+    return [e for e in state.get('enemies',[]) if e['hp']>0]
+
 DUNGEON = {'code':'mystic_forest', 'name':'Mystic Forest', 'floors':3, 'boss':'Alpha Venusaur', 'free':True, 'status':'alpha'}
 
 class StartPayload(BaseModel):
@@ -54,11 +77,11 @@ def pos(grid, ch):
 
 
 def public_state(session):
-    state=session['state']
+    state=normalize_enemies(session['state'],session['floor'])
     return {'id':session['id'], 'status':session['status'], 'dungeon':DUNGEON,
             'floor':session['floor'], 'map':tiles(session['floor']),
             'turn':session['turn'], 'player':state['player'],
-            'team':state['team'], 'enemy':state['enemy'],
+            'team':state['team'], 'enemy':state['enemy'], 'enemies':state['enemies'],
             'chest_opened':state['chest_opened'], 'reward':state.get('reward'),
             'message':state.get('message','')}
 
@@ -69,6 +92,7 @@ def read_locked(cur, session_id, uid):
     if not row: raise HTTPException(404, 'Dungeon run not found')
     row=dict(row)
     if isinstance(row['state'],str): row['state']=json.loads(row['state'])
+    normalize_enemies(row['state'],row['floor'])
     return row
 
 
@@ -104,12 +128,32 @@ def adjacent(a,b):
 
 def enemy_turn(run, damage=5):
     state=run['state']
-    enemy=state['enemy']
-    if enemy['hp']>0 and adjacent(state['player'], enemy['pos']):
-        state['team'][0]['hp'] = max(0,state['team'][0]['hp']-damage)
+    enemies=alive(state)
+    player=state['player']
+    occupied={tuple(e['pos']) for e in enemies}
+    grid=FLOORS[run['floor']-1]
+    # Advance a single nearby enemy on alternate turns. The server chooses movements.
+    if run['turn'] % 2 == 0:
+        movers=sorted((e for e in enemies if not adjacent(player,e['pos'])),
+                      key=lambda e:abs(e['pos'][0]-player[0])+abs(e['pos'][1]-player[1]))
+        for e in movers:
+            x,y=e['pos']
+            options=[(x+1,y),(x-1,y),(x,y+1),(x,y-1)]
+            options.sort(key=lambda p:abs(p[0]-player[0])+abs(p[1]-player[1]))
+            for nx,ny in options:
+                if (nx,ny) in occupied or [nx,ny]==player or not (0<=ny<len(grid) and 0<=nx<len(grid[ny])) or grid[ny][nx]=='#':continue
+                occupied.remove((x,y));occupied.add((nx,ny));e['pos']=[nx,ny]
+                break
+            break
+    attackers=[e for e in alive(state) if adjacent(player,e['pos'])]
+    if attackers:
+        # Limit total damage; avoid making multi-enemy floors instantly lethal.
+        total=min(12,damage+max(0,len(attackers)-1)*2)
+        state['team'][0]['hp']=max(0,state['team'][0]['hp']-total)
         if state['team'][0]['hp']==0:
             run['status']='failed'
             state['message']='Your leader fainted. Expedition failed.'
+    normalize_enemies(state,run['floor'])
 
 
 @router_dungeons.get('/catalog')
@@ -130,7 +174,8 @@ def start(payload:StartPayload, user=Depends(get_current_user)):
         if len(found)!=len(payload.pokemon_ids): raise HTTPException(400,'Pokemon must belong to your account')
         team=[{'capture_id':i,'pokemon_id':int(found[i]['pokemon_id']),'name':found[i]['nombre'],'level':int(found[i]['nivel'] or 1),'hp':100,'max_hp':100} for i in payload.pokemon_ids]
         grid=FLOORS[0]
-        state={'player':pos(grid,'S'),'team':team,'enemy':{'name':FLOOR_INFO[0]['enemy'],'hp':FLOOR_INFO[0]['hp'],'max_hp':FLOOR_INFO[0]['hp'],'pos':pos(grid,'E')},'chest_opened':False,'reward':None,'message':'Find the enemy, defeat it, and reach the stairs.'}
+        state={'player':pos(grid,'S'),'team':team,'enemies':new_pack(1),'chest_opened':False,'reward':None,'message':'Find the enemy, defeat it, and reach the stairs.'}
+        normalize_enemies(state,1)
         cur.execute('INSERT INTO public.dungeon_runs (usuario_id,dungeon_code,floor,turn,status,state) VALUES (%s,%s,1,0,%s,%s::jsonb) RETURNING id', (uid,payload.dungeon_code,'active',json.dumps(state)))
         rid=cur.fetchone()['id']
         return {'id':rid,'status':'active','floor':1,'turn':0,'state':state}
@@ -166,8 +211,7 @@ def move(run_id:int,payload:MovePayload,user=Depends(get_current_user)):
         nx,ny=x+dx,y+dy
         grid=FLOORS[run['floor']-1]
         if ny<0 or ny>=len(grid) or nx<0 or nx>=len(grid[0]) or grid[ny][nx]=='#': raise HTTPException(400,'Blocked tile')
-        enemy=run['state']['enemy']
-        if [nx,ny]==enemy['pos'] and enemy['hp']>0: raise HTTPException(400,'Enemy blocks this tile; attack first')
+        if any([nx,ny]==e['pos'] for e in alive(run['state'])): raise HTTPException(400,'Enemy blocks this tile; attack first')
         run['state']['player']=[nx,ny]
         run['turn']+=1
         run['state']['message']='Explore the floor.'
@@ -183,17 +227,19 @@ def attack(run_id:int,payload:AttackPayload,user=Depends(get_current_user)):
     def op(cur):
         run=read_locked(cur,run_id,uid)
         check_turn(run,payload.expected_turn)
-        enemy=run['state']['enemy']
-        if enemy['hp']<=0: raise HTTPException(409,'Enemy already defeated')
-        if not adjacent(run['state']['player'],enemy['pos']): raise HTTPException(400,'Enemy out of range')
+        targets=[e for e in alive(run['state']) if adjacent(run['state']['player'],e['pos'])]
+        if not targets: raise HTTPException(400,'Enemy out of range')
+        enemy=min(targets,key=lambda e:(e['hp'],e['id']))
         leader=run['state']['team'][0]
         power=min(36,12+leader['level']//6)
         enemy['hp']=max(0,enemy['hp']-power)
         run['turn']+=1
-        run['state']['message']=f"{leader['name']} dealt {power} damage!"
-        enemy_turn(run, 8 if run['floor']==3 else 5)
-        if enemy['hp']==0:
-            run['state']['message']=f"{enemy['name']} defeated! " + ('Open the treasure chest.' if run['floor']==3 else 'Find the stairs.')
+        run['state']['message']=f"{leader['name']} dealt {power} damage to {enemy['name']}!"
+        if not alive(run['state']):
+            run['state']['message']='All enemies defeated! ' + ('Open the treasure chest.' if run['floor']==3 else 'Find the stairs.')
+        else:
+            enemy_turn(run,8 if run['floor']==3 else 5)
+        normalize_enemies(run['state'],run['floor'])
         save(cur,run)
         return public_state(run)
     return transaction(op)
@@ -207,13 +253,14 @@ def next_floor(run_id:int,payload:NextFloorPayload,user=Depends(get_current_user
         check_turn(run,payload.expected_turn)
         if run['floor']>=3: raise HTTPException(409,'This is the final floor')
         grid=FLOORS[run['floor']-1]
-        if run['state']['enemy']['hp']>0 or run['state']['player']!=pos(grid,'>'): raise HTTPException(400,'Defeat the enemy and reach the stairs')
+        if alive(run['state']) or run['state']['player']!=pos(grid,'>'): raise HTTPException(400,'Defeat the enemy and reach the stairs')
         run['floor']+=1
         run['turn']+=1
         grid=FLOORS[run['floor']-1]
         config=FLOOR_INFO[run['floor']-1]
         run['state']['player']=pos(grid,'S')
-        run['state']['enemy']={'name':config['enemy'],'hp':config['hp'],'max_hp':config['hp'],'pos':pos(grid,'B' if run['floor']==3 else 'E')}
+        run['state']['enemies']=new_pack(run['floor'])
+        normalize_enemies(run['state'],run['floor'])
         run['state']['message']='New floor unlocked.'
         save(cur,run)
         return public_state(run)
@@ -228,7 +275,7 @@ def chest(run_id:int,payload:ChestPayload,user=Depends(get_current_user)):
         check_turn(run,payload.expected_turn)
         grid=FLOORS[2]
         state=run['state']
-        if run['floor']!=3 or state['enemy']['hp']>0 or not adjacent(state['player'],pos(grid,'C')): raise HTTPException(400,'Treasure is not accessible')
+        if run['floor']!=3 or alive(state) or not adjacent(state['player'],pos(grid,'C')): raise HTTPException(400,'Treasure is not accessible')
         if state['chest_opened']: raise HTTPException(409,'Chest already opened')
         # Cosmetic, preview-only reward. It does not grant items, currency or Pokemon.
         labels=['Forest Relic (preview)','Alpha Crest (preview)','Mystic Gem (preview)']
