@@ -64,6 +64,58 @@ class ChestPayload(BaseModel):
     expected_turn: int = Field(ge=0)
 
 
+
+# V5.1: server-verified prototype skills. These are generic dungeon skills, NOT
+# claims that a species knows a move from the canonical learnset.
+SKILLS = {
+    'fire': {'name':'Flame Burst','range':3,'power':15,'cooldown':3},
+    'water': {'name':'Water Pulse','range':3,'power':14,'cooldown':3},
+    'electric': {'name':'Spark','range':2,'power':17,'cooldown':3},
+    'slash': {'name':'Quick Slash','range':1,'power':20,'cooldown':2},
+}
+
+class SkillPayload(BaseModel):
+    expected_turn: int = Field(ge=0)
+    skill: str
+    enemy_id: str | None = None
+
+@router_dungeons.post('/runs/{run_id}/skill')
+def use_skill(run_id:int,payload:SkillPayload,user=Depends(get_current_user)):
+    skill=SKILLS.get(payload.skill)
+    if not skill: raise HTTPException(400,'Unknown skill')
+    uid=int(user['id'])
+    def op(cur):
+        run=read_locked(cur,run_id,uid)
+        check_turn(run,payload.expected_turn)
+        state=run['state']
+        if not state.get('team') or state['team'][0]['hp']<=0: raise HTTPException(409,'Leader cannot attack')
+        cooldowns=state.setdefault('skill_last_turn',{})
+        last=cooldowns.get(payload.skill)
+        if last is not None and run['turn']-int(last)<skill['cooldown']:
+            raise HTTPException(409,'Skill is recharging')
+        px,py=state['player']
+        enemies=[e for e in alive(state) if (payload.enemy_id is None or str(e['id'])==payload.enemy_id)]
+        enemies=[e for e in enemies if abs(e['pos'][0]-px)+abs(e['pos'][1]-py)<=skill['range']]
+        if not enemies: raise HTTPException(400,'No enemy in skill range')
+        enemy=min(enemies,key=lambda e:(abs(e['pos'][0]-px)+abs(e['pos'][1]-py),str(e['id'])))
+        old_hp=enemy['hp']
+        level=max(1,int(state['team'][0]['level']))
+        damage=min(38,skill['power']+level//10)
+        enemy['hp']=max(0,old_hp-damage)
+        actual=old_hp-enemy['hp']
+        cooldowns[payload.skill]=run['turn']
+        run['turn']+=1
+        state['message']=f"{state['team'][0]['name']} used {skill['name']}! {actual} damage to {enemy['name']}."
+        state['last_combat_event']={'type':'skill','skill':payload.skill,'enemy_id':enemy['id'],'damage':actual,
+                                    'enemy_pos':list(enemy['pos']),'player_pos':list(state['player'])}
+        if alive(state): enemy_turn(run,8 if run['floor']==3 else 5)
+        else: state['message']+=' Floor cleared! Find the stairs or chest.'
+        normalize_enemies(state,run['floor'])
+        save(cur,run)
+        return public_state(run)
+    return transaction(op)
+
+
 def tiles(floor):
     grid = FLOORS[floor - 1]
     return {'width':len(grid[0]), 'height':len(grid), 'rows':grid}
@@ -82,7 +134,7 @@ def public_state(session):
             'floor':session['floor'], 'map':tiles(session['floor']),
             'turn':session['turn'], 'player':state['player'],
             'team':state['team'], 'enemy':state['enemy'], 'enemies':state['enemies'],
-            'chest_opened':state['chest_opened'], 'reward':state.get('reward'),
+            'chest_opened':state['chest_opened'], 'reward':state.get('reward'), 'last_combat_event':state.get('last_combat_event'), 'skill_last_turn':state.get('skill_last_turn',{}),
             'message':state.get('message','')}
 
 
