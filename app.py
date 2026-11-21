@@ -24,6 +24,8 @@ from boss_server_engine import router_boss_combat
 from boss_rewards_secure import router_boss_rewards_secure
 from routes_forms_alola_v1 import router_forms_alola_v1
 from routes_alola_evolution_v4 import router_alola_evolution_v4
+from routes_dungeons import router_dungeons
+
 
 BACKEND_MARKER = "mastersmon-backend-2026-11-05-boss-secure-reward-v1"
 
@@ -110,6 +112,8 @@ app.include_router(router_boss_combat)
 app.include_router(router_boss_rewards_secure)
 app.include_router(router_boss_idle)
 app.include_router(router_forms_alola_v1)
+app.include_router(router_dungeons)
+
 
 @app.get("/")
 def root():
